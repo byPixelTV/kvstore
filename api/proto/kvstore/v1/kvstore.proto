@@ -8,11 +8,22 @@ service KVStore {
   rpc Get(GetRequest) returns (GetResponse);
   rpc Set(SetRequest) returns (SetResponse);
   rpc Delete(DeleteRequest) returns (DeleteResponse);
+  rpc Head(HeadRequest) returns (HeadResponse);
+  rpc Watch(WatchRequest) returns (stream WatchResponse);
+  rpc Scan(ScanRequest) returns (stream ScanResponse);
+}
+
+// STRONG is the default for backwards compatibility. EVENTUAL reads from
+// the selected node's committed local FSM and may be behind the leader.
+enum ReadConsistency {
+  READ_CONSISTENCY_STRONG = 0;
+  READ_CONSISTENCY_EVENTUAL = 1;
 }
 
 message GetRequest {
   string namespace = 1;
   string key = 2;
+  ReadConsistency consistency = 3;
 }
 
 message GetResponse {
@@ -39,4 +50,40 @@ message DeleteRequest {
 message DeleteResponse {
   bool deleted = 1;
   uint64 revision = 2;
+}
+
+// Head provides an authoritative global revision before constructing a cache.
+message HeadRequest {}
+message HeadResponse {
+  uint64 revision = 1;
+  uint64 oldest_available_revision = 2;
+}
+
+// A namespace is mandatory. An empty key watches all keys in that namespace.
+// After_revision is an exclusive cursor; checkpoints advance the cursor when
+// other keys changed. OUT_OF_RANGE means a full cache resync is required.
+message WatchRequest {
+  string namespace = 1;
+  string key = 2;
+  uint64 after_revision = 3;
+}
+message WatchResponse {
+  uint64 revision = 1;
+  string namespace = 2;
+  string key = 3;
+  bytes value = 4;
+  bool deleted = 5;
+  bool checkpoint = 6;
+}
+
+// A complete point-in-time snapshot for resynchronizing a namespace cache.
+// The first message is a checkpoint holding the consistent snapshot cursor.
+// On success the SDK can open Watch(after_revision=snapshot_revision).
+message ScanRequest { string namespace = 1; }
+message ScanResponse {
+  uint64 snapshot_revision = 1;
+  string key = 2;
+  bytes value = 3;
+  uint64 revision = 4;
+  bool checkpoint = 5;
 }

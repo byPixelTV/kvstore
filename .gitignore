@@ -5,7 +5,7 @@
 /bin/
 /build/
 /dist/
-/target/
+/out/
 
 *.exe
 *.exe~
@@ -14,21 +14,60 @@
 *.dylib
 *.test
 *.out
-*.prof
-*.coverprofile
-coverage/
+
+# ==========================================
+# Go Coverage & Profiling
+# ==========================================
+/coverage/
 coverage.*
+*.coverprofile
+*.prof
+*.pprof
+cpu.prof
+mem.prof
+
+# ==========================================
+# Dependencies
+# ==========================================
 /vendor/
 
 # ==========================================
-# Pebble Database
+# KVStore Data (Pebble & Raft)
 # ==========================================
 /data/
 /db/
+/raft/
 /storage-data/
 
-*.sst
-*.log.old
+# ==========================================
+# Benchmark Results
+# ==========================================
+/benchmarks/results/
+*.bench
+*.benchmem
+*.testlog
+
+# ==========================================
+# Environment Variables & Secrets
+# ==========================================
+.env
+.env.*
+!.env.example
+!.env.template
+
+/secrets/
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+
+# ==========================================
+# Logs
+# ==========================================
+/logs/
+*.log
+*.log.*
 
 # ==========================================
 # Temporary Files
@@ -37,23 +76,10 @@ coverage.*
 /temp/
 *.tmp
 *.temp
+*.bak
 *.swp
 *.swo
 *~
-*.bak
-
-# ==========================================
-# Environment & Secrets
-# ==========================================
-.env
-.env.*
-!.env.example
-
-*.pem
-*.key
-*.p12
-*.pfx
-secrets/
 
 # ==========================================
 # IDEs & Editors
@@ -70,13 +96,14 @@ Thumbs.db
 Desktop.ini
 
 # ==========================================
-# Logs
-# ==========================================
-/logs/
-*.log
-
-# ==========================================
-# Local Docker Overrides
+# Docker Overrides
 # ==========================================
 compose.override.yml
 docker-compose.override.yml
+
+# ==========================================
+# Local Benchmark Archives
+# ==========================================
+kvstore-src.tar.gz
+kvstore-bench.tar
+kvbench-linux

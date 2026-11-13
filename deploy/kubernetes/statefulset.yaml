@@ -1,0 +1,94 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: kvstore
+  labels:
+    app: kvstore
+spec:
+  serviceName: kvstore-headless
+  replicas: 1  # DO NOT scale beyond 1 before implementing Raft.
+  selector:
+    matchLabels:
+      app: kvstore
+  template:
+    metadata:
+      labels:
+        app: kvstore
+    spec:
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsUser: 65532
+        runAsGroup: 65532
+        runAsNonRoot: true
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: kvstore
+          image: kvstore:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: grpc
+              containerPort: 50051
+              protocol: TCP
+          env:
+            - name: KVSTORE_MODE
+              value: standalone
+            - name: KVSTORE_NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            # Refuse to run extra standalone Pods if someone scales the StatefulSet.
+            - name: KVSTORE_EXPECTED_NODE_ID
+              value: kvstore-0
+            - name: KVSTORE_LISTEN_ADDR
+              value: ":50051"
+            - name: KVSTORE_DATA_DIR
+              value: /data
+            - name: KVSTORE_SHUTDOWN_TIMEOUT
+              value: 15s
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          startupProbe:
+            grpc:
+              port: 50051
+              service: liveness
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 30
+          readinessProbe:
+            grpc:
+              port: 50051
+              service: readiness
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            grpc:
+              port: 50051
+              service: liveness
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 2Gi

@@ -1,0 +1,40 @@
+static_resources:
+  listeners:
+    - name: grpc_listener
+      address:
+        socket_address: {address: 0.0.0.0, port_value: 50051}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                '@type': type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: grpc
+                codec_type: AUTO
+                http2_protocol_options: {}
+                route_config:
+                  name: cluster_route
+                  virtual_hosts:
+                    - name: kvstore
+                      domains: ['*']
+                      routes:
+                        - match: {prefix: '/'}
+                          route:
+                            cluster: kvstore_nodes
+                            timeout: 0s
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      '@type': type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters:
+    - name: kvstore_nodes
+      connect_timeout: 2s
+      type: STRICT_DNS
+      lb_policy: ROUND_ROBIN
+      http2_protocol_options: {}
+      load_assignment:
+        cluster_name: kvstore_nodes
+        endpoints:
+          - lb_endpoints:
+              - endpoint: {address: {socket_address: {address: node0, port_value: 50051}}}
+              - endpoint: {address: {socket_address: {address: node1, port_value: 50051}}}
+              - endpoint: {address: {socket_address: {address: node2, port_value: 50051}}}

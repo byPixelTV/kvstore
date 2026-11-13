@@ -1,0 +1,86 @@
+# Development-only Raft cluster with a gRPC-aware Envoy load balancer.
+# First set KVSTORE_JOIN_TOKEN in your shell or a local .env file.
+x-common-env: &common-env
+  KVSTORE_MODE: cluster
+  KVSTORE_LISTEN_ADDR: ':50051'
+  KVSTORE_RAFT_BIND_ADDR: ':7000'
+  KVSTORE_ADMIN_LISTEN_ADDR: ':7001'
+  KVSTORE_CLUSTER_BOOTSTRAP_NODE: node0
+  KVSTORE_CLUSTER_SEEDS: 'node0:7001,node1:7001,node2:7001'
+  KVSTORE_JOIN_TOKEN: ${KVSTORE_JOIN_TOKEN:?Set KVSTORE_JOIN_TOKEN first}
+  KVSTORE_DATA_DIR: /data
+  KVSTORE_SHUTDOWN_TIMEOUT: 15s
+  KVSTORE_READ_BATCH_WINDOW: ${KVSTORE_READ_BATCH_WINDOW:-300us}
+  KVSTORE_READ_BATCH_MAX: ${KVSTORE_READ_BATCH_MAX:-256}
+x-node: &node
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: kvstore:dev
+  restart: unless-stopped
+  init: true
+  read_only: true
+  security_opt:
+    - no-new-privileges:true
+  cap_drop: [ALL]
+  healthcheck:
+    test: [CMD, /usr/local/bin/kvstore, healthcheck]
+    interval: 10s
+    timeout: 3s
+    start_period: 45s
+    retries: 5
+  stop_grace_period: 30s
+services:
+  node0:
+    <<: *node
+    hostname: node0
+    # Localhost-only diagnostics; do not expose these ports publicly.
+    ports:
+      - '127.0.0.1:50061:50051'
+      - '127.0.0.1:17001:7001'
+    environment:
+      <<: *common-env
+      KVSTORE_NODE_ID: node0
+      KVSTORE_RAFT_ADVERTISE_ADDR: node0:7000
+      KVSTORE_GRPC_ADVERTISE_ADDR: node0:50051
+      KVSTORE_ADMIN_ADVERTISE_ADDR: node0:7001
+    volumes: [node0-data:/data]
+  node1:
+    <<: *node
+    hostname: node1
+    # Localhost-only diagnostics; do not expose these ports publicly.
+    ports:
+      - '127.0.0.1:50062:50051'
+      - '127.0.0.1:17002:7001'
+    environment:
+      <<: *common-env
+      KVSTORE_NODE_ID: node1
+      KVSTORE_RAFT_ADVERTISE_ADDR: node1:7000
+      KVSTORE_GRPC_ADVERTISE_ADDR: node1:50051
+      KVSTORE_ADMIN_ADVERTISE_ADDR: node1:7001
+    volumes: [node1-data:/data]
+  node2:
+    <<: *node
+    hostname: node2
+    # Localhost-only diagnostics; do not expose these ports publicly.
+    ports:
+      - '127.0.0.1:50063:50051'
+      - '127.0.0.1:17003:7001'
+    environment:
+      <<: *common-env
+      KVSTORE_NODE_ID: node2
+      KVSTORE_RAFT_ADVERTISE_ADDR: node2:7000
+      KVSTORE_GRPC_ADVERTISE_ADDR: node2:50051
+      KVSTORE_ADMIN_ADVERTISE_ADDR: node2:7001
+    volumes: [node2-data:/data]
+  envoy:
+    image: envoyproxy/envoy:v1.35.0
+    restart: unless-stopped
+    depends_on: [node0, node1, node2]
+    ports: ['127.0.0.1:50051:50051']
+    volumes:
+      - ./deploy/envoy/cluster.yaml:/etc/envoy/envoy.yaml:ro
+volumes:
+  node0-data:
+  node1-data:
+  node2-data:

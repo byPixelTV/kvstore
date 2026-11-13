@@ -1,27 +1,37 @@
 services:
-  services:
-    kvstore:
-      build:
-        context: .
-        dockerfile: Dockerfile
-        args:
-          BUILD_CHANNEL: ${BUILD_CHANNEL:-stable}
-      image: kvstore:local
-      restart: unless-stopped
-      init: true
-      read_only: true
-      ports:
-        # Local-only until authentication / TLS are implemented.
-        - "127.0.0.1:50051:50051"
-      environment:
-        KVSTORE_LISTEN_ADDR: ":50051"
-        KVSTORE_DATA_DIR: "/data"
-      volumes:
-        - kvstore-data:/data
-      security_opt:
-        - no-new-privileges:true
-      cap_drop:
-        - ALL
+  kvstore:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        BUILD_CHANNEL: ${BUILD_CHANNEL:-stable}
+    image: kvstore:dev
+    restart: unless-stopped
+    init: true
+    read_only: true
+    ports:
+      # Deliberately localhost-only: gRPC has no TLS/auth yet.
+      - "127.0.0.1:50051:50051"
+    environment:
+      KVSTORE_MODE: standalone
+      KVSTORE_NODE_ID: node-1
+      KVSTORE_LISTEN_ADDR: ":50051"
+      KVSTORE_HEALTH_ADDR: "127.0.0.1:50051"
+      KVSTORE_DATA_DIR: "/data"
+      KVSTORE_SHUTDOWN_TIMEOUT: "15s"
+    volumes:
+      - kvstore-data:/data
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/kvstore", "healthcheck"]
+      interval: 10s
+      timeout: 3s
+      start_period: 20s
+      retries: 3
+    stop_grace_period: 30s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
 
-  volumes:
-    kvstore-data:
+volumes:
+  kvstore-data:

@@ -1,0 +1,81 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: kvstore-raft
+  labels: {app: kvstore-raft}
+spec:
+  serviceName: kvstore-raft-headless
+  replicas: 3
+  podManagementPolicy: Parallel  # avoids waiting for quorum/joins in ordinal order
+  selector:
+    matchLabels: {app: kvstore-raft}
+  template:
+    metadata:
+      labels: {app: kvstore-raft}
+    spec:
+      terminationGracePeriodSeconds: 40
+      securityContext:
+        runAsUser: 65532
+        runAsGroup: 65532
+        runAsNonRoot: true
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: kvstore
+          image: kvstore:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - {name: grpc, containerPort: 50051}
+            - {name: raft, containerPort: 7000}
+            - {name: admin, containerPort: 7001}
+          env:
+            - name: POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - name: POD_NAMESPACE
+              valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+            - {name: KVSTORE_MODE, value: cluster}
+            - {name: KVSTORE_NODE_ID, value: '$(POD_NAME)'}
+            - {name: KVSTORE_LISTEN_ADDR, value: ':50051'}
+            - {name: KVSTORE_RAFT_BIND_ADDR, value: ':7000'}
+            - {name: KVSTORE_ADMIN_LISTEN_ADDR, value: ':7001'}
+            - {name: KVSTORE_RAFT_ADVERTISE_ADDR, value: '$(POD_NAME).kvstore-raft-headless.$(POD_NAMESPACE).svc.cluster.local:7000'}
+            - {name: KVSTORE_GRPC_ADVERTISE_ADDR, value: '$(POD_NAME).kvstore-raft-headless.$(POD_NAMESPACE).svc.cluster.local:50051'}
+            - {name: KVSTORE_ADMIN_ADVERTISE_ADDR, value: '$(POD_NAME).kvstore-raft-headless.$(POD_NAMESPACE).svc.cluster.local:7001'}
+            - {name: KVSTORE_CLUSTER_BOOTSTRAP_NODE, value: kvstore-raft-0}
+            - {name: KVSTORE_CLUSTER_SEEDS, value: 'kvstore-raft-0.kvstore-raft-headless:7001,kvstore-raft-1.kvstore-raft-headless:7001,kvstore-raft-2.kvstore-raft-headless:7001'}
+            - name: KVSTORE_JOIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: kvstore-raft-auth
+                  key: join-token
+            - {name: KVSTORE_DATA_DIR, value: /data}
+            - {name: KVSTORE_SHUTDOWN_TIMEOUT, value: 20s}
+          volumeMounts: [{name: data, mountPath: /data}]
+          startupProbe:
+            grpc: {port: 50051, service: liveness}
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 30
+          readinessProbe:
+            grpc: {port: 50051, service: readiness}
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            grpc: {port: 50051, service: liveness}
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {cpu: '1', memory: 1Gi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+  volumeClaimTemplates:
+    - metadata: {name: data}
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources: {requests: {storage: 2Gi}}

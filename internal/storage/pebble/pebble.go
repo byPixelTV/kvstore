@@ -6,10 +6,10 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"log/slog"
 	"math"
 	"sync"
 
+	"github.com/byPixelTV/kvstore/internal/changefeed"
 	"github.com/byPixelTV/kvstore/internal/storage"
 	pebbledb "github.com/cockroachdb/pebble/v2"
 )
@@ -20,9 +20,12 @@ var revisionKey = []byte{0x00, 0x01}
 // Store is a persistent, single-node implementation of storage.Store.
 // The mutex serializes writes so every mutation receives a unique revision.
 type Store struct {
-	mu       sync.Mutex
-	db       *pebbledb.DB
-	revision uint64
+	mu           sync.Mutex
+	db           *pebbledb.DB
+	revision     uint64
+	oldest       uint64
+	historyBytes uint64
+	notifier     changefeed.Notifier
 }
 
 var _ storage.Store = (*Store)(nil)
@@ -32,27 +35,54 @@ func Open(path string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open pebble: %w", err)
 	}
-
 	store := &Store{db: db}
-	raw, closer, err := db.Get(revisionKey)
-	switch {
-	case errors.Is(err, pebbledb.ErrNotFound):
-		return store, nil
-	case err != nil:
-		_ = db.Close()
-		return nil, fmt.Errorf("read revision: %w", err)
+	read := func(key []byte) (uint64, bool, error) {
+		raw, closer, err := db.Get(key)
+		if errors.Is(err, pebbledb.ErrNotFound) {
+			return 0, false, nil
+		}
+		if err != nil {
+			return 0, false, err
+		}
+		defer closer.Close()
+		if len(raw) != 8 {
+			return 0, false, fmt.Errorf("invalid metadata at %x", key)
+		}
+		return binary.BigEndian.Uint64(raw), true, nil
 	}
-
-	if len(raw) != 8 {
-		_ = closer.Close()
+	rev, _, err := read(revisionKey)
+	if err != nil {
 		_ = db.Close()
-		return nil, fmt.Errorf("invalid stored revision length: %d", len(raw))
+		return nil, err
 	}
-	store.revision = binary.BigEndian.Uint64(raw)
-	if err := closer.Close(); err != nil {
+	store.revision = rev
+	floor, exists, err := read(changefeed.FloorKey)
+	if err != nil {
 		_ = db.Close()
-		return nil, fmt.Errorf("close revision reader: %w", err)
+		return nil, err
 	}
+	if !exists {
+		if rev == math.MaxUint64 {
+			_ = db.Close()
+			return nil, errors.New("revision exhausted")
+		}
+		floor = rev + 1 // existing data has no prior changefeed history
+		if err = db.Set(changefeed.FloorKey, changefeed.EncodedFloor(floor), pebbledb.Sync); err != nil {
+			_ = db.Close()
+			return nil, err
+		}
+	}
+	if floor == 0 || floor > rev+1 {
+		_ = db.Close()
+		return nil, errors.New("invalid changefeed floor")
+	}
+	store.oldest = floor
+	history, _, err := read(changefeed.ByteCountKey)
+	if err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	store.historyBytes = history
 	return store, nil
 }
 
@@ -117,12 +147,7 @@ func (s *Store) Set(ctx context.Context, namespace, key string, value []byte) (u
 
 	next := s.revision + 1
 	batch := s.db.NewBatch()
-	defer func(batch *pebbledb.Batch) {
-		err := batch.Close()
-		if err != nil {
-			slog.Error("failed to close batch", "error", err)
-		}
-	}(batch)
+	defer batch.Close()
 
 	if err := batch.Set(encodeKey(namespace, key), encodeRecord(value, next), nil); err != nil {
 		return 0, fmt.Errorf("batch set record: %w", err)
@@ -135,10 +160,17 @@ func (s *Store) Set(ctx context.Context, namespace, key string, value []byte) (u
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
+	floor, history, err := changefeed.Append(s.db, batch, changefeed.Change{Revision: next, Namespace: namespace, Key: key, Value: value}, s.oldest, s.historyBytes, true)
+	if err != nil {
+		return 0, err
+	}
 	if err := batch.Commit(pebbledb.Sync); err != nil {
 		return 0, fmt.Errorf("commit set: %w", err)
 	}
 	s.revision = next
+	s.oldest = floor
+	s.historyBytes = history
+	s.notifier.Signal()
 	return next, nil
 }
 
@@ -166,12 +198,7 @@ func (s *Store) Delete(ctx context.Context, namespace, key string) (uint64, erro
 
 	next := s.revision + 1
 	batch := s.db.NewBatch()
-	defer func(batch *pebbledb.Batch) {
-		err := batch.Close()
-		if err != nil {
-			slog.Error("failed to close batch", "error", err)
-		}
-	}(batch)
+	defer batch.Close()
 	if err := batch.Delete(encodedKey, nil); err != nil {
 		return 0, fmt.Errorf("batch delete record: %w", err)
 	}
@@ -183,9 +210,42 @@ func (s *Store) Delete(ctx context.Context, namespace, key string) (uint64, erro
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
+	floor, history, err := changefeed.Append(s.db, batch, changefeed.Change{Revision: next, Namespace: namespace, Key: key, Deleted: true}, s.oldest, s.historyBytes, true)
+	if err != nil {
+		return 0, err
+	}
 	if err := batch.Commit(pebbledb.Sync); err != nil {
 		return 0, fmt.Errorf("commit delete: %w", err)
 	}
 	s.revision = next
+	s.oldest = floor
+	s.historyBytes = history
+	s.notifier.Signal()
 	return next, nil
+}
+
+// ReadChanges serves durable events from the exact same Pebble commits as Set/Delete.
+func (s *Store) ReadChanges(ctx context.Context, after uint64, limit int) (changefeed.Page, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return changefeed.Read(ctx, s.db, after, s.revision, s.oldest, limit)
+}
+func (s *Store) Notify() <-chan struct{} { return s.notifier.Subscribe() }
+
+func (s *Store) Head(ctx context.Context) (uint64, uint64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, 0, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.revision, s.oldest, nil
+}
+
+func (s *Store) ScanNamespace(ctx context.Context, namespace string, emit func(storage.ScanItem) error) error {
+	s.mu.Lock()
+	snapshot := s.db.NewSnapshot()
+	head := s.revision
+	s.mu.Unlock()
+	defer snapshot.Close()
+	return changefeed.ScanSnapshot(ctx, snapshot, head, namespace, emit)
 }
