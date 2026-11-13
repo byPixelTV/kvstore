@@ -1,0 +1,146 @@
+name: Release
+
+# Only publish after the exact CI push-run has passed.
+# Unlike pull_request_target, this does not execute untrusted PR code with write permissions.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [stable, nightly]
+
+permissions:
+  contents: write
+  packages: write
+  actions: read
+
+concurrency:
+  group: kvstore-publish-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: >-
+      ${{ github.event.workflow_run.conclusion == 'success' &&
+          github.event.workflow_run.event == 'push' &&
+          github.event.workflow_run.head_repository.full_name == github.repository &&
+          (github.event.workflow_run.head_branch == 'stable' ||
+           github.event.workflow_run.head_branch == 'nightly') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout tested commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+
+      - name: Compute release metadata
+        id: meta
+        shell: bash
+        env:
+          BRANCH: ${{ github.event.workflow_run.head_branch }}
+          CI_RUN_NUMBER: ${{ github.event.workflow_run.run_number }}
+          CI_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          CI_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          version="$(cat VERSION)"
+          if ! [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "Invalid VERSION file"
+            exit 1
+          fi
+
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          if [[ "$BRANCH" == "stable" ]]; then
+            build_version="$version"
+            release_tag="v${version}"
+            tags="${image}:${version}"
+            tags+=$'\n'"${image}:latest"
+          else
+            build_version="${version}-SNAPSHOT"
+            release_tag="v${version}-SNAPSHOT.${CI_RUN_NUMBER}.${CI_RUN_ATTEMPT}"
+            tags="${image}:${version}-SNAPSHOT.${CI_RUN_NUMBER}.${CI_RUN_ATTEMPT}"
+            tags+=$'\n'"${image}:${version}-SNAPSHOT"
+            tags+=$'\n'"${image}:nightly"
+          fi
+
+          {
+            echo "branch=$BRANCH"
+            echo "build_version=$build_version"
+            echo "tag=$release_tag"
+            echo "sha=$CI_SHA"
+            echo 'docker_tags<<EOF'
+            echo "$tags"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Skip previously published stable version
+        id: gate
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHANNEL: ${{ steps.meta.outputs.branch }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if [[ "$CHANNEL" == "stable" ]] && gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" >/dev/null 2>&1; then
+            echo "Stable tag ${TAG} already exists: skip publishing"
+            echo 'publish=false' >> "$GITHUB_OUTPUT"
+          else
+            echo 'publish=true' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download binaries from successful CI run
+        if: steps.gate.outputs.publish == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+          gh run download "$CI_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --pattern 'kvstore-*' --dir ./dist
+          test "$(find ./dist -type f | wc -l)" -eq 4
+
+      - name: Set up Docker Buildx
+        if: steps.gate.outputs.publish == 'true'
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        if: steps.gate.outputs.publish == 'true'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Build and publish Docker image (amd64 + arm64)
+        if: steps.gate.outputs.publish == 'true'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            BUILD_CHANNEL=${{ steps.meta.outputs.branch }}
+          tags: ${{ steps.meta.outputs.docker_tags }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.meta.outputs.sha }}
+            org.opencontainers.image.version=${{ steps.meta.outputs.build_version }}
+
+      - name: Create GitHub release
+        if: steps.gate.outputs.publish == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHANNEL: ${{ steps.meta.outputs.branch }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          SHA: ${{ steps.meta.outputs.sha }}
+        run: |
+          set -euo pipefail
+          args=(--target "$SHA" --title "$TAG" --generate-notes)
+          if [[ "$CHANNEL" == "nightly" ]]; then
+            args+=(--prerelease --latest=false)
+          fi
+          gh release create "$TAG" ./dist/*/* "${args[@]}"

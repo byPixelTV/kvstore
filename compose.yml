@@ -1,0 +1,27 @@
+services:
+  services:
+    kvstore:
+      build:
+        context: .
+        dockerfile: Dockerfile
+        args:
+          BUILD_CHANNEL: ${BUILD_CHANNEL:-stable}
+      image: kvstore:local
+      restart: unless-stopped
+      init: true
+      read_only: true
+      ports:
+        # Local-only until authentication / TLS are implemented.
+        - "127.0.0.1:50051:50051"
+      environment:
+        KVSTORE_LISTEN_ADDR: ":50051"
+        KVSTORE_DATA_DIR: "/data"
+      volumes:
+        - kvstore-data:/data
+      security_opt:
+        - no-new-privileges:true
+      cap_drop:
+        - ALL
+
+  volumes:
+    kvstore-data:

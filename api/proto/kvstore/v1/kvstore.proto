@@ -1,0 +1,42 @@
+syntax = "proto3";
+
+package kvstore.v1;
+
+option go_package = "github.com/byPixelTV/kvstore/gen/go/kvstore/v1;kvstorev1";
+
+service KVStore {
+  rpc Get(GetRequest) returns (GetResponse);
+  rpc Set(SetRequest) returns (SetResponse);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+}
+
+message GetRequest {
+  string namespace = 1;
+  string key = 2;
+}
+
+message GetResponse {
+  bool found = 1;
+  bytes value = 2;
+  uint64 revision = 3;
+}
+
+message SetRequest {
+  string namespace = 1;
+  string key = 2;
+  bytes value = 3;
+}
+
+message SetResponse {
+  uint64 revision = 1;
+}
+
+message DeleteRequest {
+  string namespace = 1;
+  string key = 2;
+}
+
+message DeleteResponse {
+  bool deleted = 1;
+  uint64 revision = 2;
+}
