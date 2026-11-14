@@ -28,8 +28,19 @@ type clusterWriteRequest struct {
 	ctx      context.Context
 	queuedAt time.Time
 	cmd      command
-	reply    chan writeResponse
+	// batch is non-nil for a client BatchWrite RPC. Keep it as ONE Raft
+	// command so a migration fence cannot reject unrelated queued writes.
+	batch      []command
+	reply      chan writeResponse
+	batchReply chan batchWriteResponse
 }
+
+type batchWriteResponse struct {
+	revisions []uint64
+	err       error
+}
+
+func (r clusterWriteRequest) isBatch() bool { return r.batch != nil }
 
 type WritePerformance struct {
 	Submitted          uint64  `json:"submitted_writes"`
@@ -43,6 +54,8 @@ type WritePerformance struct {
 	AverageQueueMS     float64 `json:"average_queue_wait_ms"`
 	InFlight           int64   `json:"in_flight"`
 	PeakInFlight       int64   `json:"peak_in_flight"`
+	BatchRPCs          uint64  `json:"submitted_batch_rpcs"`
+	BatchLogicalWrites uint64  `json:"submitted_batch_logical_writes"`
 	MaxInFlight        int     `json:"configured_max_in_flight"`
 	BatchTarget        int     `json:"configured_batch_target"`
 	BatchWindowMS      float64 `json:"configured_batch_window_ms"`
@@ -59,6 +72,8 @@ type writeCounters struct {
 	admissionNanos atomic.Uint64
 	queueNanos     atomic.Uint64
 	queuedCount    atomic.Uint64
+	batchRPCs      atomic.Uint64
+	batchLogical   atomic.Uint64
 	inFlight       atomic.Int64
 	peak           atomic.Int64
 }
@@ -124,6 +139,7 @@ func (b *clusterWriteBatcher) Performance() WritePerformance {
 		Completed: count, GroupErrors: b.stats.failed.Load(),
 		InFlight: b.stats.inFlight.Load(), PeakInFlight: b.stats.peak.Load(),
 		MaxInFlight: b.maxInflight, QueueDepth: len(b.queue),
+		BatchRPCs: b.stats.batchRPCs.Load(), BatchLogicalWrites: b.stats.batchLogical.Load(),
 		BatchTarget: b.batchTarget, BatchWindowMS: float64(b.batchWindow) / 1e6,
 		BatchMaxWindowMS: float64(b.batchMaxWindow) / 1e6,
 	}
@@ -171,6 +187,47 @@ func (b *clusterWriteBatcher) Submit(ctx context.Context, cmd command) (uint64, 
 	}
 }
 
+// SubmitBatch sends one atomic batch through the SAME bounded pipeline as
+// ordinary SET and DELETE calls. It never mixes a user batch with unrelated
+// requests: a replicated migration fence must not reject other clients'
+// operations merely because they shared a physical Raft command.
+// An RPC timeout after admission has UNKNOWN commit outcome; no retry.
+func (b *clusterWriteBatcher) SubmitBatch(ctx context.Context, commands []command) ([]uint64, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if len(commands) == 0 || len(commands) > 128 {
+		return nil, errors.New("invalid batch length")
+	}
+	copyCommands := make([]command, len(commands))
+	copy(copyCommands, commands)
+	for i := range copyCommands {
+		copyCommands[i].Value = bytes.Clone(copyCommands[i].Value)
+	}
+	req := clusterWriteRequest{ctx: ctx, queuedAt: time.Now(), batch: copyCommands, batchReply: make(chan batchWriteResponse, 1)}
+	b.gate.RLock()
+	if b.closed {
+		b.gate.RUnlock()
+		return nil, errClusterBatchClosed
+	}
+	select {
+	case b.queue <- req:
+		b.stats.submitted.Add(uint64(len(commands)))
+		b.stats.batchRPCs.Add(1)
+		b.stats.batchLogical.Add(uint64(len(commands)))
+		b.gate.RUnlock()
+	case <-ctx.Done():
+		b.gate.RUnlock()
+		return nil, ctx.Err()
+	}
+	select {
+	case res := <-req.batchReply:
+		return res.revisions, res.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
 func (b *clusterWriteBatcher) Close() {
 	b.gate.Lock()
 	if !b.closed {
@@ -203,57 +260,51 @@ func (b *clusterWriteBatcher) loop() {
 			}
 			first = next
 		}
-		// Reserve the next Raft pipeline slot BEFORE starting the collection
-		// window. When the pipeline is saturated, waiting for a slot lets
-		// requests accumulate in the bounded queue. The next batch drains
-		// that backlog rather than being frozen at a small batch size while
-		// waiting for an in-flight future to finish.
+		// First reserve capacity. Under disk contention the queue builds up
+		// and the next batch can use that backlog efficiently.
 		slots <- struct{}{}
 		group := []clusterWriteRequest{first}
-		totalBytes := estimateRaftCommand(first.cmd)
-		// Under a saturated I/O pipeline, a few extra milliseconds of
-		// batching can amortize the Raft log-store sync and the Pebble
-		// FSM sync across more logical writes. Stop early once target is
-		// reached so a large backlog does NOT pay the full extra delay.
-		// A lightly loaded cluster retains the low-latency base window.
-		window := batchCollectionWindow(b.batchWindow, b.batchMaxWindow, len(slots))
-
-		timer := time.NewTimer(window)
 		queueClosed := false
-	collect:
-		for len(group) < b.batchMax {
-			select {
-			case next, ok := <-b.queue:
-				if !ok {
-					queueClosed = true
+		if !first.isBatch() {
+			totalBytes := estimateRaftCommand(first.cmd)
+			window := batchCollectionWindow(b.batchWindow, b.batchMaxWindow, len(slots))
+			timer := time.NewTimer(window)
+		collect:
+			for len(group) < b.batchMax {
+				select {
+				case next, ok := <-b.queue:
+					if !ok {
+						queueClosed = true
+						break collect
+					}
+					// A client BatchWrite is an indivisible Raft command,
+					// including with respect to migration fences.
+					if next.isBatch() {
+						pending = &next
+						break collect
+					}
+					estimated := estimateRaftCommand(next.cmd)
+					if totalBytes+estimated > clusterWriteBatchBytes {
+						pending = &next
+						break collect
+					}
+					group = append(group, next)
+					totalBytes += estimated
+					if len(group) >= b.batchTarget {
+						break collect
+					}
+				case <-timer.C:
 					break collect
 				}
-				estimated := estimateRaftCommand(next.cmd)
-				if totalBytes+estimated > clusterWriteBatchBytes {
-					pending = &next
-					break collect
-				}
-				group = append(group, next)
-				totalBytes += estimated
-				// We already have enough writes to amortize one durable
-				// commit. No need to hold these clients for the whole timer.
-				if len(group) >= b.batchTarget {
-					break collect
-				}
-			case <-timer.C:
-				break collect
 			}
-		}
-		if !timer.Stop() {
-			select {
-			case <-timer.C:
-			default:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
 			}
 		}
 
-		// The old implementation blocked here until this whole group had
-		// committed. That kept Raft at ONE outstanding command regardless of
-		// concurrency. Keep submission ordered, but await futures concurrently.
 		b.dispatch(group, slots, &wg)
 		if queueClosed && pending == nil {
 			return
@@ -262,6 +313,7 @@ func (b *clusterWriteBatcher) loop() {
 }
 
 func (b *clusterWriteBatcher) dispatch(group []clusterWriteRequest, slots chan struct{}, wg *sync.WaitGroup) {
+	isBatch := group[0].isBatch()
 	results := make([]writeResponse, len(group))
 	commands := make([]command, 0, len(group))
 	positions := make([]int, 0, len(group))
@@ -272,48 +324,57 @@ func (b *clusterWriteBatcher) dispatch(group []clusterWriteRequest, slots chan s
 			results[i].err = err
 			continue
 		}
-		commands = append(commands, req.cmd)
-		positions = append(positions, i)
+		if isBatch {
+			commands = append(commands, req.batch...)
+		} else {
+			commands = append(commands, req.cmd)
+			positions = append(positions, i)
+		}
 	}
+	var batchResult batchWriteResponse
 	replyAll := func() {
+		if isBatch {
+			group[0].batchReply <- batchResult
+			return
+		}
 		for i, req := range group {
 			req.reply <- results[i]
 		}
 	}
 	if len(commands) == 0 {
+		if isBatch {
+			batchResult.err = group[0].ctx.Err()
+		}
 		replyAll()
 		<-slots
 		return
 	}
 
 	cmd := commands[0]
-	if len(commands) > 1 {
+	if isBatch {
 		cmd = command{Operation: opBatch, Commands: commands}
+	} else if len(commands) > 1 {
+		cmd = command{Operation: opMicrobatch, Commands: commands}
 	}
 	raw, err := json.Marshal(cmd)
-	if err != nil {
-		for _, i := range positions {
-			results[i].err = err
-		}
-		replyAll()
-		<-slots
-		return
-	}
-	// The maxBytes estimate is conservative, but enforce the real encoded
-	// payload limit too: callers get an error, never a silently truncated batch.
-	if len(raw) > clusterWriteBatchBytes {
+	if err == nil && len(raw) > clusterWriteBatchBytes {
 		err = fmt.Errorf("raft command too large (%d bytes)", len(raw))
-		for _, i := range positions {
-			results[i].err = err
+	}
+	if err != nil {
+		if isBatch {
+			batchResult.err = err
+		} else {
+			for _, i := range positions {
+				results[i].err = err
+			}
 		}
 		replyAll()
 		<-slots
 		return
 	}
 
-	// Bound outstanding Raft commands and goroutines under overload.
-	// The loop already reserved a slot. Only it submits to raft.Apply,
-	// preserving log submission order despite asynchronous completion.
+	// The submission loop is the only writer into raft.Apply. This keeps
+	// the log append order deterministic while futures complete in parallel.
 	started := time.Now()
 	future := b.node.raft.Apply(raw, opTimeout)
 	b.stats.admissionNanos.Add(uint64(time.Since(started).Nanoseconds()))
@@ -330,8 +391,7 @@ func (b *clusterWriteBatcher) dispatch(group []clusterWriteRequest, slots chan s
 	go func() {
 		defer wg.Done()
 		defer func() { b.stats.inFlight.Add(-1); <-slots }()
-		// Future.Error() may remain unresolved when quorum disappears. Cap
-		// client wait, matching the original applyDirect() 10s timeout.
+		// A Raft timeout does not imply that a write was rolled back.
 		outcome := make(chan error, 1)
 		go func() { outcome <- future.Error() }()
 		var applyErr error
@@ -348,6 +408,12 @@ func (b *clusterWriteBatcher) dispatch(group []clusterWriteRequest, slots chan s
 				applyErr = fmt.Errorf("unexpected FSM response: %T", future.Response())
 			} else if response.Err != nil {
 				applyErr = response.Err
+			} else if isBatch {
+				if len(response.Revisions) != len(commands) {
+					applyErr = fmt.Errorf("raft batch returned %d revisions for %d commands", len(response.Revisions), len(commands))
+				} else {
+					batchResult.revisions = response.Revisions
+				}
 			} else if len(commands) == 1 {
 				results[positions[0]].revision = response.Revision
 			} else if len(response.Revisions) != len(commands) {
@@ -355,13 +421,23 @@ func (b *clusterWriteBatcher) dispatch(group []clusterWriteRequest, slots chan s
 			} else {
 				for j, i := range positions {
 					results[i].revision = response.Revisions[j]
+					if len(response.Errors) == len(commands) {
+						results[i].err = response.Errors[j]
+						if results[i].err != nil {
+							b.stats.failed.Add(1)
+						}
+					}
 				}
 			}
 		}
 		if applyErr != nil {
 			b.stats.failed.Add(1)
-			for _, i := range positions {
-				results[i].err = applyErr
+			if isBatch {
+				batchResult.err = applyErr
+			} else {
+				for _, i := range positions {
+					results[i].err = applyErr
+				}
 			}
 		}
 		replyAll()

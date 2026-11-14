@@ -2,7 +2,6 @@ package cluster
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 
 	kvstorev1 "github.com/byPixelTV/kvstore/gen/go/kvstore/v1"
@@ -80,20 +79,7 @@ func (n *Node) BatchWrite(ctx context.Context, operations []storage.WriteOperati
 		}
 		return revisions, nil
 	}
-	cmd := command{Operation: opBatch, Commands: commands}
-	encoded, err := json.Marshal(cmd)
-	if err != nil {
-		return nil, err
-	}
-	if len(encoded) > clusterWriteBatchBytes {
-		return nil, status.Error(codes.ResourceExhausted, "encoded batch exceeds Raft log budget")
-	}
-	result, err := n.applyDirect(ctx, cmd)
-	if err != nil {
-		return nil, err
-	}
-	if len(result.Revisions) != len(commands) {
-		return nil, errors.New("Raft batch result count mismatch")
-	}
-	return result.Revisions, nil
+	// Share the bounded, ordered Raft pipeline with point-writes. The queue
+	// preserves atomicity: it will never mix this batch with other requests.
+	return n.writes.SubmitBatch(ctx, commands)
 }

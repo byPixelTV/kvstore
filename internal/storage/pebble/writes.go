@@ -243,6 +243,9 @@ func (s *Store) applyGroup(group []writeRequest) {
 
 	commitAttempted := false
 	if batchErr == nil && changed {
+		batchErr = writer.Flush()
+	}
+	if batchErr == nil && changed {
 		var encoded [8]byte
 		binary.BigEndian.PutUint64(encoded[:], next)
 		batchErr = batch.Set(revisionKey, encoded[:], nil)
@@ -269,8 +272,10 @@ func (s *Store) applyGroup(group []writeRequest) {
 		s.readMu.Lock()
 		old := s.published
 		s.published = snapshot
-		_ = old.Close() // no readers hold the previous snapshot
 		s.readMu.Unlock()
+		// All readers using the old snapshot finished before the swap.
+		// Do not stall new GETs while Pebble releases snapshot resources.
+		_ = old.Close()
 		s.revision = next
 		s.oldest, s.historyBytes = writer.State()
 		s.notifier.Signal()

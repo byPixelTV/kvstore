@@ -89,6 +89,13 @@ func (c *readFenceCoordinator) Wait(ctx context.Context) error {
 
 	select {
 	case <-ctx.Done():
+		// The client left before the next verification started: do not
+		// inflate its pending batch or spend a quorum roundtrip for it.
+		c.mu.Lock()
+		if c.pending == b && b.waiters > 0 {
+			b.waiters--
+		}
+		c.mu.Unlock()
 		return ctx.Err()
 	case <-b.done:
 		return b.err
@@ -108,6 +115,10 @@ func (c *readFenceCoordinator) execute(b *readFenceBatch) {
 	}
 	waiters := b.waiters
 	c.mu.Unlock()
+	if waiters == 0 {
+		close(b.done) // all clients canceled before quorum verification
+		return
+	}
 
 	queueWait := time.Since(b.created)
 	active := c.stats.activeVerifications.Add(1)

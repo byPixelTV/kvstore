@@ -119,6 +119,7 @@ type report struct {
 	LeaderRouteSwitches uint64          `json:"leader_route_switches,omitempty"`
 	LeaderFailovers     uint64          `json:"leader_failovers,omitempty"`
 	BatchSize           int             `json:"batch_size"`
+	TargetOpsPerSecond  int             `json:"target_ops_per_sec,omitempty"`
 	Get                 operationReport `json:"get"`
 	Set                 operationReport `json:"set"`
 	Watch               *watchReport    `json:"watch,omitempty"`
@@ -143,6 +144,7 @@ type options struct {
 	valueSize     int
 	readPercent   int
 	batchSize     int
+	targetOps     int
 	hotKeyIndex   int
 	hotPercent    int
 	timeout       time.Duration
@@ -167,6 +169,7 @@ func main() {
 	flag.IntVar(&opt.valueSize, "value-size", 256, "value payload size in bytes")
 	flag.IntVar(&opt.readPercent, "read-percent", 80, "percentage of logical reads in mixed mode")
 	flag.IntVar(&opt.batchSize, "batch-size", 1, "logical writes per BatchWrite RPC; 1 uses legacy Set")
+	flag.IntVar(&opt.targetOps, "target-ops", 0, "maximum offered logical ops/second across workers (0=unlimited)")
 	flag.IntVar(&opt.hotKeyIndex, "hot-key-index", -1, "optional single hot key index in keyspace (-1 disables)")
 	flag.IntVar(&opt.hotPercent, "hot-percent", 0, "percentage of operations targeting the hot key (0..100)")
 	flag.DurationVar(&opt.timeout, "timeout", 8*time.Second, "per-RPC timeout")
@@ -186,7 +189,7 @@ func main() {
 	}
 }
 func valid(o options) bool {
-	return (o.consistency == "strong" || o.consistency == "eventual") && (o.mode == "get" || o.mode == "set" || o.mode == "mixed" || o.mode == "watch") && o.duration > 0 && o.warmup >= 0 && o.connections > 0 && o.concurrency > 0 && o.keys > 0 && o.valueSize >= 8 && o.valueSize <= 256<<10 && o.readPercent >= 0 && o.readPercent <= 100 && o.batchSize >= 1 && o.batchSize <= 128 && o.batchSize*(o.valueSize+128+64) <= 256<<10 && o.hotPercent >= 0 && o.hotPercent <= 100 && (o.hotKeyIndex == -1 || (o.hotKeyIndex >= 0 && o.hotKeyIndex < o.keys)) && (o.hotPercent == 0 || o.hotKeyIndex >= 0) && o.timeout > 0 && o.leaderRefresh >= 0 && o.watchers > 0 && o.watchRate > 0 && o.watchRate <= 100000
+	return (o.consistency == "strong" || o.consistency == "eventual") && (o.mode == "get" || o.mode == "set" || o.mode == "mixed" || o.mode == "watch") && o.duration > 0 && o.warmup >= 0 && o.connections > 0 && o.concurrency > 0 && o.keys > 0 && o.valueSize >= 8 && o.valueSize <= 256<<10 && o.readPercent >= 0 && o.readPercent <= 100 && o.batchSize >= 1 && o.batchSize <= 128 && o.targetOps >= 0 && o.targetOps <= 10000000 && o.batchSize*(o.valueSize+128+64) <= 256<<10 && o.hotPercent >= 0 && o.hotPercent <= 100 && (o.hotKeyIndex == -1 || (o.hotKeyIndex >= 0 && o.hotKeyIndex < o.keys)) && (o.hotPercent == 0 || o.hotKeyIndex >= 0) && o.timeout > 0 && o.leaderRefresh >= 0 && o.watchers > 0 && o.watchRate > 0 && o.watchRate <= 100000
 }
 
 // resolveLeaderAddress asks the load balancer for the Raft leader and maps
@@ -268,7 +271,7 @@ func run(opt options) error {
 	if err != nil {
 		return fmt.Errorf("GET connectivity check: %w", err)
 	}
-	rep := report{Mode: opt.mode, Consistency: opt.consistency, Address: opt.address, ResolvedAddress: target, Namespace: namespace, DurationSeconds: opt.duration.Seconds(), WarmupSeconds: opt.warmup.Seconds(), Concurrency: opt.concurrency, Connections: opt.connections, Keyspace: opt.keys, ValueBytes: opt.valueSize, BatchSize: opt.batchSize, CPUs: runtime.NumCPU()}
+	rep := report{Mode: opt.mode, Consistency: opt.consistency, Address: opt.address, ResolvedAddress: target, Namespace: namespace, DurationSeconds: opt.duration.Seconds(), WarmupSeconds: opt.warmup.Seconds(), Concurrency: opt.concurrency, Connections: opt.connections, Keyspace: opt.keys, ValueBytes: opt.valueSize, BatchSize: opt.batchSize, TargetOpsPerSecond: opt.targetOps, CPUs: runtime.NumCPU()}
 	if opt.mode == "watch" {
 		err = runWatch(opt, clients, namespace, &rep)
 	} else {
@@ -414,6 +417,7 @@ func runRPC(opt options, clients []kvstorev1.KVStoreClient, namespace string, re
 	start := time.Now()
 	measureFrom := start.Add(opt.warmup)
 	end := measureFrom.Add(opt.duration)
+	pacer := newLogicalPacer(opt.targetOps)
 	type partial struct{ get, set aggregate }
 	result := make(chan partial, opt.concurrency)
 	var wg sync.WaitGroup
@@ -442,6 +446,13 @@ func runRPC(opt options, clients []kvstorev1.KVStoreClient, namespace string, re
 				isRead := opt.mode == "get" || (opt.mode == "mixed" && rng.Intn(100) < readChance)
 				if opt.mode == "set" {
 					isRead = false
+				}
+				weight := 1
+				if !isRead && opt.batchSize > 1 {
+					weight = opt.batchSize
+				}
+				if !pacer.Wait(weight, end) {
+					break
 				}
 				ctx, cancel := rpcContext(opt.timeout)
 				begun := time.Now()

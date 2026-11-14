@@ -17,6 +17,8 @@ type BatchWriter struct {
 	oldest, used uint64
 	hasFloor     bool
 	pending      map[uint64]uint64
+	floorDirty   bool
+	bytesDirty   bool
 }
 
 func NewBatchWriter(db *pebble.DB, batch *pebble.Batch, oldest, used uint64, hasFloor bool) *BatchWriter {
@@ -67,11 +69,32 @@ func (w *BatchWriter) Append(event Change) error {
 		w.used -= size
 		w.oldest++
 	}
+	// Metadata is only written once per COMMIT, not once per event. Each
+	// 128-write Raft batch previously staged 128 redundant byte-count sets.
+	// Call Flush before committing the Pebble batch.
 	if !w.hasFloor || original != w.oldest {
+		w.floorDirty = true
+		w.hasFloor = true
+	}
+	w.bytesDirty = true
+	return nil
+}
+
+// Flush must be called once after all Append calls and BEFORE the owning
+// Pebble batch is committed. It leaves all revision/event mutations in the
+// caller's same atomic, durable commit; no separate metadata fsync occurs.
+func (w *BatchWriter) Flush() error {
+	if w.floorDirty {
 		if err := w.batch.Set(FloorKey, EncodedFloor(w.oldest), nil); err != nil {
 			return err
 		}
-		w.hasFloor = true
+		w.floorDirty = false
 	}
-	return w.batch.Set(ByteCountKey, EncodedFloor(w.used), nil)
+	if w.bytesDirty {
+		if err := w.batch.Set(ByteCountKey, EncodedFloor(w.used), nil); err != nil {
+			return err
+		}
+		w.bytesDirty = false
+	}
+	return nil
 }

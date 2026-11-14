@@ -117,16 +117,26 @@ func (r *Router) BatchWrite(ctx context.Context, req *kvstorev1.BatchWriteReques
 					results[part.positions[i]] = &kvstorev1.BatchWriteResult{GrpcCode: uint32(codes.Internal), Error: "shard returned missing result"}
 					continue
 				}
-				copyItem := *item
-				if item.GetGrpcCode() == 0 && item.GetRevision() != 0 {
-					encoded, e := EncodeRevision(shard, item.GetRevision())
-					if e != nil {
-						results[part.positions[i]] = &kvstorev1.BatchWriteResult{GrpcCode: uint32(codes.Internal), Error: e.Error()}
+				copyItem := &kvstorev1.BatchWriteResult{
+					Revision: item.GetRevision(),
+					Deleted:  item.GetDeleted(),
+					GrpcCode: item.GetGrpcCode(),
+					Error:    item.GetError(),
+				}
+
+				if copyItem.GrpcCode == 0 && copyItem.Revision != 0 {
+					encoded, err := EncodeRevision(shard, copyItem.Revision)
+					if err != nil {
+						results[part.positions[i]] = &kvstorev1.BatchWriteResult{
+							GrpcCode: uint32(codes.Internal),
+							Error:    err.Error(),
+						}
 						continue
 					}
 					copyItem.Revision = encoded
 				}
-				results[part.positions[i]] = &copyItem
+
+				results[part.positions[i]] = copyItem
 			}
 		}(shard, part)
 	}

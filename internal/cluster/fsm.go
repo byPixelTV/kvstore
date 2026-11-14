@@ -37,7 +37,10 @@ const (
 	opDelete = "delete"
 	opPeer   = "peer"
 	opBatch  = "batch"
-	opFence  = "slot-fence"
+	// Each operation in a microbatch belongs to an independent point RPC.
+	// A migration fence must reject only the affected request, not its peers.
+	opMicrobatch = "microbatch"
+	opFence      = "slot-fence"
 )
 
 type peerInfo struct {
@@ -61,6 +64,7 @@ type command struct {
 type applyResult struct {
 	Revision  uint64
 	Revisions []uint64
+	Errors    []error
 	Err       error
 }
 
@@ -477,7 +481,28 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
 		if err := json.Unmarshal(log.Data, &cmd); err != nil {
 			return fail(fmt.Errorf("decode committed log %d: %w", log.Index, err))
 		}
-		if cmd.Operation == opBatch {
+		if cmd.Operation == opMicrobatch {
+			if len(cmd.Commands) < 1 || len(cmd.Commands) > maxRaftCommandsPerBatch {
+				return fail(errors.New("invalid microbatch size"))
+			}
+			revisions := make([]uint64, len(cmd.Commands))
+			itemErrors := make([]error, len(cmd.Commands))
+			for j, item := range cmd.Commands {
+				if item.Operation != opSet && item.Operation != opDelete {
+					return fail(fmt.Errorf("invalid microbatch operation %q", item.Operation))
+				}
+				if isSealed(item) {
+					itemErrors[j] = status.Error(codes.FailedPrecondition, "write rejected by replicated migration fence; refresh routing")
+					continue
+				}
+				rev, err := applyOne(item)
+				if err != nil {
+					return fail(err)
+				}
+				revisions[j] = rev
+			}
+			responses[i] = applyResult{Revisions: revisions, Errors: itemErrors}
+		} else if cmd.Operation == opBatch {
 			if len(cmd.Commands) == 0 || len(cmd.Commands) > maxRaftCommandsPerBatch {
 				return fail(errors.New("invalid raft command batch size"))
 			}
@@ -525,6 +550,9 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
 		return responses
 	}
 	if changed {
+		if err := history.Flush(); err != nil {
+			return fail(err)
+		}
 		if err := batch.Set(revisionKey, encode64(nextRevision), nil); err != nil {
 			return fail(err)
 		}
@@ -553,10 +581,12 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
 		f.readMu.Lock()
 		oldRead := f.published
 		f.published = newRead
+		f.readMu.Unlock()
+		// The write lock guarantees that no previous reader still uses
+		// oldRead. Close it OUTSIDE the read lock to minimize GET tail latency.
 		if oldRead != nil {
 			_ = oldRead.Close()
 		}
-		f.readMu.Unlock()
 		f.revision = nextRevision
 		f.oldest, f.historyBytes = history.State()
 		f.hasFloor = true
@@ -687,10 +717,10 @@ func (f *FSM) Restore(reader io.ReadCloser) error {
 	oldRead := f.published
 	f.published = newRead
 	f.readFailure = nil
+	f.readMu.Unlock()
 	if oldRead != nil {
 		_ = oldRead.Close()
 	}
-	f.readMu.Unlock()
 	f.notifier.Signal()
 	return nil
 }

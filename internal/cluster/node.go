@@ -38,6 +38,7 @@ type Node struct {
 	raft        *raft.Raft
 	fsm         *FSM
 	raftStore   *raftboltdb.BoltStore
+	logStats    *raftLogMetrics
 	transport   *raft.NetworkTransport
 	admin       *http.Server
 	clientsMu   sync.Mutex
@@ -111,7 +112,22 @@ func Open(cfg config.Config) (_ *Node, err error) {
 	if err != nil {
 		return nil, err
 	}
-	r, err := raft.NewRaft(rCfg, fsm, bolt, bolt, snaps, transport)
+	// Recently appended log entries are re-read for follower replication.
+	// Cache only reads; every StoreLogs still passes through to durable BoltDB.
+	logMetrics := &raftLogMetrics{}
+	var logStore raft.LogStore = &measuredLogStore{inner: bolt, stats: logMetrics}
+	if cfg.RaftLogCacheEntries != 0 {
+		entries := cfg.RaftLogCacheEntries
+		if entries < 0 {
+			entries = 512
+		} // manually constructed test config
+		cache, e := raft.NewLogCache(entries, logStore)
+		if e != nil {
+			return nil, fmt.Errorf("create Raft log cache: %w", e)
+		}
+		logStore = cache
+	}
+	r, err := raft.NewRaft(rCfg, fsm, logStore, bolt, snaps, transport)
 	if err != nil {
 		return nil, err
 	}
@@ -123,6 +139,7 @@ func Open(cfg config.Config) (_ *Node, err error) {
 		}
 	}
 	node := &Node{cfg: cfg, raft: r, fsm: fsm, raftStore: bolt, transport: transport, clients: make(map[string]*grpc.ClientConn)}
+	node.logStats = logMetrics
 	batchWindow := cfg.ReadBatchWindow
 	if batchWindow == 0 { // support tests and manually constructed Config values
 		batchWindow = 300 * time.Microsecond

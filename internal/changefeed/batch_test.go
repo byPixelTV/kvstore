@@ -34,6 +34,9 @@ func TestBatchWriterEvictsNewlyStagedEvents(t *testing.T) {
 	if floor != 3 {
 		t.Fatalf("retention floor=%d want 3", floor)
 	}
+	if err := writer.Flush(); err != nil {
+		t.Fatal(err)
+	}
 	if err := batch.Commit(pebble.Sync); err != nil {
 		t.Fatal(err)
 	}

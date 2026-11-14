@@ -39,6 +39,7 @@ type Config struct {
 	RaftMaxAppendEntries  int
 	RaftCommitTimeout     time.Duration
 	RaftMaxInflight       int
+	RaftLogCacheEntries   int
 }
 
 func getenv(key, def string) string {
@@ -134,6 +135,10 @@ func Load() (Config, error) {
 	c.RaftCommitTimeout, err = time.ParseDuration(getenv("KVSTORE_RAFT_COMMIT_TIMEOUT", "50ms"))
 	if err != nil || c.RaftCommitTimeout < time.Millisecond || c.RaftCommitTimeout > time.Second {
 		return c, fmt.Errorf("KVSTORE_RAFT_COMMIT_TIMEOUT must be between 1ms and 1s")
+	}
+	c.RaftLogCacheEntries, err = strconv.Atoi(getenv("KVSTORE_RAFT_LOG_CACHE_ENTRIES", "512"))
+	if err != nil || c.RaftLogCacheEntries < 0 || c.RaftLogCacheEntries > 8192 {
+		return c, fmt.Errorf("KVSTORE_RAFT_LOG_CACHE_ENTRIES must be 0..8192")
 	}
 	c.RaftMaxInflight, err = strconv.Atoi(getenv("KVSTORE_RAFT_MAX_INFLIGHT", "16"))
 	if err != nil || c.RaftMaxInflight < 1 || c.RaftMaxInflight > 128 {
