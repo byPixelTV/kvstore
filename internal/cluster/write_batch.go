@@ -12,14 +12,14 @@ import (
 )
 
 const (
-	clusterWriteBatchWindow   = 250 * time.Microsecond
-	clusterWriteBatchMax      = 128
+	clusterWriteBatchWindow   = 1500 * time.Microsecond
+	clusterWriteBatchMax      = 256
 	clusterWriteQueueCapacity = 8192
 	// A 256-KiB value fits, including JSON/base64 overhead. Never enlarge
 	// a batch beyond this budget just because the command count allows it.
 	clusterWriteBatchBytes  = 400 << 10
 	maxRaftCommandsPerBatch = 256
-	defaultRaftInflight     = 16
+	defaultRaftInflight     = 8
 )
 
 var errClusterBatchClosed = errors.New("cluster write batcher is closed")
@@ -178,7 +178,18 @@ func (b *clusterWriteBatcher) loop() {
 		}
 		group := []clusterWriteRequest{first}
 		totalBytes := estimateRaftCommand(first.cmd)
-		timer := time.NewTimer(b.batchWindow)
+		// When the replication pipeline is almost saturated, accept a
+		// slightly longer *bounded* collection window. This coalesces more
+		// logical writes per Raft log entry instead of producing many tiny
+		// entries while the leader is busy applying earlier groups.
+		window := b.batchWindow
+		if cap(slots) > 1 && len(slots) >= cap(slots)-1 {
+			window *= 2
+			if window > 5*time.Millisecond {
+				window = 5 * time.Millisecond
+			}
+		}
+		timer := time.NewTimer(window)
 		queueClosed := false
 	collect:
 		for len(group) < b.batchMax {

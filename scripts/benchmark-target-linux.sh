@@ -16,15 +16,18 @@ DURATION="${TARGET_DURATION:-15s}"
 WARMUP="${TARGET_WARMUP:-3s}"
 VALUE_SIZE="${TARGET_VALUE_SIZE:-256}"
 KEYSPACE="${TARGET_KEYSPACE:-256}"
-CONSISTENCY="${TARGET_CONSISTENCY:-eventual}"
+CONSISTENCY="${TARGET_CONSISTENCY:-strong}"
+LEADER_MAP="${TARGET_LEADER_MAP:-}"
 ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 OUT="$ROOT/benchmarks/results/target-$ID"
 mkdir -p "$OUT"
 
-for mode in set mixed; do
+for mode in mixed; do
     file="$OUT/${mode}-${CONSISTENCY}.json"
     echo "== $mode endpoint=$ENDPOINT workers=$WORKERS consistency=$CONSISTENCY =="
-    "$BENCH" -addr "$ENDPOINT" -mode "$mode" \
+    leader_flags=()
+    if [[ -n "$LEADER_MAP" ]]; then leader_flags=(-leader-map "$LEADER_MAP"); fi
+    "$BENCH" -addr "$ENDPOINT" -mode "$mode" "${leader_flags[@]}" \
        -consistency "$CONSISTENCY" -read-percent 50 \
        -duration "$DURATION" -warmup "$WARMUP" \
        -concurrency "$WORKERS" -connections "$CONNECTIONS" \

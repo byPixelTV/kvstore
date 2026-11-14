@@ -16,12 +16,14 @@ import (
 	"os"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
 	kvstorev1 "github.com/byPixelTV/kvstore/gen/go/kvstore/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
 )
 
 const sampleSize = 20000
@@ -102,6 +104,7 @@ type report struct {
 	Mode            string          `json:"mode"`
 	Consistency     string          `json:"consistency"`
 	Address         string          `json:"address"`
+	ResolvedAddress string          `json:"resolved_address,omitempty"`
 	Namespace       string          `json:"namespace"`
 	DurationSeconds float64         `json:"duration_seconds"`
 	WarmupSeconds   float64         `json:"warmup_seconds"`
@@ -136,6 +139,7 @@ type options struct {
 	watchers    int
 	watchRate   int
 	jsonOutput  bool
+	leaderMap   string
 }
 
 func main() {
@@ -153,6 +157,7 @@ func main() {
 	flag.DurationVar(&opt.timeout, "timeout", 8*time.Second, "per-RPC timeout")
 	flag.IntVar(&opt.watchers, "watchers", 5, "concurrent Watch subscribers in watch mode")
 	flag.IntVar(&opt.watchRate, "watch-rate", 100, "target writes/second in watch mode")
+	flag.StringVar(&opt.leaderMap, "leader-map", "", "route directly to Raft leader using gRPC metadata; map advertised=reachable targets, comma-separated")
 	flag.BoolVar(&opt.jsonOutput, "json", false, "write JSON report to standard output")
 	flag.Parse()
 	if !valid(opt) {
@@ -167,12 +172,57 @@ func main() {
 func valid(o options) bool {
 	return (o.consistency == "strong" || o.consistency == "eventual") && (o.mode == "get" || o.mode == "set" || o.mode == "mixed" || o.mode == "watch") && o.duration > 0 && o.warmup >= 0 && o.connections > 0 && o.concurrency > 0 && o.keys > 0 && o.valueSize >= 8 && o.valueSize <= 256<<10 && o.readPercent >= 0 && o.readPercent <= 100 && o.timeout > 0 && o.watchers > 0 && o.watchRate > 0 && o.watchRate <= 100000
 }
+
+// resolveLeaderAddress asks the load balancer for the Raft leader and maps
+// the advertised Docker/private address to a reachable address. No arbitrary
+// target from untrusted gRPC metadata is dialed: the mapping is explicit.
+func resolveLeaderAddress(bootstrap, mapping string, timeout time.Duration) (string, error) {
+	mappings := make(map[string]string)
+	for _, item := range strings.Split(mapping, ",") {
+		pair := strings.SplitN(strings.TrimSpace(item), "=", 2)
+		if len(pair) != 2 || pair[0] == "" || pair[1] == "" {
+			return "", fmt.Errorf("invalid -leader-map entry %q (expected advertised=reachable)", item)
+		}
+		mappings[pair[0]] = pair[1]
+	}
+	conn, err := grpc.NewClient(bootstrap, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return "", err
+	}
+	defer conn.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	var hdr metadata.MD
+	ctx = metadata.AppendToOutgoingContext(ctx, "kvstore-discover-leader", "1")
+	_, err = kvstorev1.NewKVStoreClient(conn).Head(ctx, &kvstorev1.HeadRequest{}, grpc.Header(&hdr))
+	if err != nil {
+		return "", fmt.Errorf("leader discovery Head: %w", err)
+	}
+	advertised := hdr.Get("kvstore-leader-grpc")
+	if len(advertised) == 0 || advertised[0] == "" {
+		return "", errors.New("no leader metadata from cluster endpoint")
+	}
+	if target := mappings[advertised[0]]; target != "" {
+		return target, nil
+	}
+	return "", fmt.Errorf("Raft leader %q missing from -leader-map", advertised[0])
+}
+
 func run(opt options) error {
 	var runID [8]byte
 	if _, err := rand.Read(runID[:]); err != nil {
 		return err
 	}
 	namespace := fmt.Sprintf("kvbench-%x", runID)
+	target := opt.address
+	if opt.leaderMap != "" {
+		var err error
+		target, err = resolveLeaderAddress(opt.address, opt.leaderMap, opt.timeout)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(os.Stderr, "kvbench: leader %s -> %s\n", opt.address, target)
+	}
 	connections := make([]*grpc.ClientConn, 0, opt.connections)
 	defer func() {
 		for _, c := range connections {
@@ -181,7 +231,7 @@ func run(opt options) error {
 	}()
 	clients := make([]kvstorev1.KVStoreClient, 0, opt.connections)
 	for i := 0; i < opt.connections; i++ {
-		conn, err := grpc.NewClient(opt.address, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		conn, err := grpc.NewClient(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err != nil {
 			return err
 		}
@@ -194,7 +244,7 @@ func run(opt options) error {
 	if err != nil {
 		return fmt.Errorf("Head connectivity check: %w", err)
 	}
-	rep := report{Mode: opt.mode, Consistency: opt.consistency, Address: opt.address, Namespace: namespace, DurationSeconds: opt.duration.Seconds(), WarmupSeconds: opt.warmup.Seconds(), Concurrency: opt.concurrency, Connections: opt.connections, Keyspace: opt.keys, ValueBytes: opt.valueSize, CPUs: runtime.NumCPU()}
+	rep := report{Mode: opt.mode, Consistency: opt.consistency, Address: opt.address, ResolvedAddress: target, Namespace: namespace, DurationSeconds: opt.duration.Seconds(), WarmupSeconds: opt.warmup.Seconds(), Concurrency: opt.concurrency, Connections: opt.connections, Keyspace: opt.keys, ValueBytes: opt.valueSize, CPUs: runtime.NumCPU()}
 	if opt.mode == "watch" {
 		err = runWatch(opt, clients, namespace, &rep)
 	} else {

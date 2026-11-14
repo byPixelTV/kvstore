@@ -22,6 +22,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/metadata"
 )
 
 var version = "dev" // -ldflags=-X main.version=...
@@ -84,7 +85,23 @@ func run() (runErr error) {
 	}
 	defer listener.Close()
 	service := kvstore.New(store)
-	grpcServer := grpc.NewServer()
+	grpcOptions := []grpc.ServerOption{}
+	if node != nil {
+		grpcOptions = append(grpcOptions, grpc.UnaryInterceptor(func(ctx context.Context, req any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+			// Topology is revealed only when a client explicitly opts into
+			// leader discovery, not on every public unary RPC.
+			if md, ok := metadata.FromIncomingContext(ctx); ok {
+				request := md.Get("kvstore-discover-leader")
+				if len(request) == 1 && request[0] == "1" {
+					if addr := node.LeaderGRPCAddr(); addr != "" {
+						_ = grpc.SetHeader(ctx, metadata.Pairs("kvstore-leader-grpc", addr))
+					}
+				}
+			}
+			return handler(ctx, req)
+		}))
+	}
+	grpcServer := grpc.NewServer(grpcOptions...)
 	kvstorev1.RegisterKVStoreServer(grpcServer, grpcserver.New(service))
 	healthSrv := health.NewServer()
 	healthpb.RegisterHealthServer(grpcServer, healthSrv)

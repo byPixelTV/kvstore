@@ -12,9 +12,10 @@ import (
 // starts. Joining an already in-flight quorum verification would be unsafe:
 // it could have proven leadership before the later read was invoked.
 //
-// Each batch performs one ordered barrier + quorum verification, then every
-// waiter in the batch may read its own key from the committed local FSM.
-// This avoids one Raft LogBarrier per incoming GET.
+// Each batch verifies quorum leadership. The Node's leaderFence performs
+// a Raft log barrier only on the first read of a leadership term, ensuring
+// the FSM has applied all prior-term commits. Every waiter in the batch may
+// then read its own key from the local committed FSM.
 type readFenceCoordinator struct {
 	mu      sync.Mutex
 	pending *readFenceBatch

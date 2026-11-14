@@ -43,6 +43,8 @@ VALUE_SIZE="${VALUE_SIZE:-256}"
 KEYSPACE="${KEYSPACE:-256}"
 CONCURRENCIES="${CONCURRENCIES:-32 128}"
 WORKLOADS="${WORKLOADS:-set mixed}"
+READ_PERCENT="${READ_PERCENT:-50}"
+LEADER_MAP="${LEADER_MAP:-}"
 CONNECTIONS="${CONNECTIONS:-8}"
 WATCHERS="${WATCHERS:-5}"
 WATCH_RATE="${WATCH_RATE:-300}"
@@ -161,8 +163,13 @@ run_one() {
   local deployment="$1" mode="$2" consistency="$3" concurrency="$4" addr="$5" run="$6" label="$7"
   local output="$OUT/${deployment}-${label}-${mode}-${consistency}-c${concurrency}-r${run}.json"
   echo "[$deployment/$label/$mode/$consistency] workers=$concurrency run=$run/$RUNS"
+  local -a leader_flags=()
+  if [[ "$deployment" == cluster && "$label" == leader && -n "$LEADER_MAP" ]]; then
+    leader_flags=(-leader-map "$LEADER_MAP")
+  fi
   ./bin/kvbench \
     -addr "$addr" -mode "$mode" -consistency "$consistency" \
+    "${leader_flags[@]}" -read-percent "$READ_PERCENT" \
     -duration "${DURATION_SECONDS}s" -warmup "${WARMUP_SECONDS}s" \
     -concurrency "$concurrency" -connections "$CONNECTIONS" \
     -keys "$KEYSPACE" -value-size "$VALUE_SIZE" \
@@ -196,6 +203,10 @@ echo '== Starting isolated 3-node Raft cluster + Envoy =='
 "${cluster[@]}" up -d --no-build --wait --wait-timeout 150
 ready cluster
 benchmark_set cluster strong 127.0.0.1:50051 envoy
+if [[ -n "$LEADER_MAP" ]]; then
+  echo '== Running same cluster workloads with direct leader routing =='
+  benchmark_set cluster strong 127.0.0.1:50051 leader
+fi
 
 "${cluster[@]}" logs --tail 300 > "$OUT/cluster-logs.txt" 2>&1 || true
 if command -v curl >/dev/null 2>&1; then

@@ -32,17 +32,18 @@ const opTimeout = 10 * time.Second
 // Node implements storage.Store while routing writes and strong reads to Raft's
 // current leader. Peers never write directly to Pebble outside FSM.Apply.
 type Node struct {
-	cfg       config.Config
-	raft      *raft.Raft
-	fsm       *FSM
-	raftStore *raftboltdb.BoltStore
-	transport *raft.NetworkTransport
-	admin     *http.Server
-	clientsMu sync.Mutex
-	clients   map[string]*grpc.ClientConn
-	reads     *readFenceCoordinator
-	writes    *clusterWriteBatcher
-	readStats readMetrics
+	cfg         config.Config
+	raft        *raft.Raft
+	fsm         *FSM
+	raftStore   *raftboltdb.BoltStore
+	transport   *raft.NetworkTransport
+	admin       *http.Server
+	clientsMu   sync.Mutex
+	clients     map[string]*grpc.ClientConn
+	reads       *readFenceCoordinator
+	writes      *clusterWriteBatcher
+	readStats   readMetrics
+	leaderReads leaderFence
 }
 
 var _ storage.Store = (*Node)(nil)
@@ -121,6 +122,23 @@ func Open(cfg config.Config) (_ *Node, err error) {
 	batchMax := cfg.ReadBatchMax
 	if batchMax == 0 {
 		batchMax = 256
+	}
+	node.leaderReads = leaderFence{
+		term: node.raftTerm,
+		barrier: func() error {
+			begin := time.Now()
+			err := node.raft.Barrier(opTimeout).Error()
+			node.readStats.barrierCalls.Add(1)
+			node.readStats.barrierNanos.Add(uint64(time.Since(begin).Nanoseconds()))
+			return err
+		},
+		verify: func() error {
+			begin := time.Now()
+			err := node.raft.VerifyLeader().Error()
+			node.readStats.verifyCalls.Add(1)
+			node.readStats.verifyNanos.Add(uint64(time.Since(begin).Nanoseconds()))
+			return err
+		},
 	}
 	node.reads = newReadFenceCoordinator(batchWindow, batchMax, node.strongFence, &node.readStats)
 	node.writes = newClusterWriteBatcher(node)
@@ -235,28 +253,24 @@ func (n *Node) client(target string) (kvstorev1.KVStoreClient, error) {
 	return kvstorev1.NewKVStoreClient(conn), nil
 }
 
-// strongFence is called exactly once for a batch of reads. Barrier drains
-// previously queued writes into the FSM, then VerifyLeader verifies quorum
-// leadership AFTER the barrier. No newly arrived read may join that batch.
+// strongFence proves quorum leadership for each batch, while the expensive
+// Raft log barrier is executed only once per leadership term. The first
+// barrier ensures prior-term commits have reached the local FSM.
 func (n *Node) strongFence() error {
-	begin := time.Now()
-	err := n.raft.Barrier(opTimeout).Error()
-	n.readStats.barrierCalls.Add(1)
-	n.readStats.barrierNanos.Add(uint64(time.Since(begin).Nanoseconds()))
-	if err != nil {
+	if err := n.leaderReads.Fence(); err != nil {
 		return status.Error(codes.Unavailable, err.Error())
-	}
-	begin = time.Now()
-	err = n.raft.VerifyLeader().Error()
-	n.readStats.verifyCalls.Add(1)
-	n.readStats.verifyNanos.Add(uint64(time.Since(begin).Nanoseconds()))
-	if err != nil {
-		return status.Error(codes.Unavailable, err.Error())
-	}
-	if n.raft.State() != raft.Leader {
-		return status.Error(codes.Unavailable, "Raft leadership changed")
 	}
 	return nil
+}
+
+// LeaderGRPCAddr returns an *advisory* leader endpoint for clients that can
+// reach the cluster's internal gRPC network. It is not an authorization token.
+func (n *Node) LeaderGRPCAddr() string {
+	peer, err := n.leaderPeer()
+	if err != nil {
+		return ""
+	}
+	return peer.GRPCAddr
 }
 
 func (n *Node) readStrong(ctx context.Context) error {
