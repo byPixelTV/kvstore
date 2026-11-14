@@ -128,6 +128,7 @@ type watchReport struct {
 	DeliveryLatency  percentile `json:"delivery_latency"`
 }
 type options struct {
+	namespace     string
 	address       string
 	mode          string
 	consistency   string
@@ -138,6 +139,8 @@ type options struct {
 	keys          int
 	valueSize     int
 	readPercent   int
+	hotKeyIndex   int
+	hotPercent    int
 	timeout       time.Duration
 	watchers      int
 	watchRate     int
@@ -149,6 +152,7 @@ type options struct {
 func main() {
 	opt := options{}
 	flag.StringVar(&opt.address, "addr", "127.0.0.1:50051", "KVStore gRPC endpoint")
+	flag.StringVar(&opt.namespace, "namespace", "", "optional deterministic test namespace; use an isolated benchmark namespace only")
 	flag.StringVar(&opt.mode, "mode", "mixed", "get, set, mixed, or watch")
 	flag.StringVar(&opt.consistency, "consistency", "strong", "strong or eventual for GET requests")
 	flag.DurationVar(&opt.duration, "duration", 15*time.Second, "measured duration")
@@ -158,6 +162,8 @@ func main() {
 	flag.IntVar(&opt.keys, "keys", 1000, "number of distinct benchmark keys")
 	flag.IntVar(&opt.valueSize, "value-size", 256, "value payload size in bytes")
 	flag.IntVar(&opt.readPercent, "read-percent", 80, "percentage of reads in mixed mode")
+	flag.IntVar(&opt.hotKeyIndex, "hot-key-index", -1, "optional single hot key index in keyspace (-1 disables)")
+	flag.IntVar(&opt.hotPercent, "hot-percent", 0, "percentage of operations targeting the hot key (0..100)")
 	flag.DurationVar(&opt.timeout, "timeout", 8*time.Second, "per-RPC timeout")
 	flag.IntVar(&opt.watchers, "watchers", 5, "concurrent Watch subscribers in watch mode")
 	flag.IntVar(&opt.watchRate, "watch-rate", 100, "target writes/second in watch mode")
@@ -175,7 +181,7 @@ func main() {
 	}
 }
 func valid(o options) bool {
-	return (o.consistency == "strong" || o.consistency == "eventual") && (o.mode == "get" || o.mode == "set" || o.mode == "mixed" || o.mode == "watch") && o.duration > 0 && o.warmup >= 0 && o.connections > 0 && o.concurrency > 0 && o.keys > 0 && o.valueSize >= 8 && o.valueSize <= 256<<10 && o.readPercent >= 0 && o.readPercent <= 100 && o.timeout > 0 && o.leaderRefresh >= 0 && o.watchers > 0 && o.watchRate > 0 && o.watchRate <= 100000
+	return (o.consistency == "strong" || o.consistency == "eventual") && (o.mode == "get" || o.mode == "set" || o.mode == "mixed" || o.mode == "watch") && o.duration > 0 && o.warmup >= 0 && o.connections > 0 && o.concurrency > 0 && o.keys > 0 && o.valueSize >= 8 && o.valueSize <= 256<<10 && o.readPercent >= 0 && o.readPercent <= 100 && o.hotPercent >= 0 && o.hotPercent <= 100 && (o.hotKeyIndex == -1 || (o.hotKeyIndex >= 0 && o.hotKeyIndex < o.keys)) && (o.hotPercent == 0 || o.hotKeyIndex >= 0) && o.timeout > 0 && o.leaderRefresh >= 0 && o.watchers > 0 && o.watchRate > 0 && o.watchRate <= 100000
 }
 
 // resolveLeaderAddress asks the load balancer for the Raft leader and maps
@@ -219,6 +225,9 @@ func run(opt options) error {
 		return err
 	}
 	namespace := fmt.Sprintf("kvbench-%x", runID)
+	if opt.namespace != "" {
+		namespace = opt.namespace
+	}
 	target := opt.address
 	var pool *leaderRoutePool
 	clients := make([]kvstorev1.KVStoreClient, 0, opt.connections)
@@ -350,6 +359,7 @@ func runRPC(opt options, clients []kvstorev1.KVStoreClient, namespace string, re
 	if err := prefill(opt, clients, namespace); err != nil {
 		return err
 	}
+	fmt.Fprintf(os.Stderr, "kvbench: prefill complete namespace=%s\n", namespace)
 	start := time.Now()
 	measureFrom := start.Add(opt.warmup)
 	end := measureFrom.Add(opt.duration)
@@ -365,7 +375,11 @@ func runRPC(opt options, clients []kvstorev1.KVStoreClient, namespace string, re
 			value := fill(opt.valueSize)
 			p := partial{}
 			for time.Now().Before(end) {
-				key := keyAt(rng.Intn(opt.keys))
+				index := rng.Intn(opt.keys)
+				if opt.hotKeyIndex >= 0 && opt.hotPercent > 0 && rng.Intn(100) < opt.hotPercent {
+					index = opt.hotKeyIndex
+				}
+				key := keyAt(index)
 				isRead := opt.mode == "get" || (opt.mode == "mixed" && rng.Intn(100) < opt.readPercent)
 				if opt.mode == "set" {
 					isRead = false

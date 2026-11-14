@@ -2,12 +2,16 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"errors"
 	"fmt"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"log/slog"
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -91,7 +95,19 @@ func run() (runErr error) {
 	service := kvstore.New(store)
 	grpcOptions := []grpc.ServerOption{}
 	if node != nil {
-		grpcOptions = append(grpcOptions, grpc.UnaryInterceptor(func(ctx context.Context, req any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+		grpcOptions = append(grpcOptions, grpc.UnaryInterceptor(func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+			// Replicated fences are privileged. Other public RPCs cannot toggle
+			// the write protection used by online migration.
+			if info.FullMethod == "/kvstore.v1.KVStore/FenceSlot" {
+				md, ok := metadata.FromIncomingContext(ctx)
+				if !ok {
+					return nil, status.Error(codes.PermissionDenied, "fence operation requires authorization")
+				}
+				auth := md.Get("authorization")
+				if len(auth) != 1 || subtle.ConstantTimeCompare([]byte(strings.TrimSpace(strings.TrimPrefix(auth[0], "Bearer "))), []byte(cfg.JoinToken)) != 1 || !strings.HasPrefix(auth[0], "Bearer ") {
+					return nil, status.Error(codes.PermissionDenied, "fence operation requires authorization")
+				}
+			}
 			// Topology is revealed only when a client explicitly opts into
 			// leader discovery, not on every public unary RPC.
 			if md, ok := metadata.FromIncomingContext(ctx); ok {
@@ -106,7 +122,11 @@ func run() (runErr error) {
 		}))
 	}
 	grpcServer := grpc.NewServer(grpcOptions...)
-	kvstorev1.RegisterKVStoreServer(grpcServer, grpcserver.New(service))
+	if node != nil {
+		kvstorev1.RegisterKVStoreServer(grpcServer, grpcserver.New(service, node))
+	} else {
+		kvstorev1.RegisterKVStoreServer(grpcServer, grpcserver.New(service))
+	}
 	healthSrv := health.NewServer()
 	healthpb.RegisterHealthServer(grpcServer, healthSrv)
 	healthSrv.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)

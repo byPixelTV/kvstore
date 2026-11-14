@@ -18,14 +18,16 @@ CONNECTIONS="${CONNECTIONS:-16}"
 NODE_MEMORY="${NODE_MEMORY:-2g}"
 [[ "$RUNS" =~ ^[1-9][0-9]*$ ]] || { echo 'RUNS must be positive' >&2; exit 2; }
 # These ports are only bound to localhost; don't interrupt any existing services.
-if ss -H -lnt | awk '$4 ~ /:(50081|1710[1-9])$/ {print; clash=1} END {exit clash ? 0 : 1}'; then
+if ss -H -lnt | awk '$4 ~ /:(50081|1710[1-9]|17110)$/ {print; clash=1} END {exit clash ? 0 : 1}'; then
  echo 'Sharded benchmark port already in use; nothing started.' >&2; exit 1
 fi
 RUN_ID="sharded-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 PROJECT="kvbench-${RUN_ID,,}"
 OUT="$ROOT/benchmarks/results/live-linux/$RUN_ID"
 mkdir -p "$OUT" "$ROOT/bin"
+echo "$PROJECT" > "$OUT/project-name.txt"
 export KVSTORE_JOIN_TOKEN="${KVSTORE_JOIN_TOKEN:-$(od -An -N32 -tx1 /dev/urandom | tr -d '[:space:]')}"
+export KVSTORE_ROUTER_ADMIN_TOKEN="${KVSTORE_ROUTER_ADMIN_TOKEN:-$(od -An -N32 -tx1 /dev/urandom | tr -d '[:space:]')}"
 cat > "$OUT/override.yml" <<YAML
 x-limits: &limits
   image: kvstore:multiraft-dev
@@ -64,7 +66,7 @@ cleanup() {
   done; done
  fi
  docker ps --format '{{.ID}} {{.Names}} {{.Status}}' > "$OUT/containers-after.txt" 2>/dev/null || true
- if [[ "${KEEP_RUNNING:-0}" != 1 ]]; then "${compose[@]}" stop >/dev/null 2>&1 || true; fi
+ if [[ "${KEEP_RUNNING:-0}" != 1 || "$rc" -ne 0 ]]; then "${compose[@]}" stop >/dev/null 2>&1 || true; fi
  echo "Results: $OUT"
  echo "Only isolated project $PROJECT was stopped; volumes preserved."
  exit "$rc"
@@ -92,8 +94,9 @@ if ! docker cp "$container_id:/usr/local/bin/kvbench" "$ROOT/bin/kvbench-sharded
  docker rm "$container_id" >/dev/null
  exit 1
 fi
-docker rm "$container_id" >/dev/null
-chmod +x "$ROOT/bin/kvbench-sharded"
+docker cp "$container_id:/usr/local/bin/kvshardctl" "$ROOT/bin/kvshardctl-sharded" >/dev/null
+ docker rm "$container_id" >/dev/null
+ chmod +x "$ROOT/bin/kvbench-sharded" "$ROOT/bin/kvshardctl-sharded"
 echo '== Starting 9 Raft backends and 1 sharding router =='
 "${compose[@]}" up -d --no-build
 router_id="$("${compose[@]}" ps -q router)"
@@ -110,6 +113,22 @@ echo '== Running 50/50 STRONG point-operation workloads =='
 for concurrency in $CONCURRENCIES; do
  for ((run=1;run<=RUNS;run++)); do
   output="$OUT/sharded-mixed-strong-c${concurrency}-r${run}.json"
+  # Capture host I/O pressure and per-shard Raft counters per individual run.
+  cat /proc/pressure/io > "$OUT/io-before-c${concurrency}-r${run}.txt" 2>/dev/null || true
+  cat /proc/pressure/cpu > "$OUT/cpu-before-c${concurrency}-r${run}.txt" 2>/dev/null || true
+  snapshot_metrics() {
+   local prefix="$1"
+   if command -v curl >/dev/null; then
+    for s in 0 1 2; do for n in 0 1 2; do
+     local port=$((17101+s*3+n))
+     curl -fsS --max-time 2 -H "Authorization: Bearer $KVSTORE_JOIN_TOKEN" \
+       "http://127.0.0.1:${port}/v1/cluster/performance" \
+       > "$OUT/${prefix}-s${s}n${n}.json" 2>/dev/null &
+    done; done
+    wait || true
+   fi
+  }
+  snapshot_metrics "before-c${concurrency}-r${run}"
   echo "[sharded/strong/mixed] workers=$concurrency run=$run/$RUNS"
   "$ROOT/bin/kvbench-sharded" -addr 127.0.0.1:50081 -mode mixed \
    -consistency strong -read-percent 50 -duration "${DURATION_SECONDS}s" \
@@ -117,6 +136,9 @@ for concurrency in $CONCURRENCIES; do
    -connections "$CONNECTIONS" -keys "$KEYSPACE" \
    -value-size "$VALUE_SIZE" -json > "${output}.tmp"
   mv "${output}.tmp" "$output"
+  snapshot_metrics "after-c${concurrency}-r${run}"
+  cat /proc/pressure/io > "$OUT/io-after-c${concurrency}-r${run}.txt" 2>/dev/null || true
+  cat /proc/pressure/cpu > "$OUT/cpu-after-c${concurrency}-r${run}.txt" 2>/dev/null || true
   if command -v jq >/dev/null; then
    jq -er '"  GET: \(.get.ops_sec|floor)/s p99=\(.get.latency.p99_ms)ms; SET: \(.set.ops_sec|floor)/s p99=\(.set.latency.p99_ms)ms; errors=\(.get.errors+.set.errors) missing=\(.get.not_found)"' "$output"
    jq -e '(.get.errors+.set.errors)==0 and .get.not_found==0 and .get.ops_sec>0 and .set.ops_sec>0' "$output" >/dev/null || { echo "Benchmark errors: $output" >&2; exit 1; }

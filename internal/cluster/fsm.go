@@ -14,9 +14,12 @@ import (
 	"time"
 
 	"github.com/byPixelTV/kvstore/internal/changefeed"
+	"github.com/byPixelTV/kvstore/internal/sharding"
 	"github.com/byPixelTV/kvstore/internal/storage"
 	"github.com/cockroachdb/pebble/v2"
 	"github.com/hashicorp/raft"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // These key prefixes match the existing standalone Pebble record encoding.
@@ -34,6 +37,7 @@ const (
 	opDelete = "delete"
 	opPeer   = "peer"
 	opBatch  = "batch"
+	opFence  = "slot-fence"
 )
 
 type peerInfo struct {
@@ -50,6 +54,8 @@ type command struct {
 	Value     []byte    `json:"value,omitempty"`
 	Peer      *peerInfo `json:"peer,omitempty"`
 	Commands  []command `json:"commands,omitempty"`
+	Slot      uint32    `json:"slot,omitempty"`
+	Sealed    bool      `json:"sealed,omitempty"`
 }
 
 type applyResult struct {
@@ -72,6 +78,7 @@ type FSM struct {
 	hasFloor     bool
 	historyBytes uint64
 	notifier     changefeed.Notifier
+	sealed       map[sealID]bool
 	failed       error
 	metrics      fsmApplyMetrics
 }
@@ -179,6 +186,31 @@ func (f *FSM) refreshMeta() error {
 	if f.oldest > rev+1 {
 		return errors.New("history floor exceeds revision")
 	}
+	sealed := make(map[sealID]bool)
+	it, err := f.db.NewIter(&pebble.IterOptions{LowerBound: []byte{4}, UpperBound: []byte{5}})
+	if err != nil {
+		return err
+	}
+	for ok := it.First(); ok; ok = it.Next() {
+		id, e := decodeSealedKey(it.Key())
+		if e != nil {
+			_ = it.Close()
+			return e
+		}
+		if !bytes.Equal(it.Value(), []byte{1}) {
+			_ = it.Close()
+			return errors.New("invalid sealed slot value")
+		}
+		sealed[id] = true
+	}
+	if err := it.Error(); err != nil {
+		_ = it.Close()
+		return err
+	}
+	if err := it.Close(); err != nil {
+		return err
+	}
+	f.sealed = sealed
 	return nil
 }
 
@@ -216,6 +248,36 @@ func encode64(value uint64) []byte {
 	return b[:]
 }
 func peerKey(id string) []byte { return append([]byte{2}, id...) }
+
+type sealID struct {
+	namespace string
+	slot      uint16
+}
+
+func sealedKey(namespace string, slot uint16) []byte {
+	b := binary.AppendUvarint([]byte{4}, uint64(len(namespace)))
+	b = append(b, namespace...)
+	return binary.BigEndian.AppendUint16(b, slot)
+}
+func decodeSealedKey(b []byte) (sealID, error) {
+	if len(b) < 4 || b[0] != 4 {
+		return sealID{}, errors.New("invalid sealed key")
+	}
+	n, length := binary.Uvarint(b[1:])
+	if length <= 0 || 1+length+2 > len(b) || n > uint64(len(b)-1-length-2) {
+		return sealID{}, errors.New("invalid sealed namespace length")
+	}
+	ns := string(b[1+length : 1+length+int(n)])
+	trailer := b[1+length+int(n):]
+	if len(trailer) != 2 || ns == "" {
+		return sealID{}, errors.New("invalid sealed slot metadata")
+	}
+	slot := binary.BigEndian.Uint16(trailer)
+	if slot >= sharding.SlotCount {
+		return sealID{}, errors.New("out-of-range sealed slot")
+	}
+	return sealID{ns, slot}, nil
+}
 
 func (f *FSM) Get(ctx context.Context, ns, key string) (storage.Record, bool, error) {
 	if err := ctx.Err(); err != nil {
@@ -304,6 +366,17 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
 	defer batch.Close()
 	history := changefeed.NewBatchWriter(f.db, batch, f.oldest, f.historyBytes, f.hasFloor)
 	shadow := make(map[string]bool, len(logs))
+	stagedSeals := make(map[sealID]bool)
+	isSealed := func(c command) bool {
+		if len(f.sealed) == 0 && len(stagedSeals) == 0 {
+			return false
+		}
+		id := sealID{c.Namespace, sharding.Slot(c.Namespace, c.Key)}
+		if value, found := stagedSeals[id]; found {
+			return value
+		}
+		return f.sealed[id]
+	}
 	nextRevision, nextApplied := f.revision, f.applied
 	changed := false
 
@@ -357,6 +430,21 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
 				return 0, err
 			}
 			changed = true
+		case opFence:
+			if cmd.Namespace == "" || cmd.Slot >= sharding.SlotCount {
+				return 0, errors.New("invalid migration fence")
+			}
+			id := sealID{cmd.Namespace, uint16(cmd.Slot)}
+			if cmd.Sealed {
+				if err := batch.Set(sealedKey(cmd.Namespace, id.slot), []byte{1}, nil); err != nil {
+					return 0, err
+				}
+			} else {
+				if err := batch.Delete(sealedKey(cmd.Namespace, id.slot), nil); err != nil {
+					return 0, err
+				}
+			}
+			stagedSeals[id] = cmd.Sealed
 		case opPeer:
 			if cmd.Peer == nil || cmd.Peer.ID == "" || cmd.Peer.RaftAddr == "" || cmd.Peer.GRPCAddr == "" || cmd.Peer.AdminAddr == "" {
 				return 0, errors.New("invalid peer metadata")
@@ -394,6 +482,20 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
 				return fail(errors.New("invalid raft command batch size"))
 			}
 			revisions := make([]uint64, len(cmd.Commands))
+			blocked := false
+			for _, item := range cmd.Commands {
+				if item.Operation != opSet && item.Operation != opDelete {
+					return fail(fmt.Errorf("invalid batched operation %q", item.Operation))
+				}
+				if isSealed(item) {
+					blocked = true
+				}
+			}
+			if blocked {
+				responses[i] = applyResult{Err: status.Error(codes.FailedPrecondition, "write rejected by replicated migration fence; refresh routing")}
+				nextApplied = log.Index
+				continue
+			}
 			for j, item := range cmd.Commands {
 				if item.Operation != opSet && item.Operation != opDelete {
 					return fail(fmt.Errorf("invalid batched operation %q", item.Operation))
@@ -406,6 +508,11 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
 			}
 			responses[i] = applyResult{Revisions: revisions}
 		} else {
+			if (cmd.Operation == opSet || cmd.Operation == opDelete) && isSealed(cmd) {
+				responses[i] = applyResult{Err: status.Error(codes.FailedPrecondition, "write rejected by replicated migration fence; refresh routing")}
+				nextApplied = log.Index
+				continue
+			}
 			revision, err := applyOne(cmd)
 			if err != nil {
 				return fail(err)
@@ -432,6 +539,13 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
 	commitDuration := time.Since(commitStarted)
 	logicalWrites := nextRevision - f.revision
 	f.applied = nextApplied
+	for id, sealed := range stagedSeals {
+		if sealed {
+			f.sealed[id] = true
+		} else {
+			delete(f.sealed, id)
+		}
+	}
 	if changed {
 		// Do not publish until Pebble.Sync is complete. Acquire readMu only
 		// for the snapshot swap; outstanding readers finish before old.Close.

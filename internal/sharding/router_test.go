@@ -146,7 +146,11 @@ func (s *fakeScanStream) Recv() (*kvstorev1.ScanResponse, error) {
 	return v, nil
 }
 func (f *fakeShard) Scan(_ context.Context, _ *kvstorev1.ScanRequest, _ ...grpc.CallOption) (grpc.ServerStreamingClient[kvstorev1.ScanResponse], error) {
-	return &fakeScanStream{items: []*kvstorev1.ScanResponse{{Checkpoint: true, SnapshotRevision: uint64(100 + f.id)}, {Key: fmt.Sprintf("key%d", f.id), Value: []byte("abc"), Revision: 9}}}, nil
+	key := fmt.Sprintf("key%d", f.id)
+	for i := 0; Shard("mc", key) != f.id && i < 10000; i++ {
+		key = fmt.Sprintf("key-%d-%d", f.id, i)
+	}
+	return &fakeScanStream{items: []*kvstorev1.ScanResponse{{Checkpoint: true, SnapshotRevision: uint64(100 + f.id)}, {Key: key, Value: []byte("abc"), Revision: 9}}}, nil
 }
 
 type scanSink struct {
@@ -197,7 +201,11 @@ type fakeWatchStream struct {
 func (s *fakeWatchStream) Recv() (*kvstorev1.WatchResponse, error) {
 	var result *kvstorev1.WatchResponse
 	s.once.Do(func() {
-		result = &kvstorev1.WatchResponse{Namespace: "mc", Key: fmt.Sprintf("k%d", s.id), Revision: uint64(20 + s.id)}
+		key := fmt.Sprintf("k%d", s.id)
+		for i := 0; Shard("mc", key) != s.id && i < 10000; i++ {
+			key = fmt.Sprintf("watch-%d-%d", s.id, i)
+		}
+		result = &kvstorev1.WatchResponse{Namespace: "mc", Key: key, Revision: uint64(20 + s.id)}
 	})
 	if result != nil {
 		return result, nil

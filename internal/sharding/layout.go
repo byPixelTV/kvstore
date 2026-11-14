@@ -97,14 +97,18 @@ func DecodeCursor(encoded string) (Cursor, error) {
 		return c, nil
 	} // explicit opt-in may start at revision zero
 	raw, err := base64.RawURLEncoding.DecodeString(encoded)
-	if err != nil || len(raw) != 1+4+8*ShardCount {
+	if err != nil || (len(raw) != 1+4+8*ShardCount && len(raw) != 1+4+8+8*ShardCount) {
 		return c, errors.New("invalid sharded cursor encoding")
 	}
-	if raw[0] != 1 || binary.BigEndian.Uint32(raw[1:5]) != LayoutVersion {
+	if (raw[0] != 1 && raw[0] != 2) || binary.BigEndian.Uint32(raw[1:5]) != LayoutVersion || (raw[0] == 1 && len(raw) != 1+4+8*ShardCount) || (raw[0] == 2 && len(raw) != 1+4+8+8*ShardCount) {
 		return c, errors.New("unsupported cursor/layout version; rescan required")
 	}
+	offset := 5
+	if raw[0] == 2 {
+		offset = 13
+	}
 	for i := range c {
-		c[i] = binary.BigEndian.Uint64(raw[5+i*8 : 13+i*8])
+		c[i] = binary.BigEndian.Uint64(raw[offset+i*8 : offset+8+i*8])
 	}
 	return c, nil
 }

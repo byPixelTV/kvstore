@@ -18,12 +18,14 @@ import (
 	kvstorev1 "github.com/byPixelTV/kvstore/gen/go/kvstore/v1"
 	"github.com/byPixelTV/kvstore/internal/changefeed"
 	"github.com/byPixelTV/kvstore/internal/config"
+	"github.com/byPixelTV/kvstore/internal/sharding"
 	"github.com/byPixelTV/kvstore/internal/storage"
 	"github.com/hashicorp/raft"
 	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
 
@@ -184,6 +186,34 @@ func (n *Node) Close() error {
 	if e := n.fsm.Close(); e != nil {
 		err = errors.Join(err, e)
 	}
+	return err
+}
+
+// FenceSlot is replicated through Raft, preserving ordering with all writes.
+// After a seal is confirmed, all later commands for the slot are rejected by
+// the FSM (not only by the router). This prevents unknown-outcome writes from
+// silently appearing on the old owner after a migration cutover.
+func (n *Node) FenceSlot(ctx context.Context, namespace string, slot uint16, sealed bool) error {
+	if namespace == "" || slot >= sharding.SlotCount {
+		return status.Error(codes.InvalidArgument, "invalid namespace/slot")
+	}
+	if n.raft.State() != raft.Leader {
+		peer, err := n.leaderPeer()
+		if err != nil {
+			return err
+		}
+		if peer.ID == n.cfg.NodeID {
+			return status.Error(codes.Unavailable, "leader transition")
+		}
+		client, err := n.client(peer.GRPCAddr)
+		if err != nil {
+			return err
+		}
+		authCtx := metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+n.cfg.JoinToken)
+		_, err = client.FenceSlot(authCtx, &kvstorev1.FenceSlotRequest{Namespace: namespace, Slot: uint32(slot), Sealed: sealed})
+		return err
+	}
+	_, err := n.applyDirect(ctx, command{Operation: opFence, Namespace: namespace, Slot: uint32(slot), Sealed: sealed})
 	return err
 }
 

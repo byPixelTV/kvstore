@@ -19,12 +19,13 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	KVStore_Get_FullMethodName    = "/kvstore.v1.KVStore/Get"
-	KVStore_Set_FullMethodName    = "/kvstore.v1.KVStore/Set"
-	KVStore_Delete_FullMethodName = "/kvstore.v1.KVStore/Delete"
-	KVStore_Head_FullMethodName   = "/kvstore.v1.KVStore/Head"
-	KVStore_Watch_FullMethodName  = "/kvstore.v1.KVStore/Watch"
-	KVStore_Scan_FullMethodName   = "/kvstore.v1.KVStore/Scan"
+	KVStore_Get_FullMethodName       = "/kvstore.v1.KVStore/Get"
+	KVStore_Set_FullMethodName       = "/kvstore.v1.KVStore/Set"
+	KVStore_Delete_FullMethodName    = "/kvstore.v1.KVStore/Delete"
+	KVStore_Head_FullMethodName      = "/kvstore.v1.KVStore/Head"
+	KVStore_Watch_FullMethodName     = "/kvstore.v1.KVStore/Watch"
+	KVStore_Scan_FullMethodName      = "/kvstore.v1.KVStore/Scan"
+	KVStore_FenceSlot_FullMethodName = "/kvstore.v1.KVStore/FenceSlot"
 )
 
 // KVStoreClient is the client API for KVStore service.
@@ -37,6 +38,9 @@ type KVStoreClient interface {
 	Head(ctx context.Context, in *HeadRequest, opts ...grpc.CallOption) (*HeadResponse, error)
 	Watch(ctx context.Context, in *WatchRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[WatchResponse], error)
 	Scan(ctx context.Context, in *ScanRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ScanResponse], error)
+	// Internal Raft-replicated write fence for lossless live slot migration.
+	// Only trusted router may call this, authenticated by the join token.
+	FenceSlot(ctx context.Context, in *FenceSlotRequest, opts ...grpc.CallOption) (*FenceSlotResponse, error)
 }
 
 type kVStoreClient struct {
@@ -125,6 +129,16 @@ func (c *kVStoreClient) Scan(ctx context.Context, in *ScanRequest, opts ...grpc.
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type KVStore_ScanClient = grpc.ServerStreamingClient[ScanResponse]
 
+func (c *kVStoreClient) FenceSlot(ctx context.Context, in *FenceSlotRequest, opts ...grpc.CallOption) (*FenceSlotResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(FenceSlotResponse)
+	err := c.cc.Invoke(ctx, KVStore_FenceSlot_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // KVStoreServer is the server API for KVStore service.
 // All implementations must embed UnimplementedKVStoreServer
 // for forward compatibility.
@@ -135,6 +149,9 @@ type KVStoreServer interface {
 	Head(context.Context, *HeadRequest) (*HeadResponse, error)
 	Watch(*WatchRequest, grpc.ServerStreamingServer[WatchResponse]) error
 	Scan(*ScanRequest, grpc.ServerStreamingServer[ScanResponse]) error
+	// Internal Raft-replicated write fence for lossless live slot migration.
+	// Only trusted router may call this, authenticated by the join token.
+	FenceSlot(context.Context, *FenceSlotRequest) (*FenceSlotResponse, error)
 	mustEmbedUnimplementedKVStoreServer()
 }
 
@@ -162,6 +179,9 @@ func (UnimplementedKVStoreServer) Watch(*WatchRequest, grpc.ServerStreamingServe
 }
 func (UnimplementedKVStoreServer) Scan(*ScanRequest, grpc.ServerStreamingServer[ScanResponse]) error {
 	return status.Errorf(codes.Unimplemented, "method Scan not implemented")
+}
+func (UnimplementedKVStoreServer) FenceSlot(context.Context, *FenceSlotRequest) (*FenceSlotResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method FenceSlot not implemented")
 }
 func (UnimplementedKVStoreServer) mustEmbedUnimplementedKVStoreServer() {}
 func (UnimplementedKVStoreServer) testEmbeddedByValue()                 {}
@@ -278,6 +298,24 @@ func _KVStore_Scan_Handler(srv interface{}, stream grpc.ServerStream) error {
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type KVStore_ScanServer = grpc.ServerStreamingServer[ScanResponse]
 
+func _KVStore_FenceSlot_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(FenceSlotRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(KVStoreServer).FenceSlot(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: KVStore_FenceSlot_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(KVStoreServer).FenceSlot(ctx, req.(*FenceSlotRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // KVStore_ServiceDesc is the grpc.ServiceDesc for KVStore service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -300,6 +338,10 @@ var KVStore_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Head",
 			Handler:    _KVStore_Head_Handler,
+		},
+		{
+			MethodName: "FenceSlot",
+			Handler:    _KVStore_FenceSlot_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

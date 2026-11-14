@@ -833,6 +833,104 @@ func (x *ScanResponse) GetShard() uint32 {
 	return 0
 }
 
+// A fence is replicated within the source/target Raft group and applied in
+// Raft log order. A sealed slot rejects later SET/DELETE, even after restart.
+type FenceSlotRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Namespace     string                 `protobuf:"bytes,1,opt,name=namespace,proto3" json:"namespace,omitempty"`
+	Slot          uint32                 `protobuf:"varint,2,opt,name=slot,proto3" json:"slot,omitempty"`
+	Sealed        bool                   `protobuf:"varint,3,opt,name=sealed,proto3" json:"sealed,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *FenceSlotRequest) Reset() {
+	*x = FenceSlotRequest{}
+	mi := &file_kvstore_v1_kvstore_proto_msgTypes[12]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *FenceSlotRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*FenceSlotRequest) ProtoMessage() {}
+
+func (x *FenceSlotRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_kvstore_v1_kvstore_proto_msgTypes[12]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use FenceSlotRequest.ProtoReflect.Descriptor instead.
+func (*FenceSlotRequest) Descriptor() ([]byte, []int) {
+	return file_kvstore_v1_kvstore_proto_rawDescGZIP(), []int{12}
+}
+
+func (x *FenceSlotRequest) GetNamespace() string {
+	if x != nil {
+		return x.Namespace
+	}
+	return ""
+}
+
+func (x *FenceSlotRequest) GetSlot() uint32 {
+	if x != nil {
+		return x.Slot
+	}
+	return 0
+}
+
+func (x *FenceSlotRequest) GetSealed() bool {
+	if x != nil {
+		return x.Sealed
+	}
+	return false
+}
+
+type FenceSlotResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *FenceSlotResponse) Reset() {
+	*x = FenceSlotResponse{}
+	mi := &file_kvstore_v1_kvstore_proto_msgTypes[13]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *FenceSlotResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*FenceSlotResponse) ProtoMessage() {}
+
+func (x *FenceSlotResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_kvstore_v1_kvstore_proto_msgTypes[13]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use FenceSlotResponse.ProtoReflect.Descriptor instead.
+func (*FenceSlotResponse) Descriptor() ([]byte, []int) {
+	return file_kvstore_v1_kvstore_proto_rawDescGZIP(), []int{13}
+}
+
 var File_kvstore_v1_kvstore_proto protoreflect.FileDescriptor
 
 const file_kvstore_v1_kvstore_proto_rawDesc = "" +
@@ -896,17 +994,23 @@ const file_kvstore_v1_kvstore_proto_rawDesc = "" +
 	"checkpoint\x18\x05 \x01(\bR\n" +
 	"checkpoint\x12\x16\n" +
 	"\x06cursor\x18\x06 \x01(\tR\x06cursor\x12\x14\n" +
-	"\x05shard\x18\a \x01(\rR\x05shard*M\n" +
+	"\x05shard\x18\a \x01(\rR\x05shard\"\\\n" +
+	"\x10FenceSlotRequest\x12\x1c\n" +
+	"\tnamespace\x18\x01 \x01(\tR\tnamespace\x12\x12\n" +
+	"\x04slot\x18\x02 \x01(\rR\x04slot\x12\x16\n" +
+	"\x06sealed\x18\x03 \x01(\bR\x06sealed\"\x13\n" +
+	"\x11FenceSlotResponse*M\n" +
 	"\x0fReadConsistency\x12\x1b\n" +
 	"\x17READ_CONSISTENCY_STRONG\x10\x00\x12\x1d\n" +
-	"\x19READ_CONSISTENCY_EVENTUAL\x10\x012\xf2\x02\n" +
+	"\x19READ_CONSISTENCY_EVENTUAL\x10\x012\xbc\x03\n" +
 	"\aKVStore\x126\n" +
 	"\x03Get\x12\x16.kvstore.v1.GetRequest\x1a\x17.kvstore.v1.GetResponse\x126\n" +
 	"\x03Set\x12\x16.kvstore.v1.SetRequest\x1a\x17.kvstore.v1.SetResponse\x12?\n" +
 	"\x06Delete\x12\x19.kvstore.v1.DeleteRequest\x1a\x1a.kvstore.v1.DeleteResponse\x129\n" +
 	"\x04Head\x12\x17.kvstore.v1.HeadRequest\x1a\x18.kvstore.v1.HeadResponse\x12>\n" +
 	"\x05Watch\x12\x18.kvstore.v1.WatchRequest\x1a\x19.kvstore.v1.WatchResponse0\x01\x12;\n" +
-	"\x04Scan\x12\x17.kvstore.v1.ScanRequest\x1a\x18.kvstore.v1.ScanResponse0\x01B:Z8github.com/byPixelTV/kvstore/gen/go/kvstore/v1;kvstorev1b\x06proto3"
+	"\x04Scan\x12\x17.kvstore.v1.ScanRequest\x1a\x18.kvstore.v1.ScanResponse0\x01\x12H\n" +
+	"\tFenceSlot\x12\x1c.kvstore.v1.FenceSlotRequest\x1a\x1d.kvstore.v1.FenceSlotResponseB:Z8github.com/byPixelTV/kvstore/gen/go/kvstore/v1;kvstorev1b\x06proto3"
 
 var (
 	file_kvstore_v1_kvstore_proto_rawDescOnce sync.Once
@@ -921,21 +1025,23 @@ func file_kvstore_v1_kvstore_proto_rawDescGZIP() []byte {
 }
 
 var file_kvstore_v1_kvstore_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_kvstore_v1_kvstore_proto_msgTypes = make([]protoimpl.MessageInfo, 12)
+var file_kvstore_v1_kvstore_proto_msgTypes = make([]protoimpl.MessageInfo, 14)
 var file_kvstore_v1_kvstore_proto_goTypes = []any{
-	(ReadConsistency)(0),   // 0: kvstore.v1.ReadConsistency
-	(*GetRequest)(nil),     // 1: kvstore.v1.GetRequest
-	(*GetResponse)(nil),    // 2: kvstore.v1.GetResponse
-	(*SetRequest)(nil),     // 3: kvstore.v1.SetRequest
-	(*SetResponse)(nil),    // 4: kvstore.v1.SetResponse
-	(*DeleteRequest)(nil),  // 5: kvstore.v1.DeleteRequest
-	(*DeleteResponse)(nil), // 6: kvstore.v1.DeleteResponse
-	(*HeadRequest)(nil),    // 7: kvstore.v1.HeadRequest
-	(*HeadResponse)(nil),   // 8: kvstore.v1.HeadResponse
-	(*WatchRequest)(nil),   // 9: kvstore.v1.WatchRequest
-	(*WatchResponse)(nil),  // 10: kvstore.v1.WatchResponse
-	(*ScanRequest)(nil),    // 11: kvstore.v1.ScanRequest
-	(*ScanResponse)(nil),   // 12: kvstore.v1.ScanResponse
+	(ReadConsistency)(0),      // 0: kvstore.v1.ReadConsistency
+	(*GetRequest)(nil),        // 1: kvstore.v1.GetRequest
+	(*GetResponse)(nil),       // 2: kvstore.v1.GetResponse
+	(*SetRequest)(nil),        // 3: kvstore.v1.SetRequest
+	(*SetResponse)(nil),       // 4: kvstore.v1.SetResponse
+	(*DeleteRequest)(nil),     // 5: kvstore.v1.DeleteRequest
+	(*DeleteResponse)(nil),    // 6: kvstore.v1.DeleteResponse
+	(*HeadRequest)(nil),       // 7: kvstore.v1.HeadRequest
+	(*HeadResponse)(nil),      // 8: kvstore.v1.HeadResponse
+	(*WatchRequest)(nil),      // 9: kvstore.v1.WatchRequest
+	(*WatchResponse)(nil),     // 10: kvstore.v1.WatchResponse
+	(*ScanRequest)(nil),       // 11: kvstore.v1.ScanRequest
+	(*ScanResponse)(nil),      // 12: kvstore.v1.ScanResponse
+	(*FenceSlotRequest)(nil),  // 13: kvstore.v1.FenceSlotRequest
+	(*FenceSlotResponse)(nil), // 14: kvstore.v1.FenceSlotResponse
 }
 var file_kvstore_v1_kvstore_proto_depIdxs = []int32{
 	0,  // 0: kvstore.v1.GetRequest.consistency:type_name -> kvstore.v1.ReadConsistency
@@ -945,14 +1051,16 @@ var file_kvstore_v1_kvstore_proto_depIdxs = []int32{
 	7,  // 4: kvstore.v1.KVStore.Head:input_type -> kvstore.v1.HeadRequest
 	9,  // 5: kvstore.v1.KVStore.Watch:input_type -> kvstore.v1.WatchRequest
 	11, // 6: kvstore.v1.KVStore.Scan:input_type -> kvstore.v1.ScanRequest
-	2,  // 7: kvstore.v1.KVStore.Get:output_type -> kvstore.v1.GetResponse
-	4,  // 8: kvstore.v1.KVStore.Set:output_type -> kvstore.v1.SetResponse
-	6,  // 9: kvstore.v1.KVStore.Delete:output_type -> kvstore.v1.DeleteResponse
-	8,  // 10: kvstore.v1.KVStore.Head:output_type -> kvstore.v1.HeadResponse
-	10, // 11: kvstore.v1.KVStore.Watch:output_type -> kvstore.v1.WatchResponse
-	12, // 12: kvstore.v1.KVStore.Scan:output_type -> kvstore.v1.ScanResponse
-	7,  // [7:13] is the sub-list for method output_type
-	1,  // [1:7] is the sub-list for method input_type
+	13, // 7: kvstore.v1.KVStore.FenceSlot:input_type -> kvstore.v1.FenceSlotRequest
+	2,  // 8: kvstore.v1.KVStore.Get:output_type -> kvstore.v1.GetResponse
+	4,  // 9: kvstore.v1.KVStore.Set:output_type -> kvstore.v1.SetResponse
+	6,  // 10: kvstore.v1.KVStore.Delete:output_type -> kvstore.v1.DeleteResponse
+	8,  // 11: kvstore.v1.KVStore.Head:output_type -> kvstore.v1.HeadResponse
+	10, // 12: kvstore.v1.KVStore.Watch:output_type -> kvstore.v1.WatchResponse
+	12, // 13: kvstore.v1.KVStore.Scan:output_type -> kvstore.v1.ScanResponse
+	14, // 14: kvstore.v1.KVStore.FenceSlot:output_type -> kvstore.v1.FenceSlotResponse
+	8,  // [8:15] is the sub-list for method output_type
+	1,  // [1:8] is the sub-list for method input_type
 	1,  // [1:1] is the sub-list for extension type_name
 	1,  // [1:1] is the sub-list for extension extendee
 	0,  // [0:1] is the sub-list for field type_name
@@ -969,7 +1077,7 @@ func file_kvstore_v1_kvstore_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_kvstore_v1_kvstore_proto_rawDesc), len(file_kvstore_v1_kvstore_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   12,
+			NumMessages:   14,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

@@ -38,12 +38,15 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
       -o /out/kvstore ./cmd/kvstore; \
     CGO_ENABLED=0 GOOS="$TARGETOS" GOARCH="$TARGETARCH" \
       go build -trimpath -ldflags="-s -w" -o /out/kvbench ./cmd/kvbench; \
+    CGO_ENABLED=0 GOOS="$TARGETOS" GOARCH="$TARGETARCH" \
+      go build -trimpath -ldflags="-s -w" -o /out/kvshardctl ./cmd/kvshardctl; \
     chown 65532:65532 /out/data
 
 FROM scratch
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=builder /out/kvstore /usr/local/bin/kvstore
 COPY --from=builder /out/kvbench /usr/local/bin/kvbench
+COPY --from=builder /out/kvshardctl /usr/local/bin/kvshardctl
 COPY --from=builder --chown=65532:65532 /out/data /data
 USER 65532:65532
 WORKDIR /data
@@ -52,5 +55,5 @@ ENV KVSTORE_MODE=standalone \
     KVSTORE_HEALTH_ADDR=127.0.0.1:50051 \
     KVSTORE_DATA_DIR=/data \
     KVSTORE_SHUTDOWN_TIMEOUT=15s
-EXPOSE 50051 7000 7001
+EXPOSE 50051 7000 7001 7002
 ENTRYPOINT ["/usr/local/bin/kvstore"]

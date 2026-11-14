@@ -20,12 +20,34 @@ import (
 type Server struct {
 	kvstorev1.UnimplementedKVStoreServer
 	service *kvstore.Service
+	fence   interface {
+		FenceSlot(context.Context, string, uint16, bool) error
+	}
 }
 
 var _ kvstorev1.KVStoreServer = (*Server)(nil)
 
-func New(service *kvstore.Service) *Server {
-	return &Server{service: service}
+func New(service *kvstore.Service, fencer ...interface {
+	FenceSlot(context.Context, string, uint16, bool) error
+}) *Server {
+	s := &Server{service: service}
+	if len(fencer) > 0 {
+		s.fence = fencer[0]
+	}
+	return s
+}
+
+func (s *Server) FenceSlot(ctx context.Context, req *kvstorev1.FenceSlotRequest) (*kvstorev1.FenceSlotResponse, error) {
+	if s.fence == nil {
+		return nil, status.Error(codes.Unimplemented, "slot fences require a Raft backend")
+	}
+	if req.GetNamespace() == "" || req.GetSlot() >= 4096 {
+		return nil, status.Error(codes.InvalidArgument, "invalid slot fence")
+	}
+	if err := s.fence.FenceSlot(ctx, req.GetNamespace(), uint16(req.GetSlot()), req.GetSealed()); err != nil {
+		return nil, mapError(err)
+	}
+	return &kvstorev1.FenceSlotResponse{}, nil
 }
 
 func (s *Server) Get(ctx context.Context, req *kvstorev1.GetRequest) (*kvstorev1.GetResponse, error) {

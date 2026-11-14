@@ -11,6 +11,9 @@ service KVStore {
   rpc Head(HeadRequest) returns (HeadResponse);
   rpc Watch(WatchRequest) returns (stream WatchResponse);
   rpc Scan(ScanRequest) returns (stream ScanResponse);
+  // Internal Raft-replicated write fence for lossless live slot migration.
+  // Only trusted router may call this, authenticated by the join token.
+  rpc FenceSlot(FenceSlotRequest) returns (FenceSlotResponse);
 }
 
 // STRONG is the default for backwards compatibility. EVENTUAL reads from
@@ -102,3 +105,12 @@ message ScanResponse {
   string cursor = 6;
   uint32 shard = 7;
 }
+
+// A fence is replicated within the source/target Raft group and applied in
+// Raft log order. A sealed slot rejects later SET/DELETE, even after restart.
+message FenceSlotRequest {
+  string namespace = 1;
+  uint32 slot = 2;
+  bool sealed = 3;
+}
+message FenceSlotResponse {}

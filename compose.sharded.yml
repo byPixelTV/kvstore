@@ -198,7 +198,10 @@ services:
       KVSTORE_LISTEN_ADDR: ':50051'
       KVSTORE_SHARD_LAYOUT_VERSION: '1'
       KVSTORE_SHARD_DISCOVERY_INTERVAL: 2s
-      KVSTORE_ROUTER_CONNECTIONS: '8'
+      KVSTORE_ROUTER_CONNECTIONS: ${KVSTORE_ROUTER_CONNECTIONS:-8}
+      KVSTORE_JOIN_TOKEN: ${KVSTORE_JOIN_TOKEN:?Set KVSTORE_JOIN_TOKEN}
+      KVSTORE_ROUTER_ADMIN_TOKEN: ${KVSTORE_ROUTER_ADMIN_TOKEN:?Set KVSTORE_ROUTER_ADMIN_TOKEN}
+      KVSTORE_ROUTER_ADMIN_ADDR: ':7002'
       KVSTORE_SHARDS: 's0n0:50051,s0n1:50051,s0n2:50051;s1n0:50051,s1n1:50051,s1n2:50051;s2n0:50051,s2n1:50051,s2n2:50051'
     healthcheck:
       test: [CMD, /usr/local/bin/kvstore, healthcheck]
@@ -206,7 +209,9 @@ services:
       timeout: 3s
       start_period: 90s
       retries: 6
-    ports: ['127.0.0.1:50081:50051']
+    ports:
+      - '127.0.0.1:50081:50051'
+      - '127.0.0.1:17110:7002'
 volumes:
   s0n0-data:
   s0n1-data:

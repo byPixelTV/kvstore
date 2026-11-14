@@ -9,6 +9,8 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -28,8 +30,17 @@ import (
 // The router never persists data, allocates revisions or retries writes.
 type Router struct {
 	kvstorev1.UnimplementedKVStoreServer
-	groups [ShardCount]*group
-	ready  atomic.Bool
+	groups             [ShardCount]*group
+	ready              atomic.Bool
+	routing            atomic.Pointer[routingState]
+	clusterFingerprint string
+	slotGates          sync.Map
+	migrationMu        sync.Mutex
+	epochMu            sync.Mutex
+	epochChange        chan struct{}
+	loaded             atomic.Bool
+	unresolved         atomic.Bool
+	fenceToken         string
 }
 
 type group struct {
@@ -44,7 +55,8 @@ func New(layout Layout, connectionsPerBackend int) (_ *Router, err error) {
 	if connectionsPerBackend < 1 || connectionsPerBackend > 32 {
 		return nil, errors.New("connections per backend must be 1..32")
 	}
-	r := &Router{}
+	r := &Router{clusterFingerprint: fingerprint(layout), fenceToken: os.Getenv("KVSTORE_JOIN_TOKEN")}
+	r.routing.Store(&routingState{Version: 1, Epoch: 1, Fingerprint: r.clusterFingerprint, Overrides: make(map[string]map[uint16]uint8)})
 	defer func() {
 		if err != nil {
 			_ = r.Close()
@@ -131,13 +143,27 @@ func (g *group) discover(ctx context.Context) error {
 	return errors.New("no reachable, allowlisted shard leader")
 }
 func (r *Router) Refresh(ctx context.Context) error {
-	var errs []error
+	// Leader discovery is independent for each Raft group. Probe in parallel
+	// so one slow/failed group does not delay refresh of the other leaders.
+	var results [ShardCount]error
+	var wg sync.WaitGroup
 	for i, g := range r.groups {
-		if err := g.discover(ctx); err != nil {
-			errs = append(errs, fmt.Errorf("shard %d: %w", i, err))
+		wg.Add(1)
+		go func(i int, g *group) {
+			defer wg.Done()
+			if err := g.discover(ctx); err != nil {
+				results[i] = fmt.Errorf("shard %d: %w", i, err)
+			}
+		}(i, g)
+	}
+	wg.Wait()
+	var errs []error
+	for _, err := range results {
+		if err != nil {
+			errs = append(errs, err)
 		}
 	}
-	r.ready.Store(len(errs) == 0)
+	r.ready.Store(len(errs) == 0 && r.loaded.Load() && !r.unresolved.Load())
 	return errors.Join(errs...)
 }
 func (r *Router) Ready() bool { return r.ready.Load() }
@@ -145,6 +171,9 @@ func (r *Router) Ready() bool { return r.ready.Load() }
 func invalidKey(namespace, key string) error {
 	if namespace == "" {
 		return status.Error(codes.InvalidArgument, "namespace cannot be empty")
+	}
+	if strings.HasPrefix(namespace, "__kvstore_internal_") {
+		return status.Error(codes.PermissionDenied, "reserved internal namespace")
 	}
 	if key == "" {
 		return status.Error(codes.InvalidArgument, "key cannot be empty")
@@ -156,7 +185,17 @@ func (r *Router) Get(ctx context.Context, req *kvstorev1.GetRequest) (*kvstorev1
 	if err := invalidKey(req.GetNamespace(), req.GetKey()); err != nil {
 		return nil, err
 	}
-	id := Shard(req.GetNamespace(), req.GetKey())
+	if err := r.checkRouteAvailable(); err != nil {
+		return nil, err
+	}
+	slot := Slot(req.GetNamespace(), req.GetKey())
+	gate := r.slotGate(req.GetNamespace(), slot)
+	gate.RLock()
+	defer gate.RUnlock()
+	if err := r.checkRouteAvailable(); err != nil {
+		return nil, err
+	}
+	id := r.current().owner(req.GetNamespace(), slot)
 	r.routeMetadata(ctx, id)
 	g := r.groups[id]
 	c, err := g.selectClient()
@@ -188,7 +227,17 @@ func (r *Router) Set(ctx context.Context, req *kvstorev1.SetRequest) (*kvstorev1
 	if err := invalidKey(req.GetNamespace(), req.GetKey()); err != nil {
 		return nil, err
 	}
-	id := Shard(req.GetNamespace(), req.GetKey())
+	if err := r.checkRouteAvailable(); err != nil {
+		return nil, err
+	}
+	slot := Slot(req.GetNamespace(), req.GetKey())
+	gate := r.slotGate(req.GetNamespace(), slot)
+	gate.RLock()
+	defer gate.RUnlock()
+	if err := r.checkRouteAvailable(); err != nil {
+		return nil, err
+	}
+	id := r.current().owner(req.GetNamespace(), slot)
 	r.routeMetadata(ctx, id)
 	g := r.groups[id]
 	c, err := g.selectClient()
@@ -214,7 +263,17 @@ func (r *Router) Delete(ctx context.Context, req *kvstorev1.DeleteRequest) (*kvs
 	if err := invalidKey(req.GetNamespace(), req.GetKey()); err != nil {
 		return nil, err
 	}
-	id := Shard(req.GetNamespace(), req.GetKey())
+	if err := r.checkRouteAvailable(); err != nil {
+		return nil, err
+	}
+	slot := Slot(req.GetNamespace(), req.GetKey())
+	gate := r.slotGate(req.GetNamespace(), slot)
+	gate.RLock()
+	defer gate.RUnlock()
+	if err := r.checkRouteAvailable(); err != nil {
+		return nil, err
+	}
+	id := r.current().owner(req.GetNamespace(), slot)
 	r.routeMetadata(ctx, id)
 	g := r.groups[id]
 	c, err := g.selectClient()
@@ -243,9 +302,13 @@ func requireV2(active bool) error {
 	return status.Error(codes.FailedPrecondition, "multi-Raft cursors are vectors; regenerate protobuf bindings and use use_vector_cursor=true (legacy global uint64 cursors are unsupported)")
 }
 func (r *Router) Head(ctx context.Context, req *kvstorev1.HeadRequest) (*kvstorev1.HeadResponse, error) {
+	if err := r.checkRouteAvailable(); err != nil {
+		return nil, err
+	}
 	if err := requireV2(req.GetUseVectorCursor()); err != nil {
 		return nil, err
 	}
+	epoch, _ := r.epochSignal()
 	var c Cursor
 	for i, g := range r.groups {
 		client, err := g.selectClient()
@@ -258,8 +321,11 @@ func (r *Router) Head(ctx context.Context, req *kvstorev1.HeadRequest) (*kvstore
 		}
 		c[i] = res.GetRevision()
 	}
+	if r.current().Epoch != epoch {
+		return nil, status.Error(codes.Aborted, "routing changed during Head; rescan before resuming Watch")
+	}
 	// Revision zero is deliberate: no cross-shard global revision exists.
-	return &kvstorev1.HeadResponse{Cursor: c.Encode()}, nil
+	return &kvstorev1.HeadResponse{Cursor: encodeEpochCursor(c, epoch)}, nil
 }
 
 // ServeRouter starts the existing KVStore binary in stateless router mode.
@@ -289,6 +355,34 @@ func ServeRouter() error {
 		return err
 	}
 	defer router.Close()
+	// Fail closed until shard 0 has returned the durable, versioned owner map.
+	// Never serve default modulo routing over data that may have been moved.
+	bootCtx, bootCancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer bootCancel()
+	for {
+		if e := router.Refresh(bootCtx); e == nil {
+			if e = router.LoadRouting(bootCtx); e == nil {
+				break
+			}
+			slog.Warn("router routing metadata unavailable", "error", e)
+		}
+		if err := bootCtx.Err(); err != nil {
+			return fmt.Errorf("router not ready to load routing metadata: %w", err)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	router.ready.Store(true)
+	admin, err := router.startAdmin()
+	if err != nil {
+		return err
+	}
+	if admin != nil {
+		defer func() {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			_ = admin.Shutdown(shutdownCtx)
+		}()
+	}
 	listener, err := net.Listen("tcp", listen)
 	if err != nil {
 		return err
@@ -354,7 +448,7 @@ func getenv(key, def string) string {
 
 // The version and routing layout are emitted as metadata for diagnostic SDKs.
 func (r *Router) routeMetadata(ctx context.Context, shard int) {
-	_ = grpc.SetHeader(ctx, metadata.Pairs("kvstore-shard", strconv.Itoa(shard), "kvstore-shard-layout", fmt.Sprint(LayoutVersion)))
+	_ = grpc.SetHeader(ctx, metadata.Pairs("kvstore-shard", strconv.Itoa(shard), "kvstore-shard-layout", fmt.Sprint(LayoutVersion), "kvstore-routing-epoch", strconv.FormatUint(r.current().Epoch, 10)))
 }
 
 var _ kvstorev1.KVStoreServer = (*Router)(nil)

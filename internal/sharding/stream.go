@@ -21,9 +21,16 @@ func (r *Router) Scan(req *kvstorev1.ScanRequest, stream grpc.ServerStreamingSer
 	if req.GetNamespace() == "" {
 		return status.Error(codes.InvalidArgument, "namespace cannot be empty")
 	}
+	if err := invalidKey(req.GetNamespace(), "_scan_watch_"); err != nil {
+		return err
+	}
+	if err := r.checkRouteAvailable(); err != nil {
+		return err
+	}
 	if err := requireV2(req.GetUseVectorCursor()); err != nil {
 		return err
 	}
+	epoch, _ := r.epochSignal()
 	var cursors Cursor
 	for id, g := range r.groups {
 		client, err := g.selectClient()
@@ -54,6 +61,12 @@ func (r *Router) Scan(req *kvstorev1.ScanRequest, stream grpc.ServerStreamingSer
 			if !sawCheckpoint {
 				return status.Error(codes.Internal, "missing initial shard scan checkpoint")
 			}
+			if r.current().Epoch != epoch {
+				return status.Error(codes.Aborted, "routing changed during Scan; discard partial result and retry")
+			}
+			if r.current().owner(req.GetNamespace(), Slot(req.GetNamespace(), res.GetKey())) != id {
+				continue
+			}
 			rev, e := EncodeRevision(id, res.GetRevision())
 			if e != nil {
 				return status.Error(codes.Internal, e.Error())
@@ -66,7 +79,10 @@ func (r *Router) Scan(req *kvstorev1.ScanRequest, stream grpc.ServerStreamingSer
 			return status.Error(codes.Internal, "empty shard scan without checkpoint")
 		}
 	}
-	return stream.Send(&kvstorev1.ScanResponse{Checkpoint: true, Cursor: cursors.Encode()})
+	if r.current().Epoch != epoch {
+		return status.Error(codes.Aborted, "routing changed during Scan; retry")
+	}
+	return stream.Send(&kvstorev1.ScanResponse{Checkpoint: true, Cursor: encodeEpochCursor(cursors, epoch)})
 }
 
 type shardWatchEvent struct {
@@ -83,15 +99,22 @@ func (r *Router) Watch(req *kvstorev1.WatchRequest, stream grpc.ServerStreamingS
 	if req.GetNamespace() == "" {
 		return status.Error(codes.InvalidArgument, "namespace cannot be empty")
 	}
+	if err := invalidKey(req.GetNamespace(), "_scan_watch_"); err != nil {
+		return err
+	}
+	if err := r.checkRouteAvailable(); err != nil {
+		return err
+	}
 	if err := requireV2(req.GetUseVectorCursor()); err != nil {
 		return err
 	}
 	if req.GetAfterRevision() != 0 {
 		return status.Error(codes.InvalidArgument, "use cursor, not after_revision, for sharded watch")
 	}
-	cursors, err := DecodeCursor(req.GetCursor())
+	epoch, changed := r.epochSignal()
+	cursors, err := decodeEpochCursor(req.GetCursor(), epoch)
 	if err != nil {
-		return status.Error(codes.InvalidArgument, err.Error())
+		return status.Error(codes.FailedPrecondition, err.Error())
 	}
 	ctx, cancel := context.WithCancel(stream.Context())
 	defer cancel()
@@ -140,12 +163,17 @@ func (r *Router) Watch(req *kvstorev1.WatchRequest, stream grpc.ServerStreamingS
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-changed:
+			return status.Error(codes.FailedPrecondition, "shard ownership changed; rescan namespace before resuming watch")
 		case e, ok := <-events:
 			if !ok {
 				return status.Error(codes.Unavailable, "all shard feeds ended")
 			}
 			if e.err != nil {
 				return fmt.Errorf("shard %d watch: %w", e.shard, e.err)
+			}
+			if r.current().Epoch != epoch {
+				return status.Error(codes.FailedPrecondition, "shard ownership changed; rescan required")
 			}
 			incoming := e.event.GetRevision()
 			if incoming < cursors[e.shard] {
@@ -156,11 +184,19 @@ func (r *Router) Watch(req *kvstorev1.WatchRequest, stream grpc.ServerStreamingS
 			// reconnect; clients should apply events idempotently by shard/revision.
 			next := cursors
 			next[e.shard] = incoming
+			owned := e.event.GetCheckpoint() || r.current().owner(req.GetNamespace(), Slot(req.GetNamespace(), e.event.GetKey())) == e.shard
 			response := &kvstorev1.WatchResponse{
 				Revision:  0, // no single global revision; per-shard revision below
 				Namespace: e.event.GetNamespace(), Key: e.event.GetKey(), Value: e.event.GetValue(),
 				Deleted: e.event.GetDeleted(), Checkpoint: e.event.GetCheckpoint(),
-				Cursor: next.Encode(), Shard: uint32(e.shard),
+				Cursor: encodeEpochCursor(next, epoch), Shard: uint32(e.shard),
+			}
+			if !owned {
+				response.Checkpoint = true
+				response.Key = ""
+				response.Value = nil
+				response.Deleted = false
+				response.Namespace = ""
 			}
 			if !response.Checkpoint {
 				rev, err := EncodeRevision(e.shard, incoming)
