@@ -8,6 +8,9 @@ service KVStore {
   rpc Get(GetRequest) returns (GetResponse);
   rpc Set(SetRequest) returns (SetResponse);
   rpc Delete(DeleteRequest) returns (DeleteResponse);
+  // Single shard: atomic; multi-shard: independent shard batches, per-item outcomes.
+  // Clients MUST NOT blindly retry UNKNOWN_OUTCOME on a network failure.
+  rpc BatchWrite(BatchWriteRequest) returns (BatchWriteResponse);
   rpc Head(HeadRequest) returns (HeadResponse);
   rpc Watch(WatchRequest) returns (stream WatchResponse);
   rpc Scan(ScanRequest) returns (stream ScanResponse);
@@ -54,6 +57,26 @@ message DeleteResponse {
   bool deleted = 1;
   uint64 revision = 2;
 }
+
+// Maximum 128 operations and 192 KiB of raw values per request. Within each
+// shard operations are ordered and atomic; across shards they are NOT atomic.
+message BatchWriteOperation {
+  string namespace = 1;
+  string key = 2;
+  bytes value = 3;
+  bool delete = 4;
+}
+message BatchWriteRequest { repeated BatchWriteOperation operations = 1; }
+message BatchWriteResult {
+  uint64 revision = 1;
+  bool deleted = 2;
+  // 0 on success; otherwise a canonical gRPC status code for THIS item.
+  // On a transport timeout, the outcome may be unknown: never blindly retry.
+  uint32 grpc_code = 3;
+  string error = 4;
+}
+message BatchWriteResponse { repeated BatchWriteResult results = 1; }
+
 
 // On standalone and single-Raft: Head gives the authoritative revision.
 // Multi-Raft requires use_vector_cursor and returns cursor (revision=0).

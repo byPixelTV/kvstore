@@ -17,10 +17,11 @@ import (
 
 type fakeShard struct {
 	kvstorev1.KVStoreClient
-	id      int
-	writes  int
-	deletes int
-	failSet bool
+	id            int
+	writes        int
+	deletes       int
+	failSet       bool
+	batchAttempts int
 }
 
 func (f *fakeShard) Get(_ context.Context, _ *kvstorev1.GetRequest, _ ...grpc.CallOption) (*kvstorev1.GetResponse, error) {

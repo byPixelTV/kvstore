@@ -165,4 +165,21 @@ func TestThreeNodeRaftFailover(t *testing.T) {
 	if err != nil || change.GetKey() != "456" || change.GetRevision() != 2 {
 		t.Fatalf("watch after failover=%+v err=%v", change, err)
 	}
+
+	// A forwarded BatchWrite uses one Raft command with ordered revisions,
+	// including deletes of previously missing keys.
+	batch, err := client.BatchWrite(ctx, &kvstorev1.BatchWriteRequest{Operations: []*kvstorev1.BatchWriteOperation{
+		{Namespace: "players", Key: "bulk", Value: []byte("one")},
+		{Namespace: "players", Key: "bulk", Value: []byte("two")},
+		{Namespace: "players", Key: "bulk", Delete: true},
+		{Namespace: "players", Key: "bulk", Delete: true},
+	}})
+	if err != nil {
+		t.Fatalf("forwarded BatchWrite: %v", err)
+	}
+	for i, want := range []uint64{3, 4, 5, 0} {
+		if len(batch.GetResults()) != 4 || batch.Results[i].GetRevision() != want {
+			t.Fatalf("batch result %d: %+v", i, batch.GetResults())
+		}
+	}
 }

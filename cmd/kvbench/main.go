@@ -23,6 +23,7 @@ import (
 
 	kvstorev1 "github.com/byPixelTV/kvstore/gen/go/kvstore/v1"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
@@ -117,6 +118,7 @@ type report struct {
 	CPUs                int             `json:"logical_cpus"`
 	LeaderRouteSwitches uint64          `json:"leader_route_switches,omitempty"`
 	LeaderFailovers     uint64          `json:"leader_failovers,omitempty"`
+	BatchSize           int             `json:"batch_size"`
 	Get                 operationReport `json:"get"`
 	Set                 operationReport `json:"set"`
 	Watch               *watchReport    `json:"watch,omitempty"`
@@ -140,6 +142,7 @@ type options struct {
 	keys          int
 	valueSize     int
 	readPercent   int
+	batchSize     int
 	hotKeyIndex   int
 	hotPercent    int
 	timeout       time.Duration
@@ -162,7 +165,8 @@ func main() {
 	flag.IntVar(&opt.connections, "connections", 4, "independent HTTP/2 gRPC connections")
 	flag.IntVar(&opt.keys, "keys", 1000, "number of distinct benchmark keys")
 	flag.IntVar(&opt.valueSize, "value-size", 256, "value payload size in bytes")
-	flag.IntVar(&opt.readPercent, "read-percent", 80, "percentage of reads in mixed mode")
+	flag.IntVar(&opt.readPercent, "read-percent", 80, "percentage of logical reads in mixed mode")
+	flag.IntVar(&opt.batchSize, "batch-size", 1, "logical writes per BatchWrite RPC; 1 uses legacy Set")
 	flag.IntVar(&opt.hotKeyIndex, "hot-key-index", -1, "optional single hot key index in keyspace (-1 disables)")
 	flag.IntVar(&opt.hotPercent, "hot-percent", 0, "percentage of operations targeting the hot key (0..100)")
 	flag.DurationVar(&opt.timeout, "timeout", 8*time.Second, "per-RPC timeout")
@@ -182,7 +186,7 @@ func main() {
 	}
 }
 func valid(o options) bool {
-	return (o.consistency == "strong" || o.consistency == "eventual") && (o.mode == "get" || o.mode == "set" || o.mode == "mixed" || o.mode == "watch") && o.duration > 0 && o.warmup >= 0 && o.connections > 0 && o.concurrency > 0 && o.keys > 0 && o.valueSize >= 8 && o.valueSize <= 256<<10 && o.readPercent >= 0 && o.readPercent <= 100 && o.hotPercent >= 0 && o.hotPercent <= 100 && (o.hotKeyIndex == -1 || (o.hotKeyIndex >= 0 && o.hotKeyIndex < o.keys)) && (o.hotPercent == 0 || o.hotKeyIndex >= 0) && o.timeout > 0 && o.leaderRefresh >= 0 && o.watchers > 0 && o.watchRate > 0 && o.watchRate <= 100000
+	return (o.consistency == "strong" || o.consistency == "eventual") && (o.mode == "get" || o.mode == "set" || o.mode == "mixed" || o.mode == "watch") && o.duration > 0 && o.warmup >= 0 && o.connections > 0 && o.concurrency > 0 && o.keys > 0 && o.valueSize >= 8 && o.valueSize <= 256<<10 && o.readPercent >= 0 && o.readPercent <= 100 && o.batchSize >= 1 && o.batchSize <= 128 && o.batchSize*(o.valueSize+128+64) <= 256<<10 && o.hotPercent >= 0 && o.hotPercent <= 100 && (o.hotKeyIndex == -1 || (o.hotKeyIndex >= 0 && o.hotKeyIndex < o.keys)) && (o.hotPercent == 0 || o.hotKeyIndex >= 0) && o.timeout > 0 && o.leaderRefresh >= 0 && o.watchers > 0 && o.watchRate > 0 && o.watchRate <= 100000
 }
 
 // resolveLeaderAddress asks the load balancer for the Raft leader and maps
@@ -264,7 +268,7 @@ func run(opt options) error {
 	if err != nil {
 		return fmt.Errorf("GET connectivity check: %w", err)
 	}
-	rep := report{Mode: opt.mode, Consistency: opt.consistency, Address: opt.address, ResolvedAddress: target, Namespace: namespace, DurationSeconds: opt.duration.Seconds(), WarmupSeconds: opt.warmup.Seconds(), Concurrency: opt.concurrency, Connections: opt.connections, Keyspace: opt.keys, ValueBytes: opt.valueSize, CPUs: runtime.NumCPU()}
+	rep := report{Mode: opt.mode, Consistency: opt.consistency, Address: opt.address, ResolvedAddress: target, Namespace: namespace, DurationSeconds: opt.duration.Seconds(), WarmupSeconds: opt.warmup.Seconds(), Concurrency: opt.concurrency, Connections: opt.connections, Keyspace: opt.keys, ValueBytes: opt.valueSize, BatchSize: opt.batchSize, CPUs: runtime.NumCPU()}
 	if opt.mode == "watch" {
 		err = runWatch(opt, clients, namespace, &rep)
 	} else {
@@ -310,6 +314,36 @@ func fill(size int) []byte {
 func rpcContext(timeout time.Duration) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), timeout)
 }
+
+// runBatch submits multiple mutations in one RPC. Every result is checked:
+// router batches can partially succeed across independent Raft shards.
+func runBatch(client kvstorev1.KVStoreClient, ctx context.Context, operations []*kvstorev1.BatchWriteOperation) (int, int, error) {
+	reply, err := client.BatchWrite(ctx, &kvstorev1.BatchWriteRequest{Operations: operations})
+	if err != nil {
+		return 0, len(operations), err
+	}
+	if len(reply.GetResults()) != len(operations) {
+		return 0, len(operations), errors.New("BatchWrite reply length mismatch")
+	}
+	successes, failures := 0, 0
+	var firstErr error
+	for _, item := range reply.GetResults() {
+		if item == nil || item.GetGrpcCode() != 0 {
+			failures++
+			if firstErr == nil {
+				if item == nil {
+					firstErr = errors.New("missing batch result")
+				} else {
+					firstErr = status.Error(codes.Code(item.GetGrpcCode()), item.GetError())
+				}
+			}
+		} else {
+			successes++
+		}
+	}
+	return successes, failures, firstErr
+}
+
 func write(client kvstorev1.KVStoreClient, opt options, namespace, key string, value []byte) error {
 	ctx, cancel := rpcContext(opt.timeout)
 	defer cancel()
@@ -346,7 +380,23 @@ func prefill(opt options, clients []kvstorev1.KVStoreClient, namespace string) e
 				if key >= opt.keys {
 					return
 				}
-				if err := write(client, opt, namespace, keyAt(key), value); err != nil {
+				if opt.batchSize > 1 {
+					operations := []*kvstorev1.BatchWriteOperation{{Namespace: namespace, Key: keyAt(key), Value: value}}
+					for len(operations) < opt.batchSize {
+						nextKey := int(next.Add(1)) - 1
+						if nextKey >= opt.keys {
+							break
+						}
+						operations = append(operations, &kvstorev1.BatchWriteOperation{Namespace: namespace, Key: keyAt(nextKey), Value: value})
+					}
+					ctx, cancel := rpcContext(opt.timeout)
+					_, _, err := runBatch(client, ctx, operations)
+					cancel()
+					if err != nil {
+						once.Do(func() { firstErr = fmt.Errorf("prefill batch starting at %d: %w", key, err); failed.Store(true) })
+						return
+					}
+				} else if err := write(client, opt, namespace, keyAt(key), value); err != nil {
 					once.Do(func() { firstErr = fmt.Errorf("prefill key %d: %w", key, err); failed.Store(true) })
 					return
 				}
@@ -382,7 +432,14 @@ func runRPC(opt options, clients []kvstorev1.KVStoreClient, namespace string, re
 					index = opt.hotKeyIndex
 				}
 				key := keyAt(index)
-				isRead := opt.mode == "get" || (opt.mode == "mixed" && rng.Intn(100) < opt.readPercent)
+				readChance := opt.readPercent
+				if opt.batchSize > 1 && opt.mode == "mixed" {
+					// Correct expected logical GET fraction even though one
+					// SET RPC now represents batchSize logical operations.
+					numerator := opt.readPercent * opt.batchSize
+					readChance = numerator * 100 / (100 - opt.readPercent + numerator)
+				}
+				isRead := opt.mode == "get" || (opt.mode == "mixed" && rng.Intn(100) < readChance)
 				if opt.mode == "set" {
 					isRead = false
 				}
@@ -390,6 +447,7 @@ func runRPC(opt options, clients []kvstorev1.KVStoreClient, namespace string, re
 				begun := time.Now()
 				var err error
 				missing := false
+				successes, failures := 1, 0
 				if isRead {
 					consistency := kvstorev1.ReadConsistency_READ_CONSISTENCY_STRONG
 					if opt.consistency == "eventual" {
@@ -398,6 +456,17 @@ func runRPC(opt options, clients []kvstorev1.KVStoreClient, namespace string, re
 					res, readErr := cl.Get(ctx, &kvstorev1.GetRequest{Namespace: namespace, Key: key, Consistency: consistency})
 					err = readErr
 					missing = readErr == nil && !res.GetFound()
+				} else if opt.batchSize > 1 {
+					ops := make([]*kvstorev1.BatchWriteOperation, opt.batchSize)
+					ops[0] = &kvstorev1.BatchWriteOperation{Namespace: namespace, Key: key, Value: value}
+					for j := 1; j < len(ops); j++ {
+						idx := rng.Intn(opt.keys)
+						if opt.hotKeyIndex >= 0 && opt.hotPercent > 0 && rng.Intn(100) < opt.hotPercent {
+							idx = opt.hotKeyIndex
+						}
+						ops[j] = &kvstorev1.BatchWriteOperation{Namespace: namespace, Key: keyAt(idx), Value: value}
+					}
+					successes, failures, err = runBatch(cl, ctx, ops)
 				} else {
 					_, err = cl.Set(ctx, &kvstorev1.SetRequest{Namespace: namespace, Key: key, Value: value})
 				}
@@ -411,7 +480,16 @@ func runRPC(opt options, clients []kvstorev1.KVStoreClient, namespace string, re
 					target = &p.get
 				}
 				if err != nil {
-					target.Errors++
+					target.Errors += int64(failures)
+					if failures == 0 {
+						target.Errors++
+					}
+					if successes > 0 && !isRead {
+						target.OK += int64(successes)
+						for j := 0; j < successes; j++ {
+							target.Lat.Add(elapsed.Nanoseconds(), rng)
+						}
+					}
 					if loggedRPCFailures.Add(1) <= 10 {
 						op := "SET"
 						if isRead {
@@ -420,11 +498,13 @@ func runRPC(opt options, clients []kvstorev1.KVStoreClient, namespace string, re
 						fmt.Fprintf(os.Stderr, "kvbench: %s failure (%s): %v\n", op, status.Code(err), err)
 					}
 				} else {
-					target.OK++
+					target.OK += int64(successes)
 					if isRead && missing {
 						target.NotFound++
 					}
-					target.Lat.Add(elapsed.Nanoseconds(), rng)
+					for j := 0; j < successes; j++ {
+						target.Lat.Add(elapsed.Nanoseconds(), rng)
+					}
 				}
 			}
 			result <- p

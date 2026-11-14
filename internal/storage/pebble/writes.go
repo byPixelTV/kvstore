@@ -1,6 +1,7 @@
 package pebblestore
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/byPixelTV/kvstore/internal/changefeed"
+	"github.com/byPixelTV/kvstore/internal/storage"
 	pebbledb "github.com/cockroachdb/pebble/v2"
 )
 
@@ -33,11 +35,13 @@ type writeRequest struct {
 	namespace, key string
 	value          []byte
 	reply          chan writeResponse
+	operations     []storage.WriteOperation
 }
 
 type writeResponse struct {
-	revision uint64
-	err      error
+	revision  uint64
+	revisions []uint64
+	err       error
 }
 
 // submit never loses an accepted write during Close: the gate's read lock
@@ -66,6 +70,48 @@ func (s *Store) submit(ctx context.Context, kind writeKind, namespace, key strin
 		return response.revision, response.err
 	case <-ctx.Done():
 		return 0, ctx.Err()
+	}
+}
+
+// BatchWrite enqueues the complete request as ONE unit, ensuring that its
+// operations share a single durable Pebble sync with preserved item order.
+func (s *Store) BatchWrite(ctx context.Context, operations []storage.WriteOperation) ([]uint64, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if len(operations) < 1 || len(operations) > 128 {
+		return nil, errors.New("invalid batch length")
+	}
+	total := 0
+	copyOps := make([]storage.WriteOperation, len(operations))
+	for i, op := range operations {
+		if op.Namespace == "" || op.Key == "" {
+			return nil, errors.New("empty namespace/key")
+		}
+		total += len(op.Namespace) + len(op.Key) + len(op.Value) + 128
+		if total > 256<<10 {
+			return nil, errors.New("batch exceeds 256 KiB")
+		}
+		copyOps[i] = storage.WriteOperation{Namespace: op.Namespace, Key: op.Key, Delete: op.Delete, Value: bytes.Clone(op.Value)}
+	}
+	req := writeRequest{ctx: ctx, operations: copyOps, reply: make(chan writeResponse, 1)}
+	s.gate.RLock()
+	if s.closed {
+		s.gate.RUnlock()
+		return nil, ErrStoreClosed
+	}
+	select {
+	case s.writeQueue <- req:
+		s.gate.RUnlock()
+	case <-ctx.Done():
+		s.gate.RUnlock()
+		return nil, ctx.Err()
+	}
+	select {
+	case result := <-req.reply:
+		return result.revisions, result.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
 }
 
@@ -134,51 +180,67 @@ func (s *Store) applyGroup(group []writeRequest) {
 			results[i].err = err
 			continue
 		}
-		encodedKey := encodeKey(req.namespace, req.key)
-		key := string(encodedKey)
-		if req.kind == deleteKind {
-			exists, seen := shadow[key]
-			if !seen {
-				_, closer, err := s.db.Get(encodedKey)
-				if errors.Is(err, pebbledb.ErrNotFound) {
-					exists = false
-				} else if err != nil {
-					batchErr = fmt.Errorf("read before delete: %w", err)
-					break
-				} else {
-					exists = true
-					if err := closer.Close(); err != nil {
-						batchErr = err
+		ops := req.operations
+		if ops == nil {
+			ops = []storage.WriteOperation{{Namespace: req.namespace, Key: req.key, Value: req.value, Delete: req.kind == deleteKind}}
+		}
+		revisions := make([]uint64, len(ops))
+		for j, op := range ops {
+			encodedKey := encodeKey(op.Namespace, op.Key)
+			key := string(encodedKey)
+			if op.Delete {
+				exists, seen := shadow[key]
+				if !seen {
+					_, closer, err := s.db.Get(encodedKey)
+					if errors.Is(err, pebbledb.ErrNotFound) {
+						exists = false
+					} else if err != nil {
+						batchErr = fmt.Errorf("read before delete: %w", err)
 						break
+					} else {
+						exists = true
+						if err := closer.Close(); err != nil {
+							batchErr = err
+							break
+						}
 					}
 				}
+				if !exists {
+					continue
+				}
 			}
-			if !exists {
-				continue
+			if next == math.MaxUint64 {
+				batchErr = errors.New("revision counter exhausted")
+				break
 			}
+			next++
+			if !op.Delete {
+				batchErr = batch.Set(encodedKey, encodeRecord(op.Value, next), nil)
+				shadow[key] = true
+			} else {
+				batchErr = batch.Delete(encodedKey, nil)
+				shadow[key] = false
+			}
+			if batchErr != nil {
+				break
+			}
+			batchErr = writer.Append(changefeed.Change{Revision: next, Namespace: op.Namespace, Key: op.Key, Value: op.Value, Deleted: op.Delete})
+			if batchErr != nil {
+				break
+			}
+			revisions[j] = next
+			changed = true
 		}
-		if next == math.MaxUint64 {
-			batchErr = errors.New("revision counter exhausted")
+		if batchErr != nil {
 			break
 		}
-		next++
-		if req.kind == setKind {
-			batchErr = batch.Set(encodedKey, encodeRecord(req.value, next), nil)
-			shadow[key] = true
+		if req.operations != nil {
+			results[i].revisions = revisions
 		} else {
-			batchErr = batch.Delete(encodedKey, nil)
-			shadow[key] = false
+			results[i].revision = revisions[0]
 		}
-		if batchErr != nil {
-			break
-		}
-		batchErr = writer.Append(changefeed.Change{Revision: next, Namespace: req.namespace, Key: req.key, Value: req.value, Deleted: req.kind == deleteKind})
-		if batchErr != nil {
-			break
-		}
-		results[i].revision = next
-		changed = true
 	}
+
 	commitAttempted := false
 	if batchErr == nil && changed {
 		var encoded [8]byte

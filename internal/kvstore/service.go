@@ -80,3 +80,30 @@ func (s *Service) ScanNamespace(ctx context.Context, namespace string, emit func
 	}
 	return scanner.ScanNamespace(ctx, namespace, emit)
 }
+
+// BatchWrite validates all operations before they enter the storage/raft log.
+// A request is atomic within one backend. The sharding router handles multi-
+// shard partial outcomes separately and never retries uncertain writes.
+func (s *Service) BatchWrite(ctx context.Context, operations []storage.WriteOperation) ([]uint64, error) {
+	if len(operations) == 0 || len(operations) > 128 {
+		return nil, errors.New("BatchWrite requires 1..128 operations")
+	}
+	total := 0
+	for _, op := range operations {
+		if err := validateKey(op.Namespace, op.Key); err != nil {
+			return nil, err
+		}
+		if len(op.Value) > 256<<10 {
+			return nil, errors.New("BatchWrite value exceeds 256 KiB")
+		}
+		total += len(op.Value) + len(op.Namespace) + len(op.Key) + 128
+		if total > 256<<10 {
+			return nil, errors.New("BatchWrite payload exceeds 256 KiB; split into smaller batches")
+		}
+	}
+	writer, ok := s.store.(storage.BatchWriter)
+	if !ok {
+		return nil, errors.New("backend does not support atomic BatchWrite")
+	}
+	return writer.BatchWrite(ctx, operations)
+}

@@ -15,6 +15,8 @@ WARMUP_SECONDS="${WARMUP_SECONDS:-2}"
 KEYSPACE="${KEYSPACE:-16384}"
 VALUE_SIZE="${VALUE_SIZE:-256}"
 CONNECTIONS="${CONNECTIONS:-16}"
+BATCH_SIZE="${BATCH_SIZE:-1}"
+[[ "$BATCH_SIZE" =~ ^[1-9][0-9]*$ ]] && (( BATCH_SIZE <= 128 )) || { echo "BATCH_SIZE must be 1..128" >&2; exit 2; }
 NODE_MEMORY="${NODE_MEMORY:-2g}"
 [[ "$RUNS" =~ ^[1-9][0-9]*$ ]] || { echo 'RUNS must be positive' >&2; exit 2; }
 # These ports are only bound to localhost; don't interrupt any existing services.
@@ -78,7 +80,7 @@ trap 'exit 143' TERM
  date -u '+UTC %Y-%m-%d %H:%M:%S'
  echo "git_head=$(git rev-parse HEAD 2>/dev/null || echo unavailable)"
  echo "git_changes=$(git status --porcelain | wc -l)"
- echo "runs=$RUNS concurrencies=$CONCURRENCIES duration=$DURATION_SECONDS warmup=$WARMUP_SECONDS keys=$KEYSPACE bytes=$VALUE_SIZE connections=$CONNECTIONS"
+ echo "runs=$RUNS concurrencies=$CONCURRENCIES duration=$DURATION_SECONDS warmup=$WARMUP_SECONDS keys=$KEYSPACE bytes=$VALUE_SIZE connections=$CONNECTIONS batch_size=$BATCH_SIZE"
  echo "raft_inflight=${KVSTORE_RAFT_MAX_INFLIGHT:-8} raft_max_append=${KVSTORE_RAFT_MAX_APPEND_ENTRIES:-128} raft_commit_timeout=${KVSTORE_RAFT_COMMIT_TIMEOUT:-50ms}"
  echo "read_window=${KVSTORE_READ_BATCH_WINDOW:-300us} read_verify_parallelism=${KVSTORE_READ_VERIFY_PARALLELISM:-2}"
  echo "write_window=${KVSTORE_WRITE_BATCH_WINDOW:-1500us} write_target=${KVSTORE_WRITE_BATCH_TARGET:-24} write_max_window=${KVSTORE_WRITE_BATCH_MAX_WINDOW:-5ms}"
@@ -115,7 +117,7 @@ done
 echo '== Running 50/50 STRONG point-operation workloads =='
 for concurrency in $CONCURRENCIES; do
  for ((run=1;run<=RUNS;run++)); do
-  output="$OUT/sharded-mixed-strong-c${concurrency}-r${run}.json"
+  output="$OUT/sharded-mixed-strong-b${BATCH_SIZE}-c${concurrency}-r${run}.json"
   # Capture host I/O pressure and per-shard Raft counters per individual run.
   cat /proc/pressure/io > "$OUT/io-before-c${concurrency}-r${run}.txt" 2>/dev/null || true
   cat /proc/pressure/cpu > "$OUT/cpu-before-c${concurrency}-r${run}.txt" 2>/dev/null || true
@@ -134,12 +136,12 @@ for concurrency in $CONCURRENCIES; do
    fi
   }
   snapshot_metrics "before-c${concurrency}-r${run}"
-  echo "[sharded/strong/mixed] workers=$concurrency run=$run/$RUNS"
+  echo "[sharded/strong/mixed] batch_size=$BATCH_SIZE workers=$concurrency run=$run/$RUNS"
   "$ROOT/bin/kvbench-sharded" -addr 127.0.0.1:50081 -mode mixed \
    -consistency strong -read-percent 50 -duration "${DURATION_SECONDS}s" \
    -warmup "${WARMUP_SECONDS}s" -concurrency "$concurrency" \
    -connections "$CONNECTIONS" -keys "$KEYSPACE" \
-   -value-size "$VALUE_SIZE" -json > "${output}.tmp"
+   -value-size "$VALUE_SIZE" -batch-size "$BATCH_SIZE" -json > "${output}.tmp"
   mv "${output}.tmp" "$output"
   snapshot_metrics "after-c${concurrency}-r${run}"
   cat /proc/pressure/io > "$OUT/io-after-c${concurrency}-r${run}.txt" 2>/dev/null || true
