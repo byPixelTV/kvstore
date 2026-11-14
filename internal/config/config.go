@@ -15,25 +15,30 @@ const (
 )
 
 type Config struct {
-	Mode               string
-	NodeID             string
-	ListenAddr         string
-	DataDir            string
-	ShutdownTimeout    time.Duration
-	RaftBindAddr       string
-	RaftAdvertiseAddr  string
-	GRPCAdvertiseAddr  string
-	AdminListenAddr    string
-	AdminAdvertiseAddr string
-	ClusterSeeds       []string
-	Bootstrap          bool
-	BootstrapNode      string
-	JoinToken          string
-	ReadBatchWindow    time.Duration
-	ReadBatchMax       int
-	WriteBatchWindow   time.Duration
-	WriteBatchMax      int
-	RaftMaxInflight    int
+	Mode                  string
+	NodeID                string
+	ListenAddr            string
+	DataDir               string
+	ShutdownTimeout       time.Duration
+	RaftBindAddr          string
+	RaftAdvertiseAddr     string
+	GRPCAdvertiseAddr     string
+	AdminListenAddr       string
+	AdminAdvertiseAddr    string
+	ClusterSeeds          []string
+	Bootstrap             bool
+	BootstrapNode         string
+	JoinToken             string
+	ReadBatchWindow       time.Duration
+	ReadBatchMax          int
+	ReadVerifyParallelism int
+	WriteBatchWindow      time.Duration
+	WriteBatchMax         int
+	WriteBatchTarget      int
+	WriteBatchMaxWindow   time.Duration
+	RaftMaxAppendEntries  int
+	RaftCommitTimeout     time.Duration
+	RaftMaxInflight       int
 }
 
 func getenv(key, def string) string {
@@ -95,6 +100,10 @@ func Load() (Config, error) {
 	if err != nil || c.ReadBatchMax < 1 || c.ReadBatchMax > 4096 {
 		return c, fmt.Errorf("KVSTORE_READ_BATCH_MAX must be between 1 and 4096")
 	}
+	c.ReadVerifyParallelism, err = strconv.Atoi(getenv("KVSTORE_READ_VERIFY_PARALLELISM", "2"))
+	if err != nil || c.ReadVerifyParallelism < 1 || c.ReadVerifyParallelism > 64 {
+		return c, fmt.Errorf("KVSTORE_READ_VERIFY_PARALLELISM must be between 1 and 64")
+	}
 	c.WriteBatchWindow, err = time.ParseDuration(getenv("KVSTORE_WRITE_BATCH_WINDOW", "250us"))
 	if err != nil || c.WriteBatchWindow <= 0 || c.WriteBatchWindow > 20*time.Millisecond {
 		return c, fmt.Errorf("KVSTORE_WRITE_BATCH_WINDOW must be greater than 0s and at most 20ms")
@@ -102,6 +111,29 @@ func Load() (Config, error) {
 	c.WriteBatchMax, err = strconv.Atoi(getenv("KVSTORE_WRITE_BATCH_MAX", "128"))
 	if err != nil || c.WriteBatchMax < 1 || c.WriteBatchMax > 4096 {
 		return c, fmt.Errorf("KVSTORE_WRITE_BATCH_MAX must be between 1 and 4096")
+	}
+	c.WriteBatchTarget, err = strconv.Atoi(getenv("KVSTORE_WRITE_BATCH_TARGET", "24"))
+	if err != nil || c.WriteBatchTarget < 1 || c.WriteBatchTarget > 256 {
+		return c, fmt.Errorf("KVSTORE_WRITE_BATCH_TARGET must be between 1 and 256")
+	}
+	maxWindowText := os.Getenv("KVSTORE_WRITE_BATCH_MAX_WINDOW")
+	if maxWindowText == "" {
+		maxWindowText = "5ms"
+	}
+	c.WriteBatchMaxWindow, err = time.ParseDuration(maxWindowText)
+	if os.Getenv("KVSTORE_WRITE_BATCH_MAX_WINDOW") == "" && c.WriteBatchMaxWindow < c.WriteBatchWindow {
+		c.WriteBatchMaxWindow = c.WriteBatchWindow
+	}
+	if err != nil || c.WriteBatchMaxWindow < c.WriteBatchWindow || c.WriteBatchMaxWindow > 20*time.Millisecond {
+		return c, fmt.Errorf("KVSTORE_WRITE_BATCH_MAX_WINDOW must be >= KVSTORE_WRITE_BATCH_WINDOW and <= 20ms")
+	}
+	c.RaftMaxAppendEntries, err = strconv.Atoi(getenv("KVSTORE_RAFT_MAX_APPEND_ENTRIES", "128"))
+	if err != nil || c.RaftMaxAppendEntries < 1 || c.RaftMaxAppendEntries > 1024 {
+		return c, fmt.Errorf("KVSTORE_RAFT_MAX_APPEND_ENTRIES must be between 1 and 1024")
+	}
+	c.RaftCommitTimeout, err = time.ParseDuration(getenv("KVSTORE_RAFT_COMMIT_TIMEOUT", "50ms"))
+	if err != nil || c.RaftCommitTimeout < time.Millisecond || c.RaftCommitTimeout > time.Second {
+		return c, fmt.Errorf("KVSTORE_RAFT_COMMIT_TIMEOUT must be between 1ms and 1s")
 	}
 	c.RaftMaxInflight, err = strconv.Atoi(getenv("KVSTORE_RAFT_MAX_INFLIGHT", "16"))
 	if err != nil || c.RaftMaxInflight < 1 || c.RaftMaxInflight > 128 {

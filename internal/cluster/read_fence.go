@@ -8,19 +8,20 @@ import (
 	"time"
 )
 
-// readFenceCoordinator batches only requests that arrived BEFORE the fence
-// starts. Joining an already in-flight quorum verification would be unsafe:
-// it could have proven leadership before the later read was invoked.
+// readFenceCoordinator batches only requests that arrived BEFORE quorum
+// verification begins. In particular, reads arriving while an older fence
+// is verifying never share its result: that would not be linearizable.
 //
-// Each batch verifies quorum leadership. The Node's leaderFence performs
-// a Raft log barrier only on the first read of a leadership term, ensuring
-// the FSM has applied all prior-term commits. Every waiter in the batch may
-// then read its own key from the local committed FSM.
+// A small semaphore bounds simultaneous VerifyLeader RPCs. While all slots
+// are busy, newly arriving reads may share the NEXT pending fence, because
+// its verification has not begun yet. maxSize is a dispatch threshold, not a
+// hard waiter limit during overload; this is intentional backpressure.
 type readFenceCoordinator struct {
 	mu      sync.Mutex
 	pending *readFenceBatch
 	window  time.Duration
 	maxSize int
+	slots   chan struct{}
 	verify  func() error
 	closed  bool
 	wg      sync.WaitGroup
@@ -28,22 +29,37 @@ type readFenceCoordinator struct {
 }
 
 type readFenceBatch struct {
-	once    sync.Once
-	done    chan struct{}
-	err     error
-	waiters int
+	startOnce sync.Once
+	done      chan struct{}
+	err       error
+	waiters   int // guarded by coordinator.mu until detached
+	created   time.Time
 }
 
 var errReadFenceClosed = errors.New("read fence coordinator closed")
 
 func newReadFenceCoordinator(window time.Duration, maxSize int, verify func() error, stats *readMetrics) *readFenceCoordinator {
+	return newReadFenceCoordinatorWithLimit(window, maxSize, 2, verify, stats)
+}
+
+func newReadFenceCoordinatorWithLimit(window time.Duration, maxSize, maxConcurrent int, verify func() error, stats *readMetrics) *readFenceCoordinator {
 	if maxSize < 1 {
 		maxSize = 1
+	}
+	if maxConcurrent < 1 {
+		maxConcurrent = 1
 	}
 	if window < 0 {
 		window = 0
 	}
-	return &readFenceCoordinator{window: window, maxSize: maxSize, verify: verify, stats: stats}
+	return &readFenceCoordinator{
+		window: window, maxSize: maxSize, slots: make(chan struct{}, maxConcurrent),
+		verify: verify, stats: stats,
+	}
+}
+
+func (c *readFenceCoordinator) schedule(b *readFenceBatch) {
+	b.startOnce.Do(func() { go c.execute(b) })
 }
 
 func (c *readFenceCoordinator) Wait(ctx context.Context) error {
@@ -57,18 +73,17 @@ func (c *readFenceCoordinator) Wait(ctx context.Context) error {
 	}
 	b := c.pending
 	if b == nil {
-		b = &readFenceBatch{done: make(chan struct{})}
+		b = &readFenceBatch{done: make(chan struct{}), created: time.Now()}
 		c.pending = b
-		c.wg.Add(1) // under mutex: Close cannot start waiting until Add finishes
-		// Timer may fire immediately but execute waits for the same mutex.
-		time.AfterFunc(c.window, func() { c.execute(b) })
+		c.wg.Add(1) // under mutex: Close cannot race this Add
+		time.AfterFunc(c.window, func() { c.schedule(b) })
 	}
 	b.waiters++
 	c.stats.requests.Add(1)
-	// When full, dispatch immediately rather than waiting for the timer.
-	// sync.Once prevents the timer from running the same batch twice.
+	// If all verification slots are occupied, leave this batch pending
+	// so additional concurrent readers can share its NEXT quorum check.
 	if b.waiters >= c.maxSize {
-		go c.execute(b)
+		c.schedule(b)
 	}
 	c.mu.Unlock()
 
@@ -81,20 +96,35 @@ func (c *readFenceCoordinator) Wait(ctx context.Context) error {
 }
 
 func (c *readFenceCoordinator) execute(b *readFenceBatch) {
-	b.once.Do(func() {
-		c.mu.Lock()
-		if c.pending == b {
-			c.pending = nil
+	// Acquire a slot BEFORE detaching the pending batch. This is the
+	// essential linearizability boundary: no request can join after the
+	// actual VerifyLeader call starts, and no quorum-RPC stampede occurs.
+	c.slots <- struct{}{}
+	defer func() { <-c.slots; c.wg.Done() }()
+
+	c.mu.Lock()
+	if c.pending == b {
+		c.pending = nil
+	}
+	waiters := b.waiters
+	c.mu.Unlock()
+
+	queueWait := time.Since(b.created)
+	active := c.stats.activeVerifications.Add(1)
+	for {
+		peak := c.stats.peakVerifications.Load()
+		if active <= peak || c.stats.peakVerifications.CompareAndSwap(peak, active) {
+			break
 		}
-		c.mu.Unlock()
-		start := time.Now()
-		b.err = c.verify()
-		c.stats.batches.Add(1)
-		c.stats.batchWaiters.Add(uint64(b.waiters))
-		c.stats.fenceNanos.Add(uint64(time.Since(start).Nanoseconds()))
-		close(b.done) // publishes err to all waiters
-		c.wg.Done()
-	})
+	}
+	start := time.Now()
+	b.err = c.verify()
+	c.stats.activeVerifications.Add(-1)
+	c.stats.batches.Add(1)
+	c.stats.batchWaiters.Add(uint64(waiters))
+	c.stats.queueNanos.Add(uint64(queueWait.Nanoseconds()))
+	c.stats.fenceNanos.Add(uint64(time.Since(start).Nanoseconds()))
+	close(b.done) // publishes b.err to all waiters
 }
 
 func (c *readFenceCoordinator) Close() {
@@ -102,30 +132,29 @@ func (c *readFenceCoordinator) Close() {
 	c.closed = true
 	pending := c.pending
 	c.mu.Unlock()
-	// The Raft instance should already be shut down; its pending futures
-	// complete with ErrRaftShutdown. Drain a scheduled batch immediately.
 	if pending != nil {
-		go c.execute(pending)
+		c.schedule(pending)
 	}
 	c.wg.Wait()
 }
 
-// Cumulative counters, made accessible only via the authenticated admin API.
-// Read and update operations never block on these counters.
 type readMetrics struct {
-	requests      atomic.Uint64
-	batches       atomic.Uint64
-	batchWaiters  atomic.Uint64
-	fenceNanos    atomic.Uint64
-	barrierCalls  atomic.Uint64
-	barrierNanos  atomic.Uint64
-	verifyCalls   atomic.Uint64
-	verifyNanos   atomic.Uint64
-	localReads    atomic.Uint64
-	localNanos    atomic.Uint64
-	forwardReads  atomic.Uint64
-	forwardNanos  atomic.Uint64
-	eventualReads atomic.Uint64
+	requests            atomic.Uint64
+	batches             atomic.Uint64
+	batchWaiters        atomic.Uint64
+	fenceNanos          atomic.Uint64
+	queueNanos          atomic.Uint64
+	activeVerifications atomic.Int64
+	peakVerifications   atomic.Int64
+	barrierCalls        atomic.Uint64
+	barrierNanos        atomic.Uint64
+	verifyCalls         atomic.Uint64
+	verifyNanos         atomic.Uint64
+	localReads          atomic.Uint64
+	localNanos          atomic.Uint64
+	forwardReads        atomic.Uint64
+	forwardNanos        atomic.Uint64
+	eventualReads       atomic.Uint64
 }
 
 type ReadPerformance struct {
@@ -133,6 +162,9 @@ type ReadPerformance struct {
 	ReadFenceBatches      uint64  `json:"read_fence_batches"`
 	AverageBatchSize      float64 `json:"average_batch_size"`
 	AverageFenceMS        float64 `json:"average_fence_ms"`
+	AverageFenceQueueMS   float64 `json:"average_fence_queue_ms"`
+	ActiveVerifications   int64   `json:"active_verifications"`
+	PeakVerifications     int64   `json:"peak_verifications"`
 	BarrierCalls          uint64  `json:"barrier_calls"`
 	AverageBarrierMS      float64 `json:"average_barrier_ms"`
 	VerifyLeaderCalls     uint64  `json:"verify_leader_calls"`
@@ -162,6 +194,9 @@ func (m *readMetrics) Snapshot() ReadPerformance {
 		ReadFenceBatches:      batchCount,
 		AverageBatchSize:      average(m.batchWaiters.Load(), batchCount),
 		AverageFenceMS:        average(m.fenceNanos.Load(), batchCount) / 1e6,
+		AverageFenceQueueMS:   average(m.queueNanos.Load(), batchCount) / 1e6,
+		ActiveVerifications:   m.activeVerifications.Load(),
+		PeakVerifications:     m.peakVerifications.Load(),
 		BarrierCalls:          barrierCount,
 		AverageBarrierMS:      average(m.barrierNanos.Load(), barrierCount) / 1e6,
 		VerifyLeaderCalls:     verifyCount,

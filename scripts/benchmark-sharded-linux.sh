@@ -79,6 +79,9 @@ trap 'exit 143' TERM
  echo "git_head=$(git rev-parse HEAD 2>/dev/null || echo unavailable)"
  echo "git_changes=$(git status --porcelain | wc -l)"
  echo "runs=$RUNS concurrencies=$CONCURRENCIES duration=$DURATION_SECONDS warmup=$WARMUP_SECONDS keys=$KEYSPACE bytes=$VALUE_SIZE connections=$CONNECTIONS"
+ echo "raft_inflight=${KVSTORE_RAFT_MAX_INFLIGHT:-8} raft_max_append=${KVSTORE_RAFT_MAX_APPEND_ENTRIES:-128} raft_commit_timeout=${KVSTORE_RAFT_COMMIT_TIMEOUT:-50ms}"
+ echo "read_window=${KVSTORE_READ_BATCH_WINDOW:-300us} read_verify_parallelism=${KVSTORE_READ_VERIFY_PARALLELISM:-2}"
+ echo "write_window=${KVSTORE_WRITE_BATCH_WINDOW:-1500us} write_target=${KVSTORE_WRITE_BATCH_TARGET:-24} write_max_window=${KVSTORE_WRITE_BATCH_MAX_WINDOW:-5ms}"
  uname -a
  command -v lscpu >/dev/null && lscpu || true
 } > "$OUT/system.txt"
@@ -116,6 +119,8 @@ for concurrency in $CONCURRENCIES; do
   # Capture host I/O pressure and per-shard Raft counters per individual run.
   cat /proc/pressure/io > "$OUT/io-before-c${concurrency}-r${run}.txt" 2>/dev/null || true
   cat /proc/pressure/cpu > "$OUT/cpu-before-c${concurrency}-r${run}.txt" 2>/dev/null || true
+  cat /proc/pressure/memory > "$OUT/memory-before-c${concurrency}-r${run}.txt" 2>/dev/null || true
+  cat /proc/diskstats > "$OUT/diskstats-before-c${concurrency}-r${run}.txt" 2>/dev/null || true
   snapshot_metrics() {
    local prefix="$1"
    if command -v curl >/dev/null; then
@@ -139,6 +144,8 @@ for concurrency in $CONCURRENCIES; do
   snapshot_metrics "after-c${concurrency}-r${run}"
   cat /proc/pressure/io > "$OUT/io-after-c${concurrency}-r${run}.txt" 2>/dev/null || true
   cat /proc/pressure/cpu > "$OUT/cpu-after-c${concurrency}-r${run}.txt" 2>/dev/null || true
+  cat /proc/pressure/memory > "$OUT/memory-after-c${concurrency}-r${run}.txt" 2>/dev/null || true
+  cat /proc/diskstats > "$OUT/diskstats-after-c${concurrency}-r${run}.txt" 2>/dev/null || true
   if command -v jq >/dev/null; then
    jq -er '"  GET: \(.get.ops_sec|floor)/s p99=\(.get.latency.p99_ms)ms; SET: \(.set.ops_sec|floor)/s p99=\(.set.latency.p99_ms)ms; errors=\(.get.errors+.set.errors) missing=\(.get.not_found)"' "$output"
    jq -e '(.get.errors+.set.errors)==0 and .get.not_found==0 and .get.ops_sec>0 and .set.ops_sec>0' "$output" >/dev/null || { echo "Benchmark errors: $output" >&2; exit 1; }

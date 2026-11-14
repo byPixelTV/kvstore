@@ -99,6 +99,12 @@ func Open(cfg config.Config) (_ *Node, err error) {
 	// Raft can pass up to MaxAppendEntries committed logs to BatchingFSM.
 	// BatchApplyCh allows the leader to fill larger groups under load.
 	rCfg.BatchApplyCh = true
+	if cfg.RaftMaxAppendEntries > 0 {
+		rCfg.MaxAppendEntries = cfg.RaftMaxAppendEntries
+	}
+	if cfg.RaftCommitTimeout > 0 {
+		rCfg.CommitTimeout = cfg.RaftCommitTimeout
+	}
 	rCfg.SnapshotThreshold = 8192 // avoid snapshot churn during sustained writes
 	rCfg.SnapshotInterval = 2 * time.Minute
 	existing, err := raft.HasExistingState(bolt, bolt, snaps)
@@ -142,7 +148,11 @@ func Open(cfg config.Config) (_ *Node, err error) {
 			return err
 		},
 	}
-	node.reads = newReadFenceCoordinator(batchWindow, batchMax, node.strongFence, &node.readStats)
+	readVerifyParallelism := cfg.ReadVerifyParallelism
+	if readVerifyParallelism <= 0 {
+		readVerifyParallelism = 2
+	}
+	node.reads = newReadFenceCoordinatorWithLimit(batchWindow, batchMax, readVerifyParallelism, node.strongFence, &node.readStats)
 	node.writes = newClusterWriteBatcher(node)
 	return node, nil
 }

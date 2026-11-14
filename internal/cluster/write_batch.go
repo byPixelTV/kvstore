@@ -44,6 +44,9 @@ type WritePerformance struct {
 	InFlight           int64   `json:"in_flight"`
 	PeakInFlight       int64   `json:"peak_in_flight"`
 	MaxInFlight        int     `json:"configured_max_in_flight"`
+	BatchTarget        int     `json:"configured_batch_target"`
+	BatchWindowMS      float64 `json:"configured_batch_window_ms"`
+	BatchMaxWindowMS   float64 `json:"configured_batch_max_window_ms"`
 }
 
 type writeCounters struct {
@@ -61,15 +64,17 @@ type writeCounters struct {
 }
 
 type clusterWriteBatcher struct {
-	node        *Node
-	gate        sync.RWMutex
-	closed      bool
-	queue       chan clusterWriteRequest
-	done        chan struct{}
-	batchWindow time.Duration
-	batchMax    int
-	maxInflight int
-	stats       writeCounters
+	node           *Node
+	gate           sync.RWMutex
+	closed         bool
+	queue          chan clusterWriteRequest
+	done           chan struct{}
+	batchWindow    time.Duration
+	batchMaxWindow time.Duration
+	batchTarget    int
+	batchMax       int
+	maxInflight    int
+	stats          writeCounters
 }
 
 func newClusterWriteBatcher(node *Node) *clusterWriteBatcher {
@@ -84,13 +89,27 @@ func newClusterWriteBatcher(node *Node) *clusterWriteBatcher {
 	if maxBatch > maxRaftCommandsPerBatch {
 		maxBatch = maxRaftCommandsPerBatch
 	}
+	target := node.cfg.WriteBatchTarget
+	if target <= 0 {
+		target = 24
+	}
+	if target > maxBatch {
+		target = maxBatch
+	}
+	maxWindow := node.cfg.WriteBatchMaxWindow
+	if maxWindow <= 0 {
+		maxWindow = 5 * time.Millisecond
+	}
+	if maxWindow < window {
+		maxWindow = window
+	}
 	inflight := node.cfg.RaftMaxInflight
 	if inflight <= 0 {
 		inflight = defaultRaftInflight
 	}
 	b := &clusterWriteBatcher{
 		node: node, queue: make(chan clusterWriteRequest, clusterWriteQueueCapacity),
-		done: make(chan struct{}), batchWindow: window, batchMax: maxBatch,
+		done: make(chan struct{}), batchWindow: window, batchMaxWindow: maxWindow, batchTarget: target, batchMax: maxBatch,
 		maxInflight: inflight,
 	}
 	go b.loop()
@@ -105,6 +124,8 @@ func (b *clusterWriteBatcher) Performance() WritePerformance {
 		Completed: count, GroupErrors: b.stats.failed.Load(),
 		InFlight: b.stats.inFlight.Load(), PeakInFlight: b.stats.peak.Load(),
 		MaxInFlight: b.maxInflight, QueueDepth: len(b.queue),
+		BatchTarget: b.batchTarget, BatchWindowMS: float64(b.batchWindow) / 1e6,
+		BatchMaxWindowMS: float64(b.batchMaxWindow) / 1e6,
 	}
 	if groups > 0 {
 		perf.AverageBatch = float64(b.stats.logical.Load()) / float64(groups)
@@ -190,17 +211,13 @@ func (b *clusterWriteBatcher) loop() {
 		slots <- struct{}{}
 		group := []clusterWriteRequest{first}
 		totalBytes := estimateRaftCommand(first.cmd)
-		// When the replication pipeline is almost saturated, accept a
-		// slightly longer *bounded* collection window. This coalesces more
-		// logical writes per Raft log entry instead of producing many tiny
-		// entries while the leader is busy applying earlier groups.
-		window := b.batchWindow
-		if cap(slots) > 1 && len(slots) >= cap(slots)-1 {
-			window *= 2
-			if window > 5*time.Millisecond {
-				window = 5 * time.Millisecond
-			}
-		}
+		// Under a saturated I/O pipeline, a few extra milliseconds of
+		// batching can amortize the Raft log-store sync and the Pebble
+		// FSM sync across more logical writes. Stop early once target is
+		// reached so a large backlog does NOT pay the full extra delay.
+		// A lightly loaded cluster retains the low-latency base window.
+		window := batchCollectionWindow(b.batchWindow, b.batchMaxWindow, len(slots))
+
 		timer := time.NewTimer(window)
 		queueClosed := false
 	collect:
@@ -218,6 +235,11 @@ func (b *clusterWriteBatcher) loop() {
 				}
 				group = append(group, next)
 				totalBytes += estimated
+				// We already have enough writes to amortize one durable
+				// commit. No need to hold these clients for the whole timer.
+				if len(group) >= b.batchTarget {
+					break collect
+				}
 			case <-timer.C:
 				break collect
 			}
