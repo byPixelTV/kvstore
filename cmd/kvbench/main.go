@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	kvstorev1 "github.com/byPixelTV/kvstore/gen/go/kvstore/v1"
@@ -101,21 +102,23 @@ func (a aggregate) Report(seconds float64) operationReport {
 }
 
 type report struct {
-	Mode            string          `json:"mode"`
-	Consistency     string          `json:"consistency"`
-	Address         string          `json:"address"`
-	ResolvedAddress string          `json:"resolved_address,omitempty"`
-	Namespace       string          `json:"namespace"`
-	DurationSeconds float64         `json:"duration_seconds"`
-	WarmupSeconds   float64         `json:"warmup_seconds"`
-	Concurrency     int             `json:"concurrency"`
-	Connections     int             `json:"connections"`
-	Keyspace        int             `json:"keyspace"`
-	ValueBytes      int             `json:"value_bytes"`
-	CPUs            int             `json:"logical_cpus"`
-	Get             operationReport `json:"get"`
-	Set             operationReport `json:"set"`
-	Watch           *watchReport    `json:"watch,omitempty"`
+	Mode                string          `json:"mode"`
+	Consistency         string          `json:"consistency"`
+	Address             string          `json:"address"`
+	ResolvedAddress     string          `json:"resolved_address,omitempty"`
+	Namespace           string          `json:"namespace"`
+	DurationSeconds     float64         `json:"duration_seconds"`
+	WarmupSeconds       float64         `json:"warmup_seconds"`
+	Concurrency         int             `json:"concurrency"`
+	Connections         int             `json:"connections"`
+	Keyspace            int             `json:"keyspace"`
+	ValueBytes          int             `json:"value_bytes"`
+	CPUs                int             `json:"logical_cpus"`
+	LeaderRouteSwitches uint64          `json:"leader_route_switches,omitempty"`
+	LeaderFailovers     uint64          `json:"leader_failovers,omitempty"`
+	Get                 operationReport `json:"get"`
+	Set                 operationReport `json:"set"`
+	Watch               *watchReport    `json:"watch,omitempty"`
 }
 type watchReport struct {
 	Subscribers      int        `json:"subscribers"`
@@ -125,21 +128,22 @@ type watchReport struct {
 	DeliveryLatency  percentile `json:"delivery_latency"`
 }
 type options struct {
-	address     string
-	mode        string
-	consistency string
-	duration    time.Duration
-	warmup      time.Duration
-	concurrency int
-	connections int
-	keys        int
-	valueSize   int
-	readPercent int
-	timeout     time.Duration
-	watchers    int
-	watchRate   int
-	jsonOutput  bool
-	leaderMap   string
+	address       string
+	mode          string
+	consistency   string
+	duration      time.Duration
+	warmup        time.Duration
+	concurrency   int
+	connections   int
+	keys          int
+	valueSize     int
+	readPercent   int
+	timeout       time.Duration
+	watchers      int
+	watchRate     int
+	jsonOutput    bool
+	leaderMap     string
+	leaderRefresh time.Duration
 }
 
 func main() {
@@ -158,6 +162,7 @@ func main() {
 	flag.IntVar(&opt.watchers, "watchers", 5, "concurrent Watch subscribers in watch mode")
 	flag.IntVar(&opt.watchRate, "watch-rate", 100, "target writes/second in watch mode")
 	flag.StringVar(&opt.leaderMap, "leader-map", "", "route directly to Raft leader using gRPC metadata; map advertised=reachable targets, comma-separated")
+	flag.DurationVar(&opt.leaderRefresh, "leader-refresh", 2*time.Second, "leader re-discovery interval when -leader-map is set; 0 disables periodic refresh")
 	flag.BoolVar(&opt.jsonOutput, "json", false, "write JSON report to standard output")
 	flag.Parse()
 	if !valid(opt) {
@@ -170,7 +175,7 @@ func main() {
 	}
 }
 func valid(o options) bool {
-	return (o.consistency == "strong" || o.consistency == "eventual") && (o.mode == "get" || o.mode == "set" || o.mode == "mixed" || o.mode == "watch") && o.duration > 0 && o.warmup >= 0 && o.connections > 0 && o.concurrency > 0 && o.keys > 0 && o.valueSize >= 8 && o.valueSize <= 256<<10 && o.readPercent >= 0 && o.readPercent <= 100 && o.timeout > 0 && o.watchers > 0 && o.watchRate > 0 && o.watchRate <= 100000
+	return (o.consistency == "strong" || o.consistency == "eventual") && (o.mode == "get" || o.mode == "set" || o.mode == "mixed" || o.mode == "watch") && o.duration > 0 && o.warmup >= 0 && o.connections > 0 && o.concurrency > 0 && o.keys > 0 && o.valueSize >= 8 && o.valueSize <= 256<<10 && o.readPercent >= 0 && o.readPercent <= 100 && o.timeout > 0 && o.leaderRefresh >= 0 && o.watchers > 0 && o.watchRate > 0 && o.watchRate <= 100000
 }
 
 // resolveLeaderAddress asks the load balancer for the Raft leader and maps
@@ -215,28 +220,33 @@ func run(opt options) error {
 	}
 	namespace := fmt.Sprintf("kvbench-%x", runID)
 	target := opt.address
+	var pool *leaderRoutePool
+	clients := make([]kvstorev1.KVStoreClient, 0, opt.connections)
 	if opt.leaderMap != "" {
 		var err error
-		target, err = resolveLeaderAddress(opt.address, opt.leaderMap, opt.timeout)
+		pool, err = newLeaderRoutePool(opt.address, opt.leaderMap, opt.connections, opt.timeout, opt.leaderRefresh)
 		if err != nil {
 			return err
 		}
-		fmt.Fprintf(os.Stderr, "kvbench: leader %s -> %s\n", opt.address, target)
-	}
-	connections := make([]*grpc.ClientConn, 0, opt.connections)
-	defer func() {
-		for _, c := range connections {
-			_ = c.Close()
+		defer pool.Close()
+		target = pool.target()
+		clients = pool.Clients()
+		fmt.Fprintf(os.Stderr, "kvbench: initial leader %s -> %s (refresh %s)\n", opt.address, target, opt.leaderRefresh)
+	} else {
+		connections := make([]*grpc.ClientConn, 0, opt.connections)
+		defer func() {
+			for _, c := range connections {
+				_ = c.Close()
+			}
+		}()
+		for i := 0; i < opt.connections; i++ {
+			conn, err := grpc.NewClient(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
+			if err != nil {
+				return err
+			}
+			connections = append(connections, conn)
+			clients = append(clients, kvstorev1.NewKVStoreClient(conn))
 		}
-	}()
-	clients := make([]kvstorev1.KVStoreClient, 0, opt.connections)
-	for i := 0; i < opt.connections; i++ {
-		conn, err := grpc.NewClient(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
-		if err != nil {
-			return err
-		}
-		connections = append(connections, conn)
-		clients = append(clients, kvstorev1.NewKVStoreClient(conn))
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), opt.timeout)
 	_, err := clients[0].Head(ctx, &kvstorev1.HeadRequest{})
@@ -252,6 +262,11 @@ func run(opt options) error {
 	}
 	if err != nil {
 		return err
+	}
+	if pool != nil {
+		rep.ResolvedAddress = pool.target()
+		rep.LeaderRouteSwitches = pool.switches.Load()
+		rep.LeaderFailovers = pool.failovers.Load()
 	}
 	if opt.jsonOutput {
 		enc := json.NewEncoder(os.Stdout)
@@ -291,17 +306,45 @@ func write(client kvstorev1.KVStoreClient, opt options, namespace, key string, v
 	_, err := client.Set(ctx, &kvstorev1.SetRequest{Namespace: namespace, Key: key, Value: value})
 	return err
 }
+
+// Prefill must not dominate a short benchmark. Bounded parallel writes
+// populate the test namespace, but all complete before the timed workload.
 func prefill(opt options, clients []kvstorev1.KVStoreClient, namespace string) error {
 	if opt.mode == "set" {
 		return nil
 	}
 	value := fill(opt.valueSize)
-	for i := 0; i < opt.keys; i++ {
-		if err := write(clients[i%len(clients)], opt, namespace, keyAt(i), value); err != nil {
-			return fmt.Errorf("prefill key %d: %w", i, err)
-		}
+	workers := opt.concurrency
+	if workers > 64 {
+		workers = 64
 	}
-	return nil
+	if workers > opt.keys {
+		workers = opt.keys
+	}
+	var next atomic.Int64
+	var failed atomic.Bool
+	var firstErr error
+	var once sync.Once
+	var wg sync.WaitGroup
+	for worker := 0; worker < workers; worker++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			client := clients[id%len(clients)]
+			for !failed.Load() {
+				key := int(next.Add(1)) - 1
+				if key >= opt.keys {
+					return
+				}
+				if err := write(client, opt, namespace, keyAt(key), value); err != nil {
+					once.Do(func() { firstErr = fmt.Errorf("prefill key %d: %w", key, err); failed.Store(true) })
+					return
+				}
+			}
+		}(worker)
+	}
+	wg.Wait()
+	return firstErr
 }
 func runRPC(opt options, clients []kvstorev1.KVStoreClient, namespace string, rep *report) error {
 	if err := prefill(opt, clients, namespace); err != nil {

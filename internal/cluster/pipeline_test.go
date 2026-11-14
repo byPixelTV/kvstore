@@ -88,4 +88,11 @@ func TestPipelinedWritesPreserveRevisionsAndFeed(t *testing.T) {
 	if perf.InFlight != 0 || perf.PeakInFlight > int64(cfg.RaftMaxInflight) {
 		t.Fatalf("unbounded inflight writes: %+v", perf)
 	}
+	if perf.AverageBatch < 1 || perf.QueueDepth != 0 || perf.AverageAdmissionMS < 0 {
+		t.Fatalf("invalid write pipeline metrics: %+v", perf)
+	}
+	fsm := node.fsm.Performance()
+	if fsm.CommitBatches < 1 || fsm.LogicalWrites != total || fsm.AveragePebbleCommitMS <= 0 {
+		t.Fatalf("invalid durable apply metrics: %+v", fsm)
+	}
 }

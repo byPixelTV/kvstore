@@ -10,6 +10,8 @@ import (
 	"io"
 	"math"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/byPixelTV/kvstore/internal/changefeed"
 	"github.com/byPixelTV/kvstore/internal/storage"
@@ -60,6 +62,9 @@ type applyResult struct {
 // never from calls to pebble.Store.Set or pebble.Store.Delete.
 type FSM struct {
 	mu           sync.RWMutex
+	readMu       sync.RWMutex
+	published    *pebble.Snapshot
+	readFailure  error // guarded by readMu; GET never waits behind Pebble fsync
 	db           *pebble.DB
 	revision     uint64
 	applied      uint64
@@ -68,6 +73,42 @@ type FSM struct {
 	historyBytes uint64
 	notifier     changefeed.Notifier
 	failed       error
+	metrics      fsmApplyMetrics
+}
+
+// FSMPerformance separates Pebble's durable commit time from the rest of the
+// Raft FSM apply path. All metrics are cumulative and read without locking.
+type FSMPerformance struct {
+	CommitBatches         uint64  `json:"commit_batches"`
+	CommittedLogs         uint64  `json:"committed_raft_logs"`
+	LogicalWrites         uint64  `json:"logical_writes"`
+	AverageLogsPerBatch   float64 `json:"average_logs_per_commit"`
+	AverageWritesPerBatch float64 `json:"average_writes_per_commit"`
+	AveragePebbleCommitMS float64 `json:"average_pebble_commit_ms"`
+	AverageFSMApplyMS     float64 `json:"average_fsm_apply_ms"`
+	AverageLockWaitMS     float64 `json:"average_fsm_lock_wait_ms"`
+}
+
+type fsmApplyMetrics struct {
+	commits     atomic.Uint64
+	logs        atomic.Uint64
+	writes      atomic.Uint64
+	commitNanos atomic.Uint64
+	applyNanos  atomic.Uint64
+	lockNanos   atomic.Uint64
+}
+
+func (f *FSM) Performance() FSMPerformance {
+	commits := f.metrics.commits.Load()
+	result := FSMPerformance{CommitBatches: commits, CommittedLogs: f.metrics.logs.Load(), LogicalWrites: f.metrics.writes.Load()}
+	if commits > 0 {
+		result.AverageLogsPerBatch = float64(result.CommittedLogs) / float64(commits)
+		result.AverageWritesPerBatch = float64(result.LogicalWrites) / float64(commits)
+		result.AveragePebbleCommitMS = float64(f.metrics.commitNanos.Load()) / float64(commits) / 1e6
+		result.AverageFSMApplyMS = float64(f.metrics.applyNanos.Load()) / float64(commits) / 1e6
+		result.AverageLockWaitMS = float64(f.metrics.lockNanos.Load()) / float64(commits) / 1e6
+	}
+	return result
 }
 
 var _ raft.BatchingFSM = (*FSM)(nil)
@@ -82,6 +123,9 @@ func openFSM(path string) (*FSM, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	// Publish only already-durable data. Raft Apply swaps this snapshot
+	// after the synchronous Pebble commit has succeeded.
+	f.published = db.NewSnapshot()
 	return f, nil
 }
 
@@ -138,8 +182,22 @@ func (f *FSM) refreshMeta() error {
 	return nil
 }
 
-func (f *FSM) Close() error   { f.mu.Lock(); defer f.mu.Unlock(); return f.db.Close() }
-func (f *FSM) Failure() error { f.mu.RLock(); defer f.mu.RUnlock(); return f.failed }
+func (f *FSM) Close() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.readMu.Lock()
+	if f.published != nil {
+		_ = f.published.Close()
+		f.published = nil
+	}
+	f.readMu.Unlock()
+	return f.db.Close()
+}
+func (f *FSM) Failure() error {
+	f.readMu.RLock()
+	defer f.readMu.RUnlock()
+	return f.readFailure
+}
 
 func encodeRecordKey(ns, key string) []byte {
 	b := binary.AppendUvarint([]byte{1}, uint64(len(ns)))
@@ -163,12 +221,18 @@ func (f *FSM) Get(ctx context.Context, ns, key string) (storage.Record, bool, er
 	if err := ctx.Err(); err != nil {
 		return storage.Record{}, false, err
 	}
-	f.mu.RLock()
-	defer f.mu.RUnlock()
-	if f.failed != nil {
-		return storage.Record{}, false, f.failed
+	// The read snapshot is updated only AFTER the corresponding Raft apply
+	// batch has completed a synchronous Pebble commit. A GET therefore never
+	// waits for the writer's fsync and never sees uncommitted data.
+	f.readMu.RLock()
+	defer f.readMu.RUnlock()
+	if f.readFailure != nil {
+		return storage.Record{}, false, f.readFailure
 	}
-	raw, closer, err := f.db.Get(encodeRecordKey(ns, key))
+	if f.published == nil {
+		return storage.Record{}, false, errors.New("cluster FSM closed")
+	}
+	raw, closer, err := f.published.Get(encodeRecordKey(ns, key))
 	if errors.Is(err, pebble.ErrNotFound) {
 		return storage.Record{}, false, nil
 	}
@@ -218,10 +282,15 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
 	if len(logs) == 0 {
 		return responses
 	}
+	started := time.Now()
 	f.mu.Lock()
+	lockWait := time.Since(started)
 	defer f.mu.Unlock()
 	fail := func(err error) []interface{} {
 		f.failed = err
+		f.readMu.Lock()
+		f.readFailure = err
+		f.readMu.Unlock()
 		for i := range responses {
 			responses[i] = applyResult{Err: err}
 		}
@@ -356,16 +425,35 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
 	if err := batch.Set(appliedKey, encode64(nextApplied), nil); err != nil {
 		return fail(err)
 	}
+	commitStarted := time.Now()
 	if err := batch.Commit(pebble.Sync); err != nil {
 		return fail(fmt.Errorf("apply committed Raft batch ending at %d: %w", nextApplied, err))
 	}
+	commitDuration := time.Since(commitStarted)
+	logicalWrites := nextRevision - f.revision
 	f.applied = nextApplied
 	if changed {
+		// Do not publish until Pebble.Sync is complete. Acquire readMu only
+		// for the snapshot swap; outstanding readers finish before old.Close.
+		newRead := f.db.NewSnapshot()
+		f.readMu.Lock()
+		oldRead := f.published
+		f.published = newRead
+		if oldRead != nil {
+			_ = oldRead.Close()
+		}
+		f.readMu.Unlock()
 		f.revision = nextRevision
 		f.oldest, f.historyBytes = history.State()
 		f.hasFloor = true
 		f.notifier.Signal()
 	}
+	f.metrics.commitNanos.Add(uint64(commitDuration.Nanoseconds()))
+	f.metrics.lockNanos.Add(uint64(lockWait.Nanoseconds()))
+	f.metrics.logs.Add(uint64(len(logs)))
+	f.metrics.writes.Add(logicalWrites)
+	f.metrics.applyNanos.Add(uint64(time.Since(started).Nanoseconds()))
+	f.metrics.commits.Add(1)
 	return responses
 }
 
@@ -474,8 +562,21 @@ func (f *FSM) Restore(reader io.ReadCloser) error {
 	}
 	f.failed = nil
 	if err := f.refreshMeta(); err != nil {
+		f.failed = err
+		f.readMu.Lock()
+		f.readFailure = err
+		f.readMu.Unlock()
 		return err
 	}
+	newRead := f.db.NewSnapshot()
+	f.readMu.Lock()
+	oldRead := f.published
+	f.published = newRead
+	f.readFailure = nil
+	if oldRead != nil {
+		_ = oldRead.Close()
+	}
+	f.readMu.Unlock()
 	f.notifier.Signal()
 	return nil
 }

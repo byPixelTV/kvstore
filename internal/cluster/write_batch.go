@@ -32,29 +32,32 @@ type clusterWriteRequest struct {
 }
 
 type WritePerformance struct {
-	Submitted      uint64  `json:"submitted_writes"`
-	Groups         uint64  `json:"submitted_raft_groups"`
-	Completed      uint64  `json:"completed_raft_groups"`
-	GroupErrors    uint64  `json:"failed_raft_groups"`
-	AverageBatch   float64 `json:"average_batch_size"`
-	AverageApplyMS float64 `json:"average_raft_apply_ms"`
-	AverageQueueMS float64 `json:"average_queue_wait_ms"`
-	InFlight       int64   `json:"in_flight"`
-	PeakInFlight   int64   `json:"peak_in_flight"`
-	MaxInFlight    int     `json:"configured_max_in_flight"`
+	Submitted          uint64  `json:"submitted_writes"`
+	Groups             uint64  `json:"submitted_raft_groups"`
+	Completed          uint64  `json:"completed_raft_groups"`
+	GroupErrors        uint64  `json:"failed_raft_groups"`
+	AverageBatch       float64 `json:"average_batch_size"`
+	AverageApplyMS     float64 `json:"average_raft_apply_ms"`
+	AverageAdmissionMS float64 `json:"average_raft_admission_ms"`
+	QueueDepth         int     `json:"queue_depth"`
+	AverageQueueMS     float64 `json:"average_queue_wait_ms"`
+	InFlight           int64   `json:"in_flight"`
+	PeakInFlight       int64   `json:"peak_in_flight"`
+	MaxInFlight        int     `json:"configured_max_in_flight"`
 }
 
 type writeCounters struct {
-	submitted   atomic.Uint64
-	groups      atomic.Uint64
-	logical     atomic.Uint64
-	completed   atomic.Uint64
-	failed      atomic.Uint64
-	applyNanos  atomic.Uint64
-	queueNanos  atomic.Uint64
-	queuedCount atomic.Uint64
-	inFlight    atomic.Int64
-	peak        atomic.Int64
+	submitted      atomic.Uint64
+	groups         atomic.Uint64
+	logical        atomic.Uint64
+	completed      atomic.Uint64
+	failed         atomic.Uint64
+	applyNanos     atomic.Uint64
+	admissionNanos atomic.Uint64
+	queueNanos     atomic.Uint64
+	queuedCount    atomic.Uint64
+	inFlight       atomic.Int64
+	peak           atomic.Int64
 }
 
 type clusterWriteBatcher struct {
@@ -101,13 +104,16 @@ func (b *clusterWriteBatcher) Performance() WritePerformance {
 		Submitted: b.stats.submitted.Load(), Groups: groups,
 		Completed: count, GroupErrors: b.stats.failed.Load(),
 		InFlight: b.stats.inFlight.Load(), PeakInFlight: b.stats.peak.Load(),
-		MaxInFlight: b.maxInflight,
+		MaxInFlight: b.maxInflight, QueueDepth: len(b.queue),
 	}
 	if groups > 0 {
 		perf.AverageBatch = float64(b.stats.logical.Load()) / float64(groups)
 	}
 	if count > 0 {
 		perf.AverageApplyMS = float64(b.stats.applyNanos.Load()) / float64(count) / 1e6
+	}
+	if groups > 0 {
+		perf.AverageAdmissionMS = float64(b.stats.admissionNanos.Load()) / float64(groups) / 1e6
 	}
 	if n := b.stats.queuedCount.Load(); n > 0 {
 		perf.AverageQueueMS = float64(b.stats.queueNanos.Load()) / float64(n) / 1e6
@@ -176,6 +182,12 @@ func (b *clusterWriteBatcher) loop() {
 			}
 			first = next
 		}
+		// Reserve the next Raft pipeline slot BEFORE starting the collection
+		// window. When the pipeline is saturated, waiting for a slot lets
+		// requests accumulate in the bounded queue. The next batch drains
+		// that backlog rather than being frozen at a small batch size while
+		// waiting for an in-flight future to finish.
+		slots <- struct{}{}
 		group := []clusterWriteRequest{first}
 		totalBytes := estimateRaftCommand(first.cmd)
 		// When the replication pipeline is almost saturated, accept a
@@ -248,6 +260,7 @@ func (b *clusterWriteBatcher) dispatch(group []clusterWriteRequest, slots chan s
 	}
 	if len(commands) == 0 {
 		replyAll()
+		<-slots
 		return
 	}
 
@@ -261,6 +274,7 @@ func (b *clusterWriteBatcher) dispatch(group []clusterWriteRequest, slots chan s
 			results[i].err = err
 		}
 		replyAll()
+		<-slots
 		return
 	}
 	// The maxBytes estimate is conservative, but enforce the real encoded
@@ -271,14 +285,16 @@ func (b *clusterWriteBatcher) dispatch(group []clusterWriteRequest, slots chan s
 			results[i].err = err
 		}
 		replyAll()
+		<-slots
 		return
 	}
 
 	// Bound outstanding Raft commands and goroutines under overload.
-	// Only this worker submits to raft.Apply, retaining submission order.
-	slots <- struct{}{}
+	// The loop already reserved a slot. Only it submits to raft.Apply,
+	// preserving log submission order despite asynchronous completion.
 	started := time.Now()
 	future := b.node.raft.Apply(raw, opTimeout)
+	b.stats.admissionNanos.Add(uint64(time.Since(started).Nanoseconds()))
 	b.stats.groups.Add(1)
 	b.stats.logical.Add(uint64(len(commands)))
 	active := b.stats.inFlight.Add(1)

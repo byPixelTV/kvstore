@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+export LC_ALL=C
 
 # Linux bare-metal benchmark runner for an isolated KVStore project.
 # Place this file in scripts/ of the KVStore repository.
@@ -43,6 +44,9 @@ VALUE_SIZE="${VALUE_SIZE:-256}"
 KEYSPACE="${KEYSPACE:-256}"
 CONCURRENCIES="${CONCURRENCIES:-32 128}"
 WORKLOADS="${WORKLOADS:-set mixed}"
+BENCH_STANDALONE="${BENCH_STANDALONE:-1}"
+BENCH_ENVOY="${BENCH_ENVOY:-1}"
+LEADER_REFRESH="${LEADER_REFRESH:-2s}"
 READ_PERCENT="${READ_PERCENT:-50}"
 LEADER_MAP="${LEADER_MAP:-}"
 CONNECTIONS="${CONNECTIONS:-8}"
@@ -55,6 +59,12 @@ NODE_MEMORY="${NODE_MEMORY:-3g}"
   echo "READ_PERCENT must be an integer from 0 to 100; got: $READ_PERCENT" >&2; exit 2;
 }
 [[ "$RUNS" =~ ^[1-9][0-9]*$ ]] || { echo "RUNS must be positive" >&2; exit 2; }
+[[ "$BENCH_STANDALONE" =~ ^[01]$ && "$BENCH_ENVOY" =~ ^[01]$ ]] || {
+  echo "BENCH_STANDALONE and BENCH_ENVOY must be 0 or 1" >&2; exit 2;
+}
+[[ "$BENCH_ENVOY" == 1 || -n "$LEADER_MAP" ]] || {
+  echo "No cluster workload selected: enable BENCH_ENVOY or set LEADER_MAP" >&2; exit 2;
+}
 
 export KVSTORE_JOIN_TOKEN="${KVSTORE_JOIN_TOKEN:-$(od -An -N32 -tx1 /dev/urandom | tr -d '[:space:]')}"
 
@@ -151,6 +161,9 @@ trap 'exit 143' TERM
     "$DURATION_SECONDS" "$WARMUP_SECONDS" "$RUNS" "$CONCURRENCIES" "$CONNECTIONS" "$KEYSPACE" "$VALUE_SIZE"
   printf 'workloads="%s" read_percent=%s leader_map="%s" node_memory=%s skip_build=%s\n' \
     "$WORKLOADS" "$READ_PERCENT" "$LEADER_MAP" "$NODE_MEMORY" "${SKIP_BUILD:-0}"
+  printf 'standalone=%s envoy=%s leader_refresh=%s raft_inflight=%s write_window=%s read_window=%s\n' \
+    "$BENCH_STANDALONE" "$BENCH_ENVOY" "$LEADER_REFRESH" \
+    "${KVSTORE_RAFT_MAX_INFLIGHT:-8}" "${KVSTORE_WRITE_BATCH_WINDOW:-1500us}" "${KVSTORE_READ_BATCH_WINDOW:-300us}"
   if command -v git >/dev/null 2>&1; then
     echo "git_head=$(git rev-parse HEAD 2>/dev/null || echo unavailable)"
     echo "git_branch=$(git branch --show-current 2>/dev/null || echo unavailable)"
@@ -205,7 +218,7 @@ run_one() {
   echo "[$deployment/$label/$mode/$consistency] workers=$concurrency run=$run/$RUNS"
   local -a leader_flags=()
   if [[ "$deployment" == cluster && "$label" == leader && -n "$LEADER_MAP" ]]; then
-    leader_flags=(-leader-map "$LEADER_MAP")
+    leader_flags=(-leader-map "$LEADER_MAP" -leader-refresh "$LEADER_REFRESH")
   fi
   ./bin/kvbench \
     -addr "$addr" -mode "$mode" -consistency "$consistency" \
@@ -249,17 +262,21 @@ benchmark_set() {
   done
 }
 
-echo '== Starting isolated standalone =='
-"${standalone[@]}" up -d --no-build --wait --wait-timeout 120
-ready standalone
-benchmark_set standalone strong 127.0.0.1:50051 grpc
-"${standalone[@]}" logs --tail 200 > "$OUT/standalone-logs.txt" 2>&1 || true
-"${standalone[@]}" stop
+if [[ "$BENCH_STANDALONE" == 1 ]]; then
+  echo '== Starting isolated standalone =='
+  "${standalone[@]}" up -d --no-build --wait --wait-timeout 120
+  ready standalone
+  benchmark_set standalone strong 127.0.0.1:50051 grpc
+  "${standalone[@]}" logs --tail 200 > "$OUT/standalone-logs.txt" 2>&1 || true
+  "${standalone[@]}" stop
+fi
 
 echo '== Starting isolated 3-node Raft cluster + Envoy =='
 "${cluster[@]}" up -d --no-build --wait --wait-timeout 150
 ready cluster
-benchmark_set cluster strong 127.0.0.1:50051 envoy
+if [[ "$BENCH_ENVOY" == 1 ]]; then
+  benchmark_set cluster strong 127.0.0.1:50051 envoy
+fi
 if [[ -n "$LEADER_MAP" ]]; then
   echo '== Running same cluster workloads with direct leader routing =='
   benchmark_set cluster strong 127.0.0.1:50051 leader
