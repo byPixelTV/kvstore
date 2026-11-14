@@ -85,7 +85,7 @@ trap 'exit 143' TERM
  echo "runs=$RUNS concurrencies=$CONCURRENCIES duration=$DURATION_SECONDS warmup=$WARMUP_SECONDS keys=$KEYSPACE bytes=$VALUE_SIZE connections=$CONNECTIONS batch_size=$BATCH_SIZE target_ops=$TARGET_OPS"
  echo "raft_inflight=${KVSTORE_RAFT_MAX_INFLIGHT:-8} raft_max_append=${KVSTORE_RAFT_MAX_APPEND_ENTRIES:-128} raft_commit_timeout=${KVSTORE_RAFT_COMMIT_TIMEOUT:-50ms} raft_log_cache=${KVSTORE_RAFT_LOG_CACHE_ENTRIES:-512}"
  echo "read_window=${KVSTORE_READ_BATCH_WINDOW:-300us} read_verify_parallelism=${KVSTORE_READ_VERIFY_PARALLELISM:-2}"
- echo "write_window=${KVSTORE_WRITE_BATCH_WINDOW:-1500us} write_target=${KVSTORE_WRITE_BATCH_TARGET:-24} write_max_window=${KVSTORE_WRITE_BATCH_MAX_WINDOW:-5ms}"
+ echo "write_window=${KVSTORE_WRITE_BATCH_WINDOW:-1500us} write_target=${KVSTORE_WRITE_BATCH_TARGET:-64} write_max_queue_delay=${KVSTORE_WRITE_MAX_QUEUE_DELAY:-0s} write_max_window=${KVSTORE_WRITE_BATCH_MAX_WINDOW:-5ms}"
  uname -a
  command -v lscpu >/dev/null && lscpu || true
 } > "$OUT/system.txt"

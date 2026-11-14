@@ -9,12 +9,15 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 const (
 	clusterWriteBatchWindow   = 1500 * time.Microsecond
 	clusterWriteBatchMax      = 256
-	clusterWriteQueueCapacity = 8192
+	clusterWriteQueueCapacity = 2048
 	// A 256-KiB value fits, including JSON/base64 overhead. Never enlarge
 	// a batch beyond this budget just because the command count allows it.
 	clusterWriteBatchBytes  = 400 << 10
@@ -56,6 +59,8 @@ type WritePerformance struct {
 	PeakInFlight       int64   `json:"peak_in_flight"`
 	BatchRPCs          uint64  `json:"submitted_batch_rpcs"`
 	BatchLogicalWrites uint64  `json:"submitted_batch_logical_writes"`
+	RejectedBeforeRaft uint64  `json:"rejected_before_raft"`
+	QueueBudgetMS      float64 `json:"configured_queue_budget_ms"`
 	MaxInFlight        int     `json:"configured_max_in_flight"`
 	BatchTarget        int     `json:"configured_batch_target"`
 	BatchWindowMS      float64 `json:"configured_batch_window_ms"`
@@ -74,6 +79,7 @@ type writeCounters struct {
 	queuedCount    atomic.Uint64
 	batchRPCs      atomic.Uint64
 	batchLogical   atomic.Uint64
+	rejected       atomic.Uint64
 	inFlight       atomic.Int64
 	peak           atomic.Int64
 }
@@ -89,6 +95,7 @@ type clusterWriteBatcher struct {
 	batchTarget    int
 	batchMax       int
 	maxInflight    int
+	maxQueueDelay  time.Duration
 	stats          writeCounters
 }
 
@@ -106,7 +113,7 @@ func newClusterWriteBatcher(node *Node) *clusterWriteBatcher {
 	}
 	target := node.cfg.WriteBatchTarget
 	if target <= 0 {
-		target = 24
+		target = 64
 	}
 	if target > maxBatch {
 		target = maxBatch
@@ -125,7 +132,7 @@ func newClusterWriteBatcher(node *Node) *clusterWriteBatcher {
 	b := &clusterWriteBatcher{
 		node: node, queue: make(chan clusterWriteRequest, clusterWriteQueueCapacity),
 		done: make(chan struct{}), batchWindow: window, batchMaxWindow: maxWindow, batchTarget: target, batchMax: maxBatch,
-		maxInflight: inflight,
+		maxInflight: inflight, maxQueueDelay: node.cfg.WriteMaxQueueDelay,
 	}
 	go b.loop()
 	return b
@@ -140,6 +147,7 @@ func (b *clusterWriteBatcher) Performance() WritePerformance {
 		InFlight: b.stats.inFlight.Load(), PeakInFlight: b.stats.peak.Load(),
 		MaxInFlight: b.maxInflight, QueueDepth: len(b.queue),
 		BatchRPCs: b.stats.batchRPCs.Load(), BatchLogicalWrites: b.stats.batchLogical.Load(),
+		RejectedBeforeRaft: b.stats.rejected.Load(), QueueBudgetMS: float64(b.maxQueueDelay) / 1e6,
 		BatchTarget: b.batchTarget, BatchWindowMS: float64(b.batchWindow) / 1e6,
 		BatchMaxWindowMS: float64(b.batchMaxWindow) / 1e6,
 	}
@@ -238,8 +246,31 @@ func (b *clusterWriteBatcher) Close() {
 	<-b.done
 }
 
+// estimateRaftCommand slightly overestimates JSON/base64 wire size. The
+// serialized command is also checked before submitting it to Raft.
 func estimateRaftCommand(c command) int {
 	return 128 + len(c.Namespace) + len(c.Key) + 4*(len(c.Value)+2)/3
+}
+
+// An atomic client BatchWrite counts as a SINGLE admission item but can
+// contain up to 128 logical writes. This distinction is why the old code
+// emitted many ~5-write Raft logs on a three-shard workload.
+func requestLogicalCount(r clusterWriteRequest) int {
+	if r.isBatch() {
+		return len(r.batch)
+	}
+	return 1
+}
+
+func estimateRaftRequest(r clusterWriteRequest) int {
+	if !r.isBatch() {
+		return estimateRaftCommand(r.cmd)
+	}
+	n := 160 // nested opBatch envelope + JSON framing
+	for _, c := range r.batch {
+		n += estimateRaftCommand(c)
+	}
+	return n
 }
 
 func (b *clusterWriteBatcher) loop() {
@@ -260,100 +291,113 @@ func (b *clusterWriteBatcher) loop() {
 			}
 			first = next
 		}
-		// First reserve capacity. Under disk contention the queue builds up
-		// and the next batch can use that backlog efficiently.
+		// This is the admission boundary for a Raft batch. Collect AFTER a
+		// slot is available, to exploit backlog when the disk is busy.
 		slots <- struct{}{}
 		group := []clusterWriteRequest{first}
-		queueClosed := false
-		if !first.isBatch() {
-			totalBytes := estimateRaftCommand(first.cmd)
-			window := batchCollectionWindow(b.batchWindow, b.batchMaxWindow, len(slots))
-			timer := time.NewTimer(window)
-		collect:
-			for len(group) < b.batchMax {
-				select {
-				case next, ok := <-b.queue:
-					if !ok {
-						queueClosed = true
-						break collect
-					}
-					// A client BatchWrite is an indivisible Raft command,
-					// including with respect to migration fences.
-					if next.isBatch() {
-						pending = &next
-						break collect
-					}
-					estimated := estimateRaftCommand(next.cmd)
-					if totalBytes+estimated > clusterWriteBatchBytes {
-						pending = &next
-						break collect
-					}
-					group = append(group, next)
-					totalBytes += estimated
-					if len(group) >= b.batchTarget {
-						break collect
-					}
-				case <-timer.C:
+		logicalCount := requestLogicalCount(first)
+		totalBytes := estimateRaftRequest(first)
+		closed := false
+		window := batchCollectionWindow(b.batchWindow, b.batchMaxWindow, len(slots))
+		timer := time.NewTimer(window)
+	collect:
+		for logicalCount < b.batchTarget && logicalCount < b.batchMax && logicalCount < maxRaftCommandsPerBatch {
+			select {
+			case next, ok := <-b.queue:
+				if !ok {
+					closed = true
 					break collect
 				}
-			}
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
+				n := requestLogicalCount(next)
+				size := estimateRaftRequest(next)
+				if logicalCount+n > b.batchMax || logicalCount+n > maxRaftCommandsPerBatch || totalBytes+size > clusterWriteBatchBytes {
+					// Atomic user batches must never be split. Carry the
+					// entire next RPC into the next Raft admission window.
+					pending = &next
+					break collect
 				}
+				group = append(group, next)
+				logicalCount += n
+				totalBytes += size
+			case <-timer.C:
+				break collect
 			}
 		}
-
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
 		b.dispatch(group, slots, &wg)
-		if queueClosed && pending == nil {
+		if closed && pending == nil {
 			return
 		}
 	}
 }
 
 func (b *clusterWriteBatcher) dispatch(group []clusterWriteRequest, slots chan struct{}, wg *sync.WaitGroup) {
-	isBatch := group[0].isBatch()
+	// The position map associates one physical Raft child with exactly one
+	// original RPC. For BatchWrite, that child is an indivisible opBatch.
+	type submitted struct {
+		req   clusterWriteRequest
+		index int
+	}
 	results := make([]writeResponse, len(group))
+	batchResults := make([]batchWriteResponse, len(group))
+	valid := make([]submitted, 0, len(group))
 	commands := make([]command, 0, len(group))
-	positions := make([]int, 0, len(group))
+	replyAll := func() {
+		for i, req := range group {
+			if req.isBatch() {
+				req.batchReply <- batchResults[i]
+			} else {
+				req.reply <- results[i]
+			}
+		}
+	}
 	for i, req := range group {
-		b.stats.queueNanos.Add(uint64(time.Since(req.queuedAt).Nanoseconds()))
+		wait := time.Since(req.queuedAt)
+		b.stats.queueNanos.Add(uint64(wait.Nanoseconds()))
 		b.stats.queuedCount.Add(1)
 		if err := req.ctx.Err(); err != nil {
-			results[i].err = err
+			if req.isBatch() {
+				batchResults[i].err = err
+			} else {
+				results[i].err = err
+			}
 			continue
 		}
-		if isBatch {
-			commands = append(commands, req.batch...)
+		if b.maxQueueDelay > 0 && wait > b.maxQueueDelay {
+			// Not submitted to Raft: this is a DEFINITIVE rejection, not
+			// an ambiguous write timeout. Clients may retry with backoff.
+			err := status.Error(codes.ResourceExhausted, "raft write queue saturated before admission")
+			b.stats.rejected.Add(uint64(requestLogicalCount(req)))
+			if req.isBatch() {
+				batchResults[i].err = err
+			} else {
+				results[i].err = err
+			}
+			continue
+		}
+		if req.isBatch() {
+			commands = append(commands, command{Operation: opBatch, Commands: req.batch})
 		} else {
 			commands = append(commands, req.cmd)
-			positions = append(positions, i)
 		}
-	}
-	var batchResult batchWriteResponse
-	replyAll := func() {
-		if isBatch {
-			group[0].batchReply <- batchResult
-			return
-		}
-		for i, req := range group {
-			req.reply <- results[i]
-		}
+		valid = append(valid, submitted{req: req, index: i})
 	}
 	if len(commands) == 0 {
-		if isBatch {
-			batchResult.err = group[0].ctx.Err()
-		}
 		replyAll()
 		<-slots
 		return
 	}
 
+	// A single client batch retains its original wire representation. Two
+	// or more admitted RPCs use opMicrobatch with nested opBatch children,
+	// so EACH BatchWrite remains atomic and point-writes stay independent.
 	cmd := commands[0]
-	if isBatch {
-		cmd = command{Operation: opBatch, Commands: commands}
-	} else if len(commands) > 1 {
+	if len(commands) > 1 {
 		cmd = command{Operation: opMicrobatch, Commands: commands}
 	}
 	raw, err := json.Marshal(cmd)
@@ -361,11 +405,11 @@ func (b *clusterWriteBatcher) dispatch(group []clusterWriteRequest, slots chan s
 		err = fmt.Errorf("raft command too large (%d bytes)", len(raw))
 	}
 	if err != nil {
-		if isBatch {
-			batchResult.err = err
-		} else {
-			for _, i := range positions {
-				results[i].err = err
+		for _, item := range valid {
+			if item.req.isBatch() {
+				batchResults[item.index].err = err
+			} else {
+				results[item.index].err = err
 			}
 		}
 		replyAll()
@@ -373,13 +417,18 @@ func (b *clusterWriteBatcher) dispatch(group []clusterWriteRequest, slots chan s
 		return
 	}
 
-	// The submission loop is the only writer into raft.Apply. This keeps
-	// the log append order deterministic while futures complete in parallel.
+	// Only this submission loop invokes Raft.Apply, keeping log order
+	// deterministic. Futures may finish concurrently; results remain mapped
+	// to their original RPCs.
 	started := time.Now()
 	future := b.node.raft.Apply(raw, opTimeout)
 	b.stats.admissionNanos.Add(uint64(time.Since(started).Nanoseconds()))
 	b.stats.groups.Add(1)
-	b.stats.logical.Add(uint64(len(commands)))
+	logical := uint64(0)
+	for _, item := range valid {
+		logical += uint64(requestLogicalCount(item.req))
+	}
+	b.stats.logical.Add(logical)
 	active := b.stats.inFlight.Add(1)
 	for {
 		peak := b.stats.peak.Load()
@@ -391,13 +440,13 @@ func (b *clusterWriteBatcher) dispatch(group []clusterWriteRequest, slots chan s
 	go func() {
 		defer wg.Done()
 		defer func() { b.stats.inFlight.Add(-1); <-slots }()
-		// A Raft timeout does not imply that a write was rolled back.
 		outcome := make(chan error, 1)
 		go func() { outcome <- future.Error() }()
 		var applyErr error
 		select {
 		case applyErr = <-outcome:
 		case <-time.After(opTimeout):
+			// A Raft timeout is UNKNOWN OUTCOME, never a safe retry signal.
 			applyErr = context.DeadlineExceeded
 		}
 		b.stats.applyNanos.Add(uint64(time.Since(started).Nanoseconds()))
@@ -408,35 +457,47 @@ func (b *clusterWriteBatcher) dispatch(group []clusterWriteRequest, slots chan s
 				applyErr = fmt.Errorf("unexpected FSM response: %T", future.Response())
 			} else if response.Err != nil {
 				applyErr = response.Err
-			} else if isBatch {
-				if len(response.Revisions) != len(commands) {
-					applyErr = fmt.Errorf("raft batch returned %d revisions for %d commands", len(response.Revisions), len(commands))
+			} else if len(valid) == 1 {
+				item := valid[0]
+				if item.req.isBatch() {
+					if len(response.Revisions) != len(item.req.batch) {
+						applyErr = fmt.Errorf("raft batch returned %d revisions for %d commands", len(response.Revisions), len(item.req.batch))
+					} else {
+						batchResults[item.index].revisions = response.Revisions
+					}
 				} else {
-					batchResult.revisions = response.Revisions
+					results[item.index].revision = response.Revision
 				}
-			} else if len(commands) == 1 {
-				results[positions[0]].revision = response.Revision
-			} else if len(response.Revisions) != len(commands) {
-				applyErr = fmt.Errorf("raft batch returned %d revisions for %d commands", len(response.Revisions), len(commands))
+			} else if len(response.Revisions) != len(valid) || len(response.Errors) != len(valid) || len(response.BatchRevisions) != len(valid) {
+				applyErr = fmt.Errorf("microbatch returned incorrect item count")
 			} else {
-				for j, i := range positions {
-					results[i].revision = response.Revisions[j]
-					if len(response.Errors) == len(commands) {
-						results[i].err = response.Errors[j]
-						if results[i].err != nil {
-							b.stats.failed.Add(1)
+				for j, item := range valid {
+					itemErr := response.Errors[j]
+					if item.req.isBatch() {
+						if itemErr == nil && len(response.BatchRevisions[j]) != len(item.req.batch) {
+							itemErr = fmt.Errorf("raft nested batch returned incorrect revision count")
 						}
+						batchResults[item.index].err = itemErr
+						if itemErr == nil {
+							batchResults[item.index].revisions = response.BatchRevisions[j]
+						}
+					} else {
+						results[item.index].revision = response.Revisions[j]
+						results[item.index].err = itemErr
+					}
+					if itemErr != nil {
+						b.stats.failed.Add(1)
 					}
 				}
 			}
 		}
 		if applyErr != nil {
 			b.stats.failed.Add(1)
-			if isBatch {
-				batchResult.err = applyErr
-			} else {
-				for _, i := range positions {
-					results[i].err = applyErr
+			for _, item := range valid {
+				if item.req.isBatch() {
+					batchResults[item.index].err = applyErr
+				} else {
+					results[item.index].err = applyErr
 				}
 			}
 		}

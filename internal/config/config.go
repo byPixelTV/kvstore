@@ -36,6 +36,7 @@ type Config struct {
 	WriteBatchMax         int
 	WriteBatchTarget      int
 	WriteBatchMaxWindow   time.Duration
+	WriteMaxQueueDelay    time.Duration
 	RaftMaxAppendEntries  int
 	RaftCommitTimeout     time.Duration
 	RaftMaxInflight       int
@@ -113,7 +114,7 @@ func Load() (Config, error) {
 	if err != nil || c.WriteBatchMax < 1 || c.WriteBatchMax > 4096 {
 		return c, fmt.Errorf("KVSTORE_WRITE_BATCH_MAX must be between 1 and 4096")
 	}
-	c.WriteBatchTarget, err = strconv.Atoi(getenv("KVSTORE_WRITE_BATCH_TARGET", "24"))
+	c.WriteBatchTarget, err = strconv.Atoi(getenv("KVSTORE_WRITE_BATCH_TARGET", "64"))
 	if err != nil || c.WriteBatchTarget < 1 || c.WriteBatchTarget > 256 {
 		return c, fmt.Errorf("KVSTORE_WRITE_BATCH_TARGET must be between 1 and 256")
 	}
@@ -127,6 +128,10 @@ func Load() (Config, error) {
 	}
 	if err != nil || c.WriteBatchMaxWindow < c.WriteBatchWindow || c.WriteBatchMaxWindow > 20*time.Millisecond {
 		return c, fmt.Errorf("KVSTORE_WRITE_BATCH_MAX_WINDOW must be >= KVSTORE_WRITE_BATCH_WINDOW and <= 20ms")
+	}
+	c.WriteMaxQueueDelay, err = time.ParseDuration(getenv("KVSTORE_WRITE_MAX_QUEUE_DELAY", "0s"))
+	if err != nil || c.WriteMaxQueueDelay < 0 || c.WriteMaxQueueDelay > 10*time.Second {
+		return c, fmt.Errorf("KVSTORE_WRITE_MAX_QUEUE_DELAY must be between 0s (disabled) and 10s")
 	}
 	c.RaftMaxAppendEntries, err = strconv.Atoi(getenv("KVSTORE_RAFT_MAX_APPEND_ENTRIES", "128"))
 	if err != nil || c.RaftMaxAppendEntries < 1 || c.RaftMaxAppendEntries > 1024 {

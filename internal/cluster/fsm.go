@@ -62,10 +62,11 @@ type command struct {
 }
 
 type applyResult struct {
-	Revision  uint64
-	Revisions []uint64
-	Errors    []error
-	Err       error
+	Revision       uint64
+	Revisions      []uint64
+	Errors         []error
+	BatchRevisions [][]uint64 // only populated for nested BatchWrite children
+	Err            error
 }
 
 // FSM is the replicated Pebble state machine. All writes must come from Raft,
@@ -485,11 +486,56 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
 			if len(cmd.Commands) < 1 || len(cmd.Commands) > maxRaftCommandsPerBatch {
 				return fail(errors.New("invalid microbatch size"))
 			}
+			logicalCount := 0
+			// Validate the complete envelope before staging any writes. Nested
+			// opBatch children are indivisible RPC transactions even when sharing
+			// a physical Raft log with unrelated clients.
+			for _, item := range cmd.Commands {
+				switch item.Operation {
+				case opSet, opDelete:
+					logicalCount++
+				case opBatch:
+					if len(item.Commands) < 1 || len(item.Commands) > 128 {
+						return fail(errors.New("invalid nested client batch size"))
+					}
+					logicalCount += len(item.Commands)
+					for _, nested := range item.Commands {
+						if nested.Operation != opSet && nested.Operation != opDelete {
+							return fail(fmt.Errorf("invalid nested batch operation %q", nested.Operation))
+						}
+					}
+				default:
+					return fail(fmt.Errorf("invalid microbatch operation %q", item.Operation))
+				}
+			}
+			if logicalCount > maxRaftCommandsPerBatch {
+				return fail(errors.New("too many logical writes in microbatch"))
+			}
 			revisions := make([]uint64, len(cmd.Commands))
 			itemErrors := make([]error, len(cmd.Commands))
+			batchRevisions := make([][]uint64, len(cmd.Commands))
 			for j, item := range cmd.Commands {
-				if item.Operation != opSet && item.Operation != opDelete {
-					return fail(fmt.Errorf("invalid microbatch operation %q", item.Operation))
+				if item.Operation == opBatch {
+					blocked := false
+					for _, nested := range item.Commands {
+						if isSealed(nested) {
+							blocked = true
+							break
+						}
+					}
+					if blocked {
+						itemErrors[j] = status.Error(codes.FailedPrecondition, "write rejected by replicated migration fence; refresh routing")
+						continue
+					}
+					batchRevisions[j] = make([]uint64, len(item.Commands))
+					for k, nested := range item.Commands {
+						rev, err := applyOne(nested)
+						if err != nil {
+							return fail(err)
+						}
+						batchRevisions[j][k] = rev
+					}
+					continue
 				}
 				if isSealed(item) {
 					itemErrors[j] = status.Error(codes.FailedPrecondition, "write rejected by replicated migration fence; refresh routing")
@@ -501,7 +547,7 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
 				}
 				revisions[j] = rev
 			}
-			responses[i] = applyResult{Revisions: revisions, Errors: itemErrors}
+			responses[i] = applyResult{Revisions: revisions, Errors: itemErrors, BatchRevisions: batchRevisions}
 		} else if cmd.Operation == opBatch {
 			if len(cmd.Commands) == 0 || len(cmd.Commands) > maxRaftCommandsPerBatch {
 				return fail(errors.New("invalid raft command batch size"))
