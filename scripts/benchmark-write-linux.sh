@@ -50,6 +50,12 @@ WATCHERS="${WATCHERS:-5}"
 WATCH_RATE="${WATCH_RATE:-300}"
 # Memory limits retain plenty of headroom for other production services.
 NODE_MEMORY="${NODE_MEMORY:-3g}"
+# Avoid silently running a different workload from the requested one.
+[[ "$READ_PERCENT" =~ ^(100|[0-9]|[1-9][0-9])$ ]] || {
+  echo "READ_PERCENT must be an integer from 0 to 100; got: $READ_PERCENT" >&2; exit 2;
+}
+[[ "$RUNS" =~ ^[1-9][0-9]*$ ]] || { echo "RUNS must be positive" >&2; exit 2; }
+
 export KVSTORE_JOIN_TOKEN="${KVSTORE_JOIN_TOKEN:-$(od -An -N32 -tx1 /dev/urandom | tr -d '[:space:]')}"
 
 cat > "$OUT/standalone.override.yml" <<YAML
@@ -97,6 +103,24 @@ cluster=(docker compose -p "$CLUSTER_PROJECT" -f "$ROOT/compose.cluster.yml" -f 
 cleanup() {
   local exit_code=$?
   trap - EXIT
+  # Retain diagnostics even if an RPC, build or direct-leader lookup fails.
+  # These Compose commands are scoped to our two unique benchmark projects.
+  if [[ ! -f "$OUT/standalone-logs.txt" ]]; then
+    "${standalone[@]}" logs --tail 200 > "$OUT/standalone-logs.txt" 2>&1 || true
+  fi
+  if [[ ! -f "$OUT/cluster-logs.txt" ]]; then
+    "${cluster[@]}" logs --tail 300 > "$OUT/cluster-logs.txt" 2>&1 || true
+  fi
+  if command -v curl >/dev/null 2>&1; then
+    for node in 0 1 2; do
+      if [[ ! -s "$OUT/node${node}-performance.json" ]]; then
+        curl -fsS --max-time 2 -H "Authorization: Bearer $KVSTORE_JOIN_TOKEN" \
+          "http://127.0.0.1:$((17001+node))/v1/cluster/performance" \
+          > "$OUT/node${node}-performance.json" 2>/dev/null || rm -f "$OUT/node${node}-performance.json"
+      fi
+    done
+  fi
+  docker ps --format '{{.ID}} {{.Names}} {{.Status}}' > "$OUT/containers-after.txt" 2>/dev/null || true
   if [[ "${KEEP_RUNNING:-0}" != 1 ]]; then
     "${standalone[@]}" stop >/dev/null 2>&1 || true
     "${cluster[@]}" stop >/dev/null 2>&1 || true
@@ -125,7 +149,23 @@ trap 'exit 143' TERM
   echo "RUN CONFIG:"
   printf 'duration=%ss warmup=%ss runs=%s concurrency="%s" connections=%s keys=%s bytes=%s\n' \
     "$DURATION_SECONDS" "$WARMUP_SECONDS" "$RUNS" "$CONCURRENCIES" "$CONNECTIONS" "$KEYSPACE" "$VALUE_SIZE"
+  printf 'workloads="%s" read_percent=%s leader_map="%s" node_memory=%s skip_build=%s\n' \
+    "$WORKLOADS" "$READ_PERCENT" "$LEADER_MAP" "$NODE_MEMORY" "${SKIP_BUILD:-0}"
+  if command -v git >/dev/null 2>&1; then
+    echo "git_head=$(git rev-parse HEAD 2>/dev/null || echo unavailable)"
+    echo "git_branch=$(git branch --show-current 2>/dev/null || echo unavailable)"
+    if [[ -n "$(git status --porcelain 2>/dev/null)" ]]; then
+      echo 'git_worktree=modified'
+    else
+      echo 'git_worktree=clean'
+    fi
+  fi
 } > "$OUT/system.txt"
+
+# Validate the final merged Compose configuration before building images.
+"${standalone[@]}" config -q
+"${cluster[@]}" config -q
+
 docker ps --format '{{.ID}} {{.Names}} {{.Status}}' > "$OUT/containers-before.txt"
 
 if [[ "${SKIP_BUILD:-0}" != 1 ]]; then
@@ -176,7 +216,24 @@ run_one() {
     -watchers "$WATCHERS" -watch-rate "$WATCH_RATE" -json > "${output}.tmp"
   mv -- "${output}.tmp" "$output"
   if command -v jq >/dev/null 2>&1; then
+    jq -e '.get.ops_sec != null and .set.ops_sec != null and .get.errors != null and .set.errors != null' "$output" >/dev/null
     jq -r '"  GET: \(.get.ops_sec|floor)/s p99=\(.get.latency.p99_ms)ms err=\(.get.errors) missing=\(.get.not_found); SET: \(.set.ops_sec|floor)/s p99=\(.set.latency.p99_ms)ms err=\(.set.errors)"' "$output"
+    if ! jq -e '(.get.errors + .set.errors) == 0 and .get.not_found == 0' "$output" >/dev/null; then
+      echo "  ERROR: request errors or missing GET keys detected in $output" >&2
+      return 1
+    fi
+    if [[ "$mode" == mixed ]]; then
+      local observed
+      observed="$(jq -r '((.get.ok + .get.errors) * 100) / ((.get.ok + .get.errors + .set.ok + .set.errors) | if . == 0 then 1 else . end)' "$output")"
+      printf '  MIXED distribution: %.1f%% GET / %.1f%% SET (target: %s%% GET)\n' \
+        "$observed" "$(awk -v r="$observed" 'BEGIN {print 100-r}')" "$READ_PERCENT"
+      if ! awk -v a="$observed" -v e="$READ_PERCENT" 'BEGIN { d=a-e; if (d<0) d=-d; exit(d>10 ? 1 : 0) }'; then
+        echo "  ERROR: unexpected MIXED distribution: $observed% GET, expected $READ_PERCENT%" >&2
+        return 1
+      fi
+    fi
+  else
+    echo '  NOTE: install jq to validate the actual GET/SET distribution automatically.'
   fi
 }
 
