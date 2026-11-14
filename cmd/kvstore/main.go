@@ -70,7 +70,7 @@ func run() (runErr error) {
 		}
 		store = node
 	} else {
-		persistent, openErr := pebblestore.Open(cfg.DataDir)
+		persistent, openErr := pebblestore.OpenWithOptions(cfg.DataDir, pebblestore.Options{BatchWindow: cfg.WriteBatchWindow, BatchMax: cfg.WriteBatchMax})
 		if openErr != nil {
 			return fmt.Errorf("open pebble: %w", openErr)
 		}

@@ -31,6 +31,7 @@ const (
 	opSet    = "set"
 	opDelete = "delete"
 	opPeer   = "peer"
+	opBatch  = "batch"
 )
 
 type peerInfo struct {
@@ -46,11 +47,13 @@ type command struct {
 	Key       string    `json:"key,omitempty"`
 	Value     []byte    `json:"value,omitempty"`
 	Peer      *peerInfo `json:"peer,omitempty"`
+	Commands  []command `json:"commands,omitempty"`
 }
 
 type applyResult struct {
-	Revision uint64
-	Err      error
+	Revision  uint64
+	Revisions []uint64
+	Err       error
 }
 
 // FSM is the replicated Pebble state machine. All writes must come from Raft,
@@ -67,7 +70,7 @@ type FSM struct {
 	failed       error
 }
 
-var _ raft.FSM = (*FSM)(nil)
+var _ raft.BatchingFSM = (*FSM)(nil)
 
 func openFSM(path string) (*FSM, error) {
 	db, err := pebble.Open(path, nil)
@@ -197,93 +200,173 @@ func (f *FSM) Peer(id string) (peerInfo, bool, error) {
 	return peer, true, nil
 }
 
+// Apply delegates to the same atomic implementation used by ApplyBatch.
 func (f *FSM) Apply(log *raft.Log) any {
+	return f.ApplyBatch([]*raft.Log{log})[0]
+}
+
+// ApplyBatch is called with committed, ordered Raft logs. Every batch (up to
+// MaxAppendEntries) becomes ONE durable Pebble commit, including revision,
+// changefeed events, peer routing metadata, and applied Raft index.
+// A replayed index is ignored. Configuration logs advance the applied index
+// without generating a KV revision.
+func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
+	responses := make([]interface{}, len(logs))
+	for i := range responses {
+		responses[i] = applyResult{}
+	}
+	if len(logs) == 0 {
+		return responses
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	fail := func(err error) []interface{} {
+		f.failed = err
+		for i := range responses {
+			responses[i] = applyResult{Err: err}
+		}
+		return responses
+	}
 	if f.failed != nil {
-		return applyResult{Err: f.failed}
+		return fail(f.failed)
 	}
-	// A committed log may be replayed after restarting while Pebble still
-	// contains its effects. The applied index is persisted in the same batch.
-	if log.Index <= f.applied {
-		return applyResult{}
-	}
-	var cmd command
-	if err := json.Unmarshal(log.Data, &cmd); err != nil {
-		f.failed = fmt.Errorf("decode committed log %d: %w", log.Index, err)
-		return applyResult{Err: f.failed}
-	}
+
 	batch := f.db.NewBatch()
 	defer batch.Close()
-	rev := uint64(0)
-	var err error
-	switch cmd.Operation {
-	case opSet:
-		if f.revision == math.MaxUint64 {
-			err = errors.New("revision exhausted")
-			break
+	history := changefeed.NewBatchWriter(f.db, batch, f.oldest, f.historyBytes, f.hasFloor)
+	shadow := make(map[string]bool, len(logs))
+	nextRevision, nextApplied := f.revision, f.applied
+	changed := false
+
+	// Process each logical write in Raft log order, including multiple
+	// commands packed into one log. A same-key delete must see earlier
+	// uncommitted sets/deletes from the same Pebble batch.
+	applyOne := func(cmd command) (uint64, error) {
+		revision := uint64(0)
+		switch cmd.Operation {
+		case opSet, opDelete:
+			encoded := encodeRecordKey(cmd.Namespace, cmd.Key)
+			key := string(encoded)
+			if cmd.Operation == opDelete {
+				exists, known := shadow[key]
+				if !known {
+					_, closer, err := f.db.Get(encoded)
+					switch {
+					case errors.Is(err, pebble.ErrNotFound):
+						exists = false
+					case err != nil:
+						return 0, fmt.Errorf("read before delete: %w", err)
+					default:
+						exists = true
+						if err := closer.Close(); err != nil {
+							return 0, err
+						}
+					}
+				}
+				if !exists {
+					return 0, nil
+				}
+			}
+			if nextRevision == math.MaxUint64 {
+				return 0, errors.New("revision exhausted")
+			}
+			nextRevision++
+			revision = nextRevision
+			var err error
+			if cmd.Operation == opSet {
+				err = batch.Set(encoded, encodeRecord(cmd.Value, revision), nil)
+				shadow[key] = true
+			} else {
+				err = batch.Delete(encoded, nil)
+				shadow[key] = false
+			}
+			if err != nil {
+				return 0, err
+			}
+			err = history.Append(changefeed.Change{Revision: revision, Namespace: cmd.Namespace, Key: cmd.Key, Value: cmd.Value, Deleted: cmd.Operation == opDelete})
+			if err != nil {
+				return 0, err
+			}
+			changed = true
+		case opPeer:
+			if cmd.Peer == nil || cmd.Peer.ID == "" || cmd.Peer.RaftAddr == "" || cmd.Peer.GRPCAddr == "" || cmd.Peer.AdminAddr == "" {
+				return 0, errors.New("invalid peer metadata")
+			}
+			raw, err := json.Marshal(cmd.Peer)
+			if err != nil {
+				return 0, err
+			}
+			if err := batch.Set(peerKey(cmd.Peer.ID), raw, nil); err != nil {
+				return 0, err
+			}
+		default:
+			return 0, fmt.Errorf("unrecognized committed operation %q", cmd.Operation)
 		}
-		rev = f.revision + 1
-		err = batch.Set(encodeRecordKey(cmd.Namespace, cmd.Key), encodeRecord(cmd.Value, rev), nil)
-	case opDelete:
-		encoded := encodeRecordKey(cmd.Namespace, cmd.Key)
-		_, closer, getErr := f.db.Get(encoded)
-		if errors.Is(getErr, pebble.ErrNotFound) {
-			break
-		}
-		if getErr != nil {
-			err = getErr
-			break
-		}
-		if closeErr := closer.Close(); closeErr != nil {
-			err = closeErr
-			break
-		}
-		if f.revision == math.MaxUint64 {
-			err = errors.New("revision exhausted")
-			break
-		}
-		rev = f.revision + 1
-		err = batch.Delete(encoded, nil)
-	case opPeer:
-		if cmd.Peer == nil || cmd.Peer.ID == "" || cmd.Peer.RaftAddr == "" || cmd.Peer.GRPCAddr == "" || cmd.Peer.AdminAddr == "" {
-			err = errors.New("invalid peer metadata")
-			break
-		}
-		var raw []byte
-		raw, err = json.Marshal(cmd.Peer)
-		if err == nil {
-			err = batch.Set(peerKey(cmd.Peer.ID), raw, nil)
-		}
-	default:
-		err = fmt.Errorf("unrecognized committed operation %q", cmd.Operation)
+		return revision, nil
 	}
-	newFloor, newHistory := f.oldest, f.historyBytes
-	if err == nil && rev != 0 {
-		newFloor, newHistory, err = changefeed.Append(f.db, batch, changefeed.Change{Revision: rev, Namespace: cmd.Namespace, Key: cmd.Key, Value: cmd.Value, Deleted: cmd.Operation == opDelete}, f.oldest, f.historyBytes, f.hasFloor)
-		if err == nil {
-			err = batch.Set(revisionKey, encode64(rev), nil)
+
+	for i, log := range logs {
+		if log.Index <= nextApplied {
+			continue
+		} // durable index already applied
+		if log.Type != raft.LogCommand && log.Type != raft.LogConfiguration {
+			return fail(fmt.Errorf("unexpected committed Raft log type %v at index %d", log.Type, log.Index))
+		}
+		if log.Type == raft.LogConfiguration {
+			nextApplied = log.Index
+			continue
+		}
+		var cmd command
+		if err := json.Unmarshal(log.Data, &cmd); err != nil {
+			return fail(fmt.Errorf("decode committed log %d: %w", log.Index, err))
+		}
+		if cmd.Operation == opBatch {
+			if len(cmd.Commands) == 0 || len(cmd.Commands) > 64 {
+				return fail(errors.New("invalid raft command batch size"))
+			}
+			revisions := make([]uint64, len(cmd.Commands))
+			for j, item := range cmd.Commands {
+				if item.Operation != opSet && item.Operation != opDelete {
+					return fail(fmt.Errorf("invalid batched operation %q", item.Operation))
+				}
+				rev, err := applyOne(item)
+				if err != nil {
+					return fail(err)
+				}
+				revisions[j] = rev
+			}
+			responses[i] = applyResult{Revisions: revisions}
+		} else {
+			revision, err := applyOne(cmd)
+			if err != nil {
+				return fail(err)
+			}
+			responses[i] = applyResult{Revision: revision}
+		}
+		nextApplied = log.Index
+	}
+	if nextApplied == f.applied {
+		return responses
+	}
+	if changed {
+		if err := batch.Set(revisionKey, encode64(nextRevision), nil); err != nil {
+			return fail(err)
 		}
 	}
-	if err == nil {
-		err = batch.Set(appliedKey, encode64(log.Index), nil)
+	if err := batch.Set(appliedKey, encode64(nextApplied), nil); err != nil {
+		return fail(err)
 	}
-	if err == nil {
-		err = batch.Commit(pebble.Sync)
+	if err := batch.Commit(pebble.Sync); err != nil {
+		return fail(fmt.Errorf("apply committed Raft batch ending at %d: %w", nextApplied, err))
 	}
-	if err != nil {
-		f.failed = fmt.Errorf("apply committed raft index %d: %w", log.Index, err)
-		return applyResult{Err: f.failed}
-	}
-	if rev != 0 {
-		f.oldest = newFloor
-		f.historyBytes = newHistory
+	f.applied = nextApplied
+	if changed {
+		f.revision = nextRevision
+		f.oldest, f.historyBytes = history.State()
 		f.hasFloor = true
-		f.revision = rev
 		f.notifier.Signal()
 	}
-	f.applied = log.Index
-	return applyResult{Revision: rev}
+	return responses
 }
 
 // Snapshot captures a consistent Pebble snapshot quickly. The potentially

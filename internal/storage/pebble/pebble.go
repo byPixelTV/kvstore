@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"sync"
+	"time"
 
 	"github.com/byPixelTV/kvstore/internal/changefeed"
 	"github.com/byPixelTV/kvstore/internal/storage"
@@ -18,9 +19,19 @@ import (
 var revisionKey = []byte{0x00, 0x01}
 
 // Store is a persistent, single-node implementation of storage.Store.
-// The mutex serializes writes so every mutation receives a unique revision.
+// One dedicated worker serializes changes while grouping concurrent writes
+// into atomic WAL-synced Pebble batches.
 type Store struct {
-	mu           sync.Mutex
+	mu           sync.RWMutex
+	readMu       sync.RWMutex
+	published    *pebbledb.Snapshot
+	gate         sync.RWMutex
+	closed       bool
+	failed       error
+	writeQueue   chan writeRequest
+	workerDone   chan struct{}
+	batchWindow  time.Duration
+	batchMax     int
 	db           *pebbledb.DB
 	revision     uint64
 	oldest       uint64
@@ -30,12 +41,29 @@ type Store struct {
 
 var _ storage.Store = (*Store)(nil)
 
-func Open(path string) (*Store, error) {
+// Options control bounded micro-batching. A zero Options value uses defaults.
+type Options struct {
+	BatchWindow time.Duration
+	BatchMax    int
+}
+
+func Open(path string) (*Store, error) { return OpenWithOptions(path, Options{}) }
+
+func OpenWithOptions(path string, opts Options) (*Store, error) {
+	if opts.BatchWindow == 0 {
+		opts.BatchWindow = defaultWriteBatchWindow
+	}
+	if opts.BatchMax == 0 {
+		opts.BatchMax = defaultWriteBatchMax
+	}
+	if opts.BatchWindow < 0 || opts.BatchWindow > 20*time.Millisecond || opts.BatchMax < 1 || opts.BatchMax > 4096 {
+		return nil, errors.New("invalid write batch settings")
+	}
 	db, err := pebbledb.Open(path, nil)
 	if err != nil {
 		return nil, fmt.Errorf("open pebble: %w", err)
 	}
-	store := &Store{db: db}
+	store := &Store{db: db, writeQueue: make(chan writeRequest, writeQueueCapacity), workerDone: make(chan struct{}), batchWindow: opts.BatchWindow, batchMax: opts.BatchMax}
 	read := func(key []byte) (uint64, bool, error) {
 		raw, closer, err := db.Get(key)
 		if errors.Is(err, pebbledb.ErrNotFound) {
@@ -83,11 +111,30 @@ func Open(path string) (*Store, error) {
 		return nil, err
 	}
 	store.historyBytes = history
+	// Published reads never observe a write before its WAL sync completes.
+	store.published = db.NewSnapshot()
+	go store.writeLoop()
 	return store, nil
 }
 
 func (s *Store) Close() error {
-	// Call only after the gRPC server has finished handling requests.
+	// Reject new work, drain accepted work, then close the DB.
+	s.gate.Lock()
+	if s.closed {
+		s.gate.Unlock()
+		<-s.workerDone
+		return nil
+	}
+	s.closed = true
+	close(s.writeQueue)
+	s.gate.Unlock()
+	<-s.workerDone
+	s.readMu.Lock()
+	if s.published != nil {
+		_ = s.published.Close()
+		s.published = nil
+	}
+	defer s.readMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.db.Close()
@@ -111,8 +158,11 @@ func (s *Store) Get(ctx context.Context, namespace, key string) (storage.Record,
 	if err := ctx.Err(); err != nil {
 		return storage.Record{}, false, err
 	}
-
-	raw, closer, err := s.db.Get(encodeKey(namespace, key))
+	// Reads use a published snapshot advanced only after a successful WAL
+	// sync. They never wait behind an in-flight fsync.
+	s.readMu.RLock()
+	defer s.readMu.RUnlock()
+	raw, closer, err := s.published.Get(encodeKey(namespace, key))
 	if errors.Is(err, pebbledb.ErrNotFound) {
 		return storage.Record{}, false, nil
 	}
@@ -135,99 +185,21 @@ func (s *Store) Get(ctx context.Context, namespace, key string) (storage.Record,
 }
 
 func (s *Store) Set(ctx context.Context, namespace, key string, value []byte) (uint64, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if err := ctx.Err(); err != nil {
-		return 0, err
-	}
-	if s.revision == math.MaxUint64 {
-		return 0, errors.New("revision counter exhausted")
-	}
-
-	next := s.revision + 1
-	batch := s.db.NewBatch()
-	defer batch.Close()
-
-	if err := batch.Set(encodeKey(namespace, key), encodeRecord(value, next), nil); err != nil {
-		return 0, fmt.Errorf("batch set record: %w", err)
-	}
-	var encodedRevision [8]byte
-	binary.BigEndian.PutUint64(encodedRevision[:], next)
-	if err := batch.Set(revisionKey, encodedRevision[:], nil); err != nil {
-		return 0, fmt.Errorf("batch set revision: %w", err)
-	}
-	if err := ctx.Err(); err != nil {
-		return 0, err
-	}
-	floor, history, err := changefeed.Append(s.db, batch, changefeed.Change{Revision: next, Namespace: namespace, Key: key, Value: value}, s.oldest, s.historyBytes, true)
-	if err != nil {
-		return 0, err
-	}
-	if err := batch.Commit(pebbledb.Sync); err != nil {
-		return 0, fmt.Errorf("commit set: %w", err)
-	}
-	s.revision = next
-	s.oldest = floor
-	s.historyBytes = history
-	s.notifier.Signal()
-	return next, nil
+	// Clone before passing to a worker: the caller can modify the slice.
+	return s.submit(ctx, setKind, namespace, key, bytes.Clone(value))
 }
 
 func (s *Store) Delete(ctx context.Context, namespace, key string) (uint64, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if err := ctx.Err(); err != nil {
-		return 0, err
-	}
-	encodedKey := encodeKey(namespace, key)
-	_, closer, err := s.db.Get(encodedKey)
-	if errors.Is(err, pebbledb.ErrNotFound) {
-		return 0, nil
-	}
-	if err != nil {
-		return 0, fmt.Errorf("pebble get before delete: %w", err)
-	}
-	if err := closer.Close(); err != nil {
-		return 0, fmt.Errorf("close pebble reader: %w", err)
-	}
-	if s.revision == math.MaxUint64 {
-		return 0, errors.New("revision counter exhausted")
-	}
-
-	next := s.revision + 1
-	batch := s.db.NewBatch()
-	defer batch.Close()
-	if err := batch.Delete(encodedKey, nil); err != nil {
-		return 0, fmt.Errorf("batch delete record: %w", err)
-	}
-	var encodedRevision [8]byte
-	binary.BigEndian.PutUint64(encodedRevision[:], next)
-	if err := batch.Set(revisionKey, encodedRevision[:], nil); err != nil {
-		return 0, fmt.Errorf("batch set revision: %w", err)
-	}
-	if err := ctx.Err(); err != nil {
-		return 0, err
-	}
-	floor, history, err := changefeed.Append(s.db, batch, changefeed.Change{Revision: next, Namespace: namespace, Key: key, Deleted: true}, s.oldest, s.historyBytes, true)
-	if err != nil {
-		return 0, err
-	}
-	if err := batch.Commit(pebbledb.Sync); err != nil {
-		return 0, fmt.Errorf("commit delete: %w", err)
-	}
-	s.revision = next
-	s.oldest = floor
-	s.historyBytes = history
-	s.notifier.Signal()
-	return next, nil
+	return s.submit(ctx, deleteKind, namespace, key, nil)
 }
 
 // ReadChanges serves durable events from the exact same Pebble commits as Set/Delete.
 func (s *Store) ReadChanges(ctx context.Context, after uint64, limit int) (changefeed.Page, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.failed != nil {
+		return changefeed.Page{}, s.failed
+	}
 	return changefeed.Read(ctx, s.db, after, s.revision, s.oldest, limit)
 }
 func (s *Store) Notify() <-chan struct{} { return s.notifier.Subscribe() }
@@ -236,16 +208,24 @@ func (s *Store) Head(ctx context.Context) (uint64, uint64, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, 0, err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.failed != nil {
+		return 0, 0, s.failed
+	}
 	return s.revision, s.oldest, nil
 }
 
 func (s *Store) ScanNamespace(ctx context.Context, namespace string, emit func(storage.ScanItem) error) error {
-	s.mu.Lock()
+	s.mu.RLock()
+	if s.failed != nil {
+		err := s.failed
+		s.mu.RUnlock()
+		return err
+	}
 	snapshot := s.db.NewSnapshot()
 	head := s.revision
-	s.mu.Unlock()
+	s.mu.RUnlock()
 	defer snapshot.Close()
 	return changefeed.ScanSnapshot(ctx, snapshot, head, namespace, emit)
 }

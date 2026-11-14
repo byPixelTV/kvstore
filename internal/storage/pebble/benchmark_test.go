@@ -3,6 +3,7 @@ package pebblestore
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 	"testing"
 )
 
@@ -44,4 +45,27 @@ func BenchmarkPebbleSetSync(b *testing.B) {
 			b.Fatal(err)
 		}
 	}
+}
+
+// Measures concurrent sync writes with the same real record+revision+feed
+// contract as production, rather than raw Pebble batch throughput.
+func BenchmarkPebbleSetParallelGrouped(b *testing.B) {
+	s, err := Open(b.TempDir())
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer s.Close()
+	var next atomic.Uint64
+	value := make([]byte, 256)
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			id := next.Add(1)
+			if _, err := s.Set(context.Background(), "bench", fmt.Sprintf("k%d", id%1000), value); err != nil {
+				b.Error(err)
+				return
+			}
+		}
+	})
 }

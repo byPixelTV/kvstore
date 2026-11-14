@@ -31,6 +31,8 @@ type Config struct {
 	JoinToken          string
 	ReadBatchWindow    time.Duration
 	ReadBatchMax       int
+	WriteBatchWindow   time.Duration
+	WriteBatchMax      int
 }
 
 func getenv(key, def string) string {
@@ -91,6 +93,14 @@ func Load() (Config, error) {
 	c.ReadBatchMax, err = strconv.Atoi(getenv("KVSTORE_READ_BATCH_MAX", "256"))
 	if err != nil || c.ReadBatchMax < 1 || c.ReadBatchMax > 4096 {
 		return c, fmt.Errorf("KVSTORE_READ_BATCH_MAX must be between 1 and 4096")
+	}
+	c.WriteBatchWindow, err = time.ParseDuration(getenv("KVSTORE_WRITE_BATCH_WINDOW", "250us"))
+	if err != nil || c.WriteBatchWindow <= 0 || c.WriteBatchWindow > 20*time.Millisecond {
+		return c, fmt.Errorf("KVSTORE_WRITE_BATCH_WINDOW must be greater than 0s and at most 20ms")
+	}
+	c.WriteBatchMax, err = strconv.Atoi(getenv("KVSTORE_WRITE_BATCH_MAX", "64"))
+	if err != nil || c.WriteBatchMax < 1 || c.WriteBatchMax > 4096 {
+		return c, fmt.Errorf("KVSTORE_WRITE_BATCH_MAX must be between 1 and 4096")
 	}
 	if c.Mode == ModeStandalone {
 		if expected := os.Getenv("KVSTORE_EXPECTED_NODE_ID"); expected != "" && expected != c.NodeID {

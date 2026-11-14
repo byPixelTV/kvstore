@@ -41,6 +41,7 @@ type Node struct {
 	clientsMu sync.Mutex
 	clients   map[string]*grpc.ClientConn
 	reads     *readFenceCoordinator
+	writes    *clusterWriteBatcher
 	readStats readMetrics
 }
 
@@ -92,6 +93,9 @@ func Open(cfg config.Config) (_ *Node, err error) {
 	rCfg := raft.DefaultConfig()
 	rCfg.LocalID = raft.ServerID(cfg.NodeID)
 	rCfg.LogLevel = "INFO"
+	// Raft can pass up to MaxAppendEntries committed logs to BatchingFSM.
+	// BatchApplyCh allows the leader to fill larger groups under load.
+	rCfg.BatchApplyCh = true
 	rCfg.SnapshotThreshold = 8192 // avoid snapshot churn during sustained writes
 	rCfg.SnapshotInterval = 2 * time.Minute
 	existing, err := raft.HasExistingState(bolt, bolt, snaps)
@@ -119,6 +123,7 @@ func Open(cfg config.Config) (_ *Node, err error) {
 		batchMax = 256
 	}
 	node.reads = newReadFenceCoordinator(batchWindow, batchMax, node.strongFence, &node.readStats)
+	node.writes = newClusterWriteBatcher(node)
 	return node, nil
 }
 
@@ -143,6 +148,8 @@ func (n *Node) Close() error {
 		_ = n.admin.Shutdown(ctx)
 		cancel()
 	}
+	// Drain accepted write groups BEFORE shutting down Raft.
+	n.writes.Close()
 	err := n.raft.Shutdown().Error()
 	n.reads.Close()
 	n.clientsMu.Lock()
@@ -163,28 +170,36 @@ func (n *Node) Close() error {
 }
 
 func (n *Node) apply(ctx context.Context, cmd command) (uint64, error) {
+	if cmd.Operation == opSet || cmd.Operation == opDelete {
+		return n.writes.Submit(ctx, cmd)
+	}
+	result, err := n.applyDirect(ctx, cmd)
+	return result.Revision, err
+}
+
+func (n *Node) applyDirect(ctx context.Context, cmd command) (applyResult, error) {
 	if err := ctx.Err(); err != nil {
-		return 0, err
+		return applyResult{}, err
 	}
 	raw, err := json.Marshal(cmd)
 	if err != nil {
-		return 0, err
+		return applyResult{}, err
 	}
 	future := n.raft.Apply(raw, opTimeout)
 	done := make(chan error, 1)
 	go func() { done <- future.Error() }()
 	select {
 	case <-ctx.Done():
-		return 0, ctx.Err() // The committed write may still complete; callers must not blindly retry non-idempotent operations.
+		return applyResult{}, ctx.Err() // may still commit after timeout
 	case err := <-done:
 		if err != nil {
-			return 0, err
+			return applyResult{}, err
 		}
 		result, ok := future.Response().(applyResult)
 		if !ok {
-			return 0, fmt.Errorf("unexpected FSM result: %T", future.Response())
+			return applyResult{}, fmt.Errorf("unexpected FSM result: %T", future.Response())
 		}
-		return result.Revision, result.Err
+		return result, result.Err
 	}
 }
 
