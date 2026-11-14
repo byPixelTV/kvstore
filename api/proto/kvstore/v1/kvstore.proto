@@ -52,11 +52,14 @@ message DeleteResponse {
   uint64 revision = 2;
 }
 
-// Head provides an authoritative global revision before constructing a cache.
-message HeadRequest {}
+// On standalone and single-Raft: Head gives the authoritative revision.
+// Multi-Raft requires use_vector_cursor and returns cursor (revision=0).
+message HeadRequest { bool use_vector_cursor = 1; }
 message HeadResponse {
   uint64 revision = 1;
   uint64 oldest_available_revision = 2;
+  // Opaque cursor for multi-Raft. Set use_vector_cursor on requests.
+  string cursor = 3;
 }
 
 // A namespace is mandatory. An empty key watches all keys in that namespace.
@@ -66,6 +69,9 @@ message WatchRequest {
   string namespace = 1;
   string key = 2;
   uint64 after_revision = 3;
+  // Multi-Raft requires a per-shard cursor vector; legacy uint64 cursors are invalid.
+  string cursor = 4;
+  bool use_vector_cursor = 5;
 }
 message WatchResponse {
   uint64 revision = 1;
@@ -74,16 +80,25 @@ message WatchResponse {
   bytes value = 4;
   bool deleted = 5;
   bool checkpoint = 6;
+  string cursor = 7;
+  uint32 shard = 8;
 }
 
-// A complete point-in-time snapshot for resynchronizing a namespace cache.
-// The first message is a checkpoint holding the consistent snapshot cursor.
-// On success the SDK can open Watch(after_revision=snapshot_revision).
-message ScanRequest { string namespace = 1; }
+// Single-Raft: the first message is a consistent snapshot checkpoint; then
+// Watch(after_revision=snapshot_revision). Multi-Raft: request vector mode,
+// consume all records, then the FINAL checkpoint with the opaque cursor.
+// Resync by Watch(cursor=final_checkpoint.cursor) in vector mode.
+message ScanRequest {
+  string namespace = 1;
+  bool use_vector_cursor = 2;
+}
 message ScanResponse {
   uint64 snapshot_revision = 1;
   string key = 2;
   bytes value = 3;
   uint64 revision = 4;
   bool checkpoint = 5;
+  // Final checkpoint after ALL shard snapshots have completed.
+  string cursor = 6;
+  uint32 shard = 7;
 }

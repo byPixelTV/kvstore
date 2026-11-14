@@ -249,10 +249,10 @@ func run(opt options) error {
 		}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), opt.timeout)
-	_, err := clients[0].Head(ctx, &kvstorev1.HeadRequest{})
+	_, err := clients[0].Get(ctx, &kvstorev1.GetRequest{Namespace: namespace, Key: "__kvbench_connectivity_probe", Consistency: kvstorev1.ReadConsistency_READ_CONSISTENCY_STRONG})
 	cancel()
 	if err != nil {
-		return fmt.Errorf("Head connectivity check: %w", err)
+		return fmt.Errorf("GET connectivity check: %w", err)
 	}
 	rep := report{Mode: opt.mode, Consistency: opt.consistency, Address: opt.address, ResolvedAddress: target, Namespace: namespace, DurationSeconds: opt.duration.Seconds(), WarmupSeconds: opt.warmup.Seconds(), Concurrency: opt.concurrency, Connections: opt.connections, Keyspace: opt.keys, ValueBytes: opt.valueSize, CPUs: runtime.NumCPU()}
 	if opt.mode == "watch" {

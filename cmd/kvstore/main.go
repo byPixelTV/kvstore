@@ -17,6 +17,7 @@ import (
 	"github.com/byPixelTV/kvstore/internal/grpcserver"
 	"github.com/byPixelTV/kvstore/internal/healthcheck"
 	"github.com/byPixelTV/kvstore/internal/kvstore"
+	"github.com/byPixelTV/kvstore/internal/sharding"
 	"github.com/byPixelTV/kvstore/internal/storage"
 	pebblestore "github.com/byPixelTV/kvstore/internal/storage/pebble"
 	"google.golang.org/grpc"
@@ -54,6 +55,9 @@ func main() {
 }
 
 func run() (runErr error) {
+	if os.Getenv("KVSTORE_MODE") == "router" {
+		return sharding.ServeRouter()
+	}
 	cfg, err := config.Load()
 	if err != nil {
 		return err

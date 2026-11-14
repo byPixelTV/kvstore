@@ -1,0 +1,219 @@
+# Preview: three independent Raft groups, each with three voters.
+# New volumes only. DO NOT mount existing single-Raft /data into these nodes.
+# Localhost-only public gateway and admin diagnostics.
+x-node: &node
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: kvstore:multiraft-dev
+  restart: unless-stopped
+  init: true
+  read_only: true
+  security_opt: ["no-new-privileges:true"]
+  cap_drop: [ALL]
+  healthcheck:
+    test: [CMD, /usr/local/bin/kvstore, healthcheck]
+    interval: 10s
+    timeout: 3s
+    start_period: 60s
+    retries: 5
+  stop_grace_period: 30s
+x-common: &common
+  KVSTORE_MODE: cluster
+  KVSTORE_LISTEN_ADDR: ':50051'
+  KVSTORE_RAFT_BIND_ADDR: ':7000'
+  KVSTORE_ADMIN_LISTEN_ADDR: ':7001'
+  KVSTORE_DATA_DIR: /data
+  KVSTORE_JOIN_TOKEN: ${KVSTORE_JOIN_TOKEN:?Set KVSTORE_JOIN_TOKEN}
+  KVSTORE_READ_BATCH_WINDOW: ${KVSTORE_READ_BATCH_WINDOW:-300us}
+  KVSTORE_WRITE_BATCH_WINDOW: ${KVSTORE_WRITE_BATCH_WINDOW:-1500us}
+  KVSTORE_WRITE_BATCH_MAX: ${KVSTORE_WRITE_BATCH_MAX:-256}
+  KVSTORE_RAFT_MAX_INFLIGHT: ${KVSTORE_RAFT_MAX_INFLIGHT:-8}
+services:
+  s0n0:
+    <<: *node
+    hostname: s0n0
+    environment:
+      <<: *common
+      KVSTORE_NODE_ID: node0
+      KVSTORE_CLUSTER_BOOTSTRAP_NODE: node0
+      KVSTORE_CLUSTER_SEEDS: 's0n0:7001,s0n1:7001,s0n2:7001'
+      KVSTORE_RAFT_ADVERTISE_ADDR: s0n0:7000
+      KVSTORE_GRPC_ADVERTISE_ADDR: s0n0:50051
+      KVSTORE_ADMIN_ADVERTISE_ADDR: s0n0:7001
+    ports:
+      - '127.0.0.1:17101:7001'
+    volumes:
+      - s0n0-data:/data
+  s0n1:
+    <<: *node
+    hostname: s0n1
+    environment:
+      <<: *common
+      KVSTORE_NODE_ID: node1
+      KVSTORE_CLUSTER_BOOTSTRAP_NODE: node0
+      KVSTORE_CLUSTER_SEEDS: 's0n0:7001,s0n1:7001,s0n2:7001'
+      KVSTORE_RAFT_ADVERTISE_ADDR: s0n1:7000
+      KVSTORE_GRPC_ADVERTISE_ADDR: s0n1:50051
+      KVSTORE_ADMIN_ADVERTISE_ADDR: s0n1:7001
+    ports:
+      - '127.0.0.1:17102:7001'
+    volumes:
+      - s0n1-data:/data
+  s0n2:
+    <<: *node
+    hostname: s0n2
+    environment:
+      <<: *common
+      KVSTORE_NODE_ID: node2
+      KVSTORE_CLUSTER_BOOTSTRAP_NODE: node0
+      KVSTORE_CLUSTER_SEEDS: 's0n0:7001,s0n1:7001,s0n2:7001'
+      KVSTORE_RAFT_ADVERTISE_ADDR: s0n2:7000
+      KVSTORE_GRPC_ADVERTISE_ADDR: s0n2:50051
+      KVSTORE_ADMIN_ADVERTISE_ADDR: s0n2:7001
+    ports:
+      - '127.0.0.1:17103:7001'
+    volumes:
+      - s0n2-data:/data
+  s1n0:
+    <<: *node
+    hostname: s1n0
+    environment:
+      <<: *common
+      KVSTORE_NODE_ID: node0
+      KVSTORE_CLUSTER_BOOTSTRAP_NODE: node1
+      KVSTORE_CLUSTER_SEEDS: 's1n0:7001,s1n1:7001,s1n2:7001'
+      KVSTORE_RAFT_ADVERTISE_ADDR: s1n0:7000
+      KVSTORE_GRPC_ADVERTISE_ADDR: s1n0:50051
+      KVSTORE_ADMIN_ADVERTISE_ADDR: s1n0:7001
+    ports:
+      - '127.0.0.1:17104:7001'
+    volumes:
+      - s1n0-data:/data
+  s1n1:
+    <<: *node
+    hostname: s1n1
+    environment:
+      <<: *common
+      KVSTORE_NODE_ID: node1
+      KVSTORE_CLUSTER_BOOTSTRAP_NODE: node1
+      KVSTORE_CLUSTER_SEEDS: 's1n0:7001,s1n1:7001,s1n2:7001'
+      KVSTORE_RAFT_ADVERTISE_ADDR: s1n1:7000
+      KVSTORE_GRPC_ADVERTISE_ADDR: s1n1:50051
+      KVSTORE_ADMIN_ADVERTISE_ADDR: s1n1:7001
+    ports:
+      - '127.0.0.1:17105:7001'
+    volumes:
+      - s1n1-data:/data
+  s1n2:
+    <<: *node
+    hostname: s1n2
+    environment:
+      <<: *common
+      KVSTORE_NODE_ID: node2
+      KVSTORE_CLUSTER_BOOTSTRAP_NODE: node1
+      KVSTORE_CLUSTER_SEEDS: 's1n0:7001,s1n1:7001,s1n2:7001'
+      KVSTORE_RAFT_ADVERTISE_ADDR: s1n2:7000
+      KVSTORE_GRPC_ADVERTISE_ADDR: s1n2:50051
+      KVSTORE_ADMIN_ADVERTISE_ADDR: s1n2:7001
+    ports:
+      - '127.0.0.1:17106:7001'
+    volumes:
+      - s1n2-data:/data
+  s2n0:
+    <<: *node
+    hostname: s2n0
+    environment:
+      <<: *common
+      KVSTORE_NODE_ID: node0
+      KVSTORE_CLUSTER_BOOTSTRAP_NODE: node2
+      KVSTORE_CLUSTER_SEEDS: 's2n0:7001,s2n1:7001,s2n2:7001'
+      KVSTORE_RAFT_ADVERTISE_ADDR: s2n0:7000
+      KVSTORE_GRPC_ADVERTISE_ADDR: s2n0:50051
+      KVSTORE_ADMIN_ADVERTISE_ADDR: s2n0:7001
+    ports:
+      - '127.0.0.1:17107:7001'
+    volumes:
+      - s2n0-data:/data
+  s2n1:
+    <<: *node
+    hostname: s2n1
+    environment:
+      <<: *common
+      KVSTORE_NODE_ID: node1
+      KVSTORE_CLUSTER_BOOTSTRAP_NODE: node2
+      KVSTORE_CLUSTER_SEEDS: 's2n0:7001,s2n1:7001,s2n2:7001'
+      KVSTORE_RAFT_ADVERTISE_ADDR: s2n1:7000
+      KVSTORE_GRPC_ADVERTISE_ADDR: s2n1:50051
+      KVSTORE_ADMIN_ADVERTISE_ADDR: s2n1:7001
+    ports:
+      - '127.0.0.1:17108:7001'
+    volumes:
+      - s2n1-data:/data
+  s2n2:
+    <<: *node
+    hostname: s2n2
+    environment:
+      <<: *common
+      KVSTORE_NODE_ID: node2
+      KVSTORE_CLUSTER_BOOTSTRAP_NODE: node2
+      KVSTORE_CLUSTER_SEEDS: 's2n0:7001,s2n1:7001,s2n2:7001'
+      KVSTORE_RAFT_ADVERTISE_ADDR: s2n2:7000
+      KVSTORE_GRPC_ADVERTISE_ADDR: s2n2:50051
+      KVSTORE_ADMIN_ADVERTISE_ADDR: s2n2:7001
+    ports:
+      - '127.0.0.1:17109:7001'
+    volumes:
+      - s2n2-data:/data
+  router:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: kvstore:multiraft-dev
+    restart: unless-stopped
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    depends_on:
+      s0n0:
+        condition: service_started
+      s0n1:
+        condition: service_started
+      s0n2:
+        condition: service_started
+      s1n0:
+        condition: service_started
+      s1n1:
+        condition: service_started
+      s1n2:
+        condition: service_started
+      s2n0:
+        condition: service_started
+      s2n1:
+        condition: service_started
+      s2n2:
+        condition: service_started
+    environment:
+      KVSTORE_MODE: router
+      KVSTORE_LISTEN_ADDR: ':50051'
+      KVSTORE_SHARD_LAYOUT_VERSION: '1'
+      KVSTORE_SHARD_DISCOVERY_INTERVAL: 2s
+      KVSTORE_ROUTER_CONNECTIONS: '8'
+      KVSTORE_SHARDS: 's0n0:50051,s0n1:50051,s0n2:50051;s1n0:50051,s1n1:50051,s1n2:50051;s2n0:50051,s2n1:50051,s2n2:50051'
+    healthcheck:
+      test: [CMD, /usr/local/bin/kvstore, healthcheck]
+      interval: 10s
+      timeout: 3s
+      start_period: 90s
+      retries: 6
+    ports: ['127.0.0.1:50081:50051']
+volumes:
+  s0n0-data:
+  s0n1-data:
+  s0n2-data:
+  s1n0-data:
+  s1n1-data:
+  s1n2-data:
+  s2n0-data:
+  s2n1-data:
+  s2n2-data:

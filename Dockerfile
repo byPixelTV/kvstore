@@ -36,11 +36,14 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 GOOS="$TARGETOS" GOARCH="$TARGETARCH" \
       go build -trimpath -ldflags="-s -w -X main.version=$version" \
       -o /out/kvstore ./cmd/kvstore; \
+    CGO_ENABLED=0 GOOS="$TARGETOS" GOARCH="$TARGETARCH" \
+      go build -trimpath -ldflags="-s -w" -o /out/kvbench ./cmd/kvbench; \
     chown 65532:65532 /out/data
 
 FROM scratch
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=builder /out/kvstore /usr/local/bin/kvstore
+COPY --from=builder /out/kvbench /usr/local/bin/kvbench
 COPY --from=builder --chown=65532:65532 /out/data /data
 USER 65532:65532
 WORKDIR /data
