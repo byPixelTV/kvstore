@@ -321,7 +321,7 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
 			return fail(fmt.Errorf("decode committed log %d: %w", log.Index, err))
 		}
 		if cmd.Operation == opBatch {
-			if len(cmd.Commands) == 0 || len(cmd.Commands) > 64 {
+			if len(cmd.Commands) == 0 || len(cmd.Commands) > maxRaftCommandsPerBatch {
 				return fail(errors.New("invalid raft command batch size"))
 			}
 			revisions := make([]uint64, len(cmd.Commands))

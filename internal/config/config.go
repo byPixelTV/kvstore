@@ -33,6 +33,7 @@ type Config struct {
 	ReadBatchMax       int
 	WriteBatchWindow   time.Duration
 	WriteBatchMax      int
+	RaftMaxInflight    int
 }
 
 func getenv(key, def string) string {
@@ -98,9 +99,13 @@ func Load() (Config, error) {
 	if err != nil || c.WriteBatchWindow <= 0 || c.WriteBatchWindow > 20*time.Millisecond {
 		return c, fmt.Errorf("KVSTORE_WRITE_BATCH_WINDOW must be greater than 0s and at most 20ms")
 	}
-	c.WriteBatchMax, err = strconv.Atoi(getenv("KVSTORE_WRITE_BATCH_MAX", "64"))
+	c.WriteBatchMax, err = strconv.Atoi(getenv("KVSTORE_WRITE_BATCH_MAX", "128"))
 	if err != nil || c.WriteBatchMax < 1 || c.WriteBatchMax > 4096 {
 		return c, fmt.Errorf("KVSTORE_WRITE_BATCH_MAX must be between 1 and 4096")
+	}
+	c.RaftMaxInflight, err = strconv.Atoi(getenv("KVSTORE_RAFT_MAX_INFLIGHT", "16"))
+	if err != nil || c.RaftMaxInflight < 1 || c.RaftMaxInflight > 128 {
+		return c, fmt.Errorf("KVSTORE_RAFT_MAX_INFLIGHT must be between 1 and 128")
 	}
 	if c.Mode == ModeStandalone {
 		if expected := os.Getenv("KVSTORE_EXPECTED_NODE_ID"); expected != "" && expected != c.NodeID {

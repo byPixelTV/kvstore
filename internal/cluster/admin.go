@@ -181,8 +181,9 @@ func (n *Node) handlePerformance(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(struct {
-		NodeID    string          `json:"node_id"`
-		RaftState string          `json:"raft_state"`
-		Reads     ReadPerformance `json:"reads"`
-	}{NodeID: n.cfg.NodeID, RaftState: n.RaftState(), Reads: n.ReadPerformance()})
+		NodeID    string           `json:"node_id"`
+		RaftState string           `json:"raft_state"`
+		Reads     ReadPerformance  `json:"reads"`
+		Writes    WritePerformance `json:"writes"`
+	}{NodeID: n.cfg.NodeID, RaftState: n.RaftState(), Reads: n.ReadPerformance(), Writes: n.writes.Performance()})
 }

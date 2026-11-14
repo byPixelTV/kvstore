@@ -3,41 +3,116 @@ package cluster
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 const (
 	clusterWriteBatchWindow   = 250 * time.Microsecond
-	clusterWriteBatchMax      = 64
-	clusterWriteQueueCapacity = 4096
-	// Conservative estimated JSON payload limit (Raft's recommended log
-	// entry size is around 512 KiB). A 256 KiB value alone fits.
-	clusterWriteBatchBytes = 400 << 10
+	clusterWriteBatchMax      = 128
+	clusterWriteQueueCapacity = 8192
+	// A 256-KiB value fits, including JSON/base64 overhead. Never enlarge
+	// a batch beyond this budget just because the command count allows it.
+	clusterWriteBatchBytes  = 400 << 10
+	maxRaftCommandsPerBatch = 256
+	defaultRaftInflight     = 16
 )
 
 var errClusterBatchClosed = errors.New("cluster write batcher is closed")
 
 type clusterWriteRequest struct {
-	ctx   context.Context
-	cmd   command
-	reply chan writeResponse
+	ctx      context.Context
+	queuedAt time.Time
+	cmd      command
+	reply    chan writeResponse
+}
+
+type WritePerformance struct {
+	Submitted      uint64  `json:"submitted_writes"`
+	Groups         uint64  `json:"submitted_raft_groups"`
+	Completed      uint64  `json:"completed_raft_groups"`
+	GroupErrors    uint64  `json:"failed_raft_groups"`
+	AverageBatch   float64 `json:"average_batch_size"`
+	AverageApplyMS float64 `json:"average_raft_apply_ms"`
+	AverageQueueMS float64 `json:"average_queue_wait_ms"`
+	InFlight       int64   `json:"in_flight"`
+	PeakInFlight   int64   `json:"peak_in_flight"`
+	MaxInFlight    int     `json:"configured_max_in_flight"`
+}
+
+type writeCounters struct {
+	submitted   atomic.Uint64
+	groups      atomic.Uint64
+	logical     atomic.Uint64
+	completed   atomic.Uint64
+	failed      atomic.Uint64
+	applyNanos  atomic.Uint64
+	queueNanos  atomic.Uint64
+	queuedCount atomic.Uint64
+	inFlight    atomic.Int64
+	peak        atomic.Int64
 }
 
 type clusterWriteBatcher struct {
-	node   *Node
-	gate   sync.RWMutex
-	closed bool
-	queue  chan clusterWriteRequest
-	done   chan struct{}
+	node        *Node
+	gate        sync.RWMutex
+	closed      bool
+	queue       chan clusterWriteRequest
+	done        chan struct{}
+	batchWindow time.Duration
+	batchMax    int
+	maxInflight int
+	stats       writeCounters
 }
 
 func newClusterWriteBatcher(node *Node) *clusterWriteBatcher {
-	b := &clusterWriteBatcher{node: node, queue: make(chan clusterWriteRequest, clusterWriteQueueCapacity), done: make(chan struct{})}
+	window := node.cfg.WriteBatchWindow
+	if window <= 0 {
+		window = clusterWriteBatchWindow
+	}
+	maxBatch := node.cfg.WriteBatchMax
+	if maxBatch <= 0 {
+		maxBatch = clusterWriteBatchMax
+	}
+	if maxBatch > maxRaftCommandsPerBatch {
+		maxBatch = maxRaftCommandsPerBatch
+	}
+	inflight := node.cfg.RaftMaxInflight
+	if inflight <= 0 {
+		inflight = defaultRaftInflight
+	}
+	b := &clusterWriteBatcher{
+		node: node, queue: make(chan clusterWriteRequest, clusterWriteQueueCapacity),
+		done: make(chan struct{}), batchWindow: window, batchMax: maxBatch,
+		maxInflight: inflight,
+	}
 	go b.loop()
 	return b
+}
+
+func (b *clusterWriteBatcher) Performance() WritePerformance {
+	count := b.stats.completed.Load()
+	groups := b.stats.groups.Load()
+	perf := WritePerformance{
+		Submitted: b.stats.submitted.Load(), Groups: groups,
+		Completed: count, GroupErrors: b.stats.failed.Load(),
+		InFlight: b.stats.inFlight.Load(), PeakInFlight: b.stats.peak.Load(),
+		MaxInFlight: b.maxInflight,
+	}
+	if groups > 0 {
+		perf.AverageBatch = float64(b.stats.logical.Load()) / float64(groups)
+	}
+	if count > 0 {
+		perf.AverageApplyMS = float64(b.stats.applyNanos.Load()) / float64(count) / 1e6
+	}
+	if n := b.stats.queuedCount.Load(); n > 0 {
+		perf.AverageQueueMS = float64(b.stats.queueNanos.Load()) / float64(n) / 1e6
+	}
+	return perf
 }
 
 func (b *clusterWriteBatcher) Submit(ctx context.Context, cmd command) (uint64, error) {
@@ -45,7 +120,7 @@ func (b *clusterWriteBatcher) Submit(ctx context.Context, cmd command) (uint64, 
 		return 0, err
 	}
 	cmd.Value = bytes.Clone(cmd.Value)
-	req := clusterWriteRequest{ctx: ctx, cmd: cmd, reply: make(chan writeResponse, 1)}
+	req := clusterWriteRequest{ctx: ctx, queuedAt: time.Now(), cmd: cmd, reply: make(chan writeResponse, 1)}
 	b.gate.RLock()
 	if b.closed {
 		b.gate.RUnlock()
@@ -53,15 +128,18 @@ func (b *clusterWriteBatcher) Submit(ctx context.Context, cmd command) (uint64, 
 	}
 	select {
 	case b.queue <- req:
+		b.stats.submitted.Add(1)
 		b.gate.RUnlock()
 	case <-ctx.Done():
 		b.gate.RUnlock()
 		return 0, ctx.Err()
 	}
 	select {
-	case result := <-req.reply:
-		return result.revision, result.err
+	case res := <-req.reply:
+		return res.revision, res.err
 	case <-ctx.Done():
+		// May have committed despite cancellation; callers must treat this
+		// result as outcome-unknown and must not blindly retry increments.
 		return 0, ctx.Err()
 	}
 }
@@ -81,8 +159,11 @@ func estimateRaftCommand(c command) int {
 }
 
 func (b *clusterWriteBatcher) loop() {
-	defer close(b.done)
+	slots := make(chan struct{}, b.maxInflight)
 	var pending *clusterWriteRequest
+	var wg sync.WaitGroup
+	defer func() { wg.Wait(); close(b.done) }()
+
 	for {
 		var first clusterWriteRequest
 		if pending != nil {
@@ -97,10 +178,10 @@ func (b *clusterWriteBatcher) loop() {
 		}
 		group := []clusterWriteRequest{first}
 		totalBytes := estimateRaftCommand(first.cmd)
-		timer := time.NewTimer(clusterWriteBatchWindow)
+		timer := time.NewTimer(b.batchWindow)
 		queueClosed := false
 	collect:
-		for len(group) < clusterWriteBatchMax {
+		for len(group) < b.batchMax {
 			select {
 			case next, ok := <-b.queue:
 				if !ok {
@@ -124,18 +205,24 @@ func (b *clusterWriteBatcher) loop() {
 			default:
 			}
 		}
-		b.applyGroup(group)
+
+		// The old implementation blocked here until this whole group had
+		// committed. That kept Raft at ONE outstanding command regardless of
+		// concurrency. Keep submission ordered, but await futures concurrently.
+		b.dispatch(group, slots, &wg)
 		if queueClosed && pending == nil {
 			return
 		}
 	}
 }
 
-func (b *clusterWriteBatcher) applyGroup(group []clusterWriteRequest) {
+func (b *clusterWriteBatcher) dispatch(group []clusterWriteRequest, slots chan struct{}, wg *sync.WaitGroup) {
 	results := make([]writeResponse, len(group))
 	commands := make([]command, 0, len(group))
 	positions := make([]int, 0, len(group))
 	for i, req := range group {
+		b.stats.queueNanos.Add(uint64(time.Since(req.queuedAt).Nanoseconds()))
+		b.stats.queuedCount.Add(1)
 		if err := req.ctx.Err(); err != nil {
 			results[i].err = err
 			continue
@@ -143,34 +230,91 @@ func (b *clusterWriteBatcher) applyGroup(group []clusterWriteRequest) {
 		commands = append(commands, req.cmd)
 		positions = append(positions, i)
 	}
-	if len(commands) > 0 {
-		var cmd command
-		if len(commands) == 1 {
-			cmd = commands[0]
-		} else {
-			cmd = command{Operation: opBatch, Commands: commands}
+	replyAll := func() {
+		for i, req := range group {
+			req.reply <- results[i]
 		}
-		// A client cancel after submitting a Raft entry cannot undo a commit.
-		// The batch belongs to the server and is not tied to one caller's ctx.
-		ctx, cancel := context.WithTimeout(context.Background(), opTimeout)
-		response, err := b.node.applyDirect(ctx, cmd)
-		cancel()
-		if err == nil && len(commands) > 1 && len(response.Revisions) != len(commands) {
-			err = fmt.Errorf("raft batch returned %d revisions for %d commands", len(response.Revisions), len(commands))
+	}
+	if len(commands) == 0 {
+		replyAll()
+		return
+	}
+
+	cmd := commands[0]
+	if len(commands) > 1 {
+		cmd = command{Operation: opBatch, Commands: commands}
+	}
+	raw, err := json.Marshal(cmd)
+	if err != nil {
+		for _, i := range positions {
+			results[i].err = err
 		}
-		for j, idx := range positions {
-			if err != nil {
-				results[idx].err = err
-				continue
-			}
-			if len(commands) == 1 {
-				results[idx].revision = response.Revision
+		replyAll()
+		return
+	}
+	// The maxBytes estimate is conservative, but enforce the real encoded
+	// payload limit too: callers get an error, never a silently truncated batch.
+	if len(raw) > clusterWriteBatchBytes {
+		err = fmt.Errorf("raft command too large (%d bytes)", len(raw))
+		for _, i := range positions {
+			results[i].err = err
+		}
+		replyAll()
+		return
+	}
+
+	// Bound outstanding Raft commands and goroutines under overload.
+	// Only this worker submits to raft.Apply, retaining submission order.
+	slots <- struct{}{}
+	started := time.Now()
+	future := b.node.raft.Apply(raw, opTimeout)
+	b.stats.groups.Add(1)
+	b.stats.logical.Add(uint64(len(commands)))
+	active := b.stats.inFlight.Add(1)
+	for {
+		peak := b.stats.peak.Load()
+		if active <= peak || b.stats.peak.CompareAndSwap(peak, active) {
+			break
+		}
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer func() { b.stats.inFlight.Add(-1); <-slots }()
+		// Future.Error() may remain unresolved when quorum disappears. Cap
+		// client wait, matching the original applyDirect() 10s timeout.
+		outcome := make(chan error, 1)
+		go func() { outcome <- future.Error() }()
+		var applyErr error
+		select {
+		case applyErr = <-outcome:
+		case <-time.After(opTimeout):
+			applyErr = context.DeadlineExceeded
+		}
+		b.stats.applyNanos.Add(uint64(time.Since(started).Nanoseconds()))
+		b.stats.completed.Add(1)
+		if applyErr == nil {
+			response, ok := future.Response().(applyResult)
+			if !ok {
+				applyErr = fmt.Errorf("unexpected FSM response: %T", future.Response())
+			} else if response.Err != nil {
+				applyErr = response.Err
+			} else if len(commands) == 1 {
+				results[positions[0]].revision = response.Revision
+			} else if len(response.Revisions) != len(commands) {
+				applyErr = fmt.Errorf("raft batch returned %d revisions for %d commands", len(response.Revisions), len(commands))
 			} else {
-				results[idx].revision = response.Revisions[j]
+				for j, i := range positions {
+					results[i].revision = response.Revisions[j]
+				}
 			}
 		}
-	}
-	for i, req := range group {
-		req.reply <- results[i]
-	}
+		if applyErr != nil {
+			b.stats.failed.Add(1)
+			for _, i := range positions {
+				results[i].err = applyErr
+			}
+		}
+		replyAll()
+	}()
 }

@@ -54,3 +54,16 @@ func TestReadBatchConfig(t *testing.T) {
 		t.Fatal("expected invalid batch window")
 	}
 }
+
+func TestRaftInflightConfig(t *testing.T) {
+	t.Setenv("KVSTORE_MODE", "standalone")
+	t.Setenv("KVSTORE_RAFT_MAX_INFLIGHT", "32")
+	cfg, err := Load()
+	if err != nil || cfg.RaftMaxInflight != 32 {
+		t.Fatalf("cfg=%+v err=%v", cfg, err)
+	}
+	t.Setenv("KVSTORE_RAFT_MAX_INFLIGHT", "129")
+	if _, err := Load(); err == nil {
+		t.Fatal("accepted invalid inflight limit")
+	}
+}
