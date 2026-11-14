@@ -51,7 +51,11 @@ echo '== Move one hot slot while the benchmark is still writing =='
 "$ROOT/bin/kvshardctl-sharded" -action migrate -namespace "$NAMESPACE" -key key-0000000 \
  -admin http://127.0.0.1:17110 > "$OUT/migration-result.json"
 wait "$BENCH_PID"
-jq -e '(.get.errors + .set.errors)==0 and .get.not_found==0 and .get.ok>0 and .set.ok>0' "$OUT/live-load.json" >/dev/null
+if ! jq -e '(.get.errors + .set.errors)==0 and .get.not_found==0 and .get.ok>0 and .set.ok>0' "$OUT/live-load.json" >/dev/null; then
+ echo 'ERROR: migration load reported failed operations; see live-load-stderr.txt and live-load.json' >&2
+ jq '{GET: .get.ops_sec, SET: .set.ops_sec, errors: (.get.errors + .set.errors), missing: .get.not_found}' "$OUT/live-load.json" >&2
+ exit 1
+fi
 jq '{GET: .get.ops_sec, SET: .set.ops_sec, errors: (.get.errors + .set.errors), missing: .get.not_found}' "$OUT/live-load.json"
 echo '== Verify persisted owner after migration =='
 "$ROOT/bin/kvshardctl-sharded" -action layout -admin http://127.0.0.1:17110 > "$OUT/routing-layout.json"

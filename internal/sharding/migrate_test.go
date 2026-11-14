@@ -273,3 +273,57 @@ func TestCatchUpWithNoNewChangesReturnsImmediately(t *testing.T) {
 		t.Fatalf("catch-up on quiet shard: cursor=%d report=%+v err=%v", cursor, report, err)
 	}
 }
+
+// A busy hot key may generate hundreds of source changes during one migration.
+// Only the final state matters at cutover, so these must not become hundreds
+// of sequential Raft/fsync round trips on the destination.
+func TestCatchUpCoalescesHotKeyAndPreservesDeletes(t *testing.T) {
+	ctx := context.Background()
+	ns := "hot-namespace"
+	key := "key-0000000"
+	slot := Slot(ns, key)
+	target := newMemShard()
+	var events []*kvstorev1.WatchResponse
+	for i := 1; i <= 363; i++ {
+		events = append(events, &kvstorev1.WatchResponse{Revision: uint64(i), Key: key, Namespace: ns, Value: []byte(fmt.Sprintf("value-%03d", i))})
+	}
+	// Insert another key in the same slot and subsequently delete it.
+	other := matchingKeys(ns, slot, 1)[0]
+	if other == key {
+		other = matchingKeys(ns, slot, 2)[1]
+	}
+	events = append(events,
+		&kvstorev1.WatchResponse{Revision: 364, Key: other, Namespace: ns, Value: []byte("intermediate")},
+		&kvstorev1.WatchResponse{Revision: 365, Key: other, Namespace: ns, Deleted: true},
+	)
+	cursor := uint64(0)
+	report := &MigrationReport{}
+	err := catchUp(ctx, &memoryWatch{events: events, head: 365}, target, ns, slot, &cursor, 365, report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursor != 365 || report.Replayed != 365 || report.ReplayWrites != 2 {
+		t.Fatalf("incorrect replay progress: cursor=%d report=%+v", cursor, report)
+	}
+	got, err := target.Get(ctx, &kvstorev1.GetRequest{Namespace: ns, Key: key})
+	if err != nil || !got.GetFound() || string(got.GetValue()) != "value-363" {
+		t.Fatalf("hot key final value lost: %+v %v", got, err)
+	}
+	deleted, err := target.Get(ctx, &kvstorev1.GetRequest{Namespace: ns, Key: other})
+	if err != nil || deleted.GetFound() {
+		t.Fatalf("tombstone not applied: %+v %v", deleted, err)
+	}
+}
+
+func TestCatchUpOnlyAdvancesCursorAfterSuccessfulWrites(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	ns := "players"
+	key := "player-42"
+	cursor := uint64(1)
+	report := &MigrationReport{}
+	err := catchUp(ctx, &memoryWatch{events: []*kvstorev1.WatchResponse{{Revision: 2, Namespace: ns, Key: key, Value: []byte("new")}}}, newMemShard(), ns, Slot(ns, key), &cursor, 2, report)
+	if !errors.Is(err, context.Canceled) || cursor != 1 || report.Replayed != 0 {
+		t.Fatalf("advanced cursor without durable destination write: cursor=%d err=%v report=%+v", cursor, err, report)
+	}
+}

@@ -28,6 +28,7 @@ type MigrationReport struct {
 	NewEpoch        uint64  `json:"new_epoch"`
 	Copied          uint64  `json:"copied"`
 	Replayed        uint64  `json:"replayed"`
+	ReplayWrites    uint64  `json:"replay_writes"`
 	RemovedStale    uint64  `json:"removed_stale"`
 	CutoverFreezeMS float64 `json:"cutover_freeze_ms"`
 }
@@ -123,38 +124,135 @@ func parallelSlotScan(ctx context.Context, client kvstorev1.KVStoreClient, names
 	return revision, completed.Load(), nil
 }
 
-// catchUp applies the source's durable changefeed in strict revision order.
-// Every acknowledged destination SET/DELETE is Raft-applied before progress
-// advances. A missing retained history fails the migration, never guesses.
+// Replay batches hold only the latest mutation for each key. All changes
+// remain ordered by source revision, but *intermediate* values of a hot key
+// need not be persisted on the destination. No target reads can reach that
+// key until the routing cutover succeeds and the source has been sealed.
+// The upper bounds limit memory use for namespaces with many distinct keys.
+const (
+	migrationReplayMaxKeys   = 128
+	migrationReplayMaxBytes  = 4 << 20
+	migrationReplayMaxEvents = 8192
+	migrationReplayWorkers   = 16
+)
+
+type replayMutation struct {
+	key     string
+	value   []byte
+	deleted bool
+}
+
+// applyReplay writes distinct keys in parallel but does not return until ALL
+// acknowledged destination writes have completed. Applying the next batch
+// only after this one preserves per-key order across replay batches.
+func applyReplay(ctx context.Context, target kvstorev1.KVStoreClient, namespace string, pending map[string]replayMutation) error {
+	if len(pending) == 0 {
+		return ctx.Err()
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	jobs := make(chan replayMutation)
+	workers := min(len(pending), migrationReplayWorkers)
+	var wg sync.WaitGroup
+	var once sync.Once
+	var firstErr error
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for item := range jobs {
+				if ctx.Err() != nil {
+					return
+				}
+				var err error
+				if item.deleted {
+					_, err = target.Delete(ctx, &kvstorev1.DeleteRequest{Namespace: namespace, Key: item.key})
+				} else {
+					_, err = target.Set(ctx, &kvstorev1.SetRequest{Namespace: namespace, Key: item.key, Value: item.value})
+				}
+				if err != nil {
+					once.Do(func() { firstErr = fmt.Errorf("replay key %q: %w", item.key, err); cancel() })
+					return
+				}
+			}
+		}()
+	}
+sendLoop:
+	for _, item := range pending {
+		select {
+		case jobs <- item:
+		case <-ctx.Done():
+			break sendLoop
+		}
+	}
+	close(jobs)
+	wg.Wait()
+	if firstErr != nil {
+		return firstErr
+	}
+	return ctx.Err()
+}
+
+// catchUp consumes all source revisions through 'until', coalesces overwrites
+// of the same key, and persists the resulting per-key state before advancing
+// the cursor. Revisions are not considered replayed until the destination has
+// acknowledged every write in the batch. This is safe because the destination
+// is NOT yet serving the migrated slot and epoch changes force SDK rescans.
 func catchUp(ctx context.Context, stream grpc.ServerStreamingClient[kvstorev1.WatchResponse], target kvstorev1.KVStoreClient, namespace string, slot uint16, cursor *uint64, until uint64, report *MigrationReport) error {
-	// When nothing has changed since the previous checkpoint, do not wait
-	// for a Watch heartbeat (which can take 20 seconds on an idle shard).
 	if *cursor >= until {
 		return nil
 	}
-	for *cursor < until {
+	pending := make(map[string]replayMutation)
+	progress := *cursor
+	var pendingBytes int
+	var batchEvents uint64
+	var sourceEvents int
+	flush := func() error {
+		if err := applyReplay(ctx, target, namespace, pending); err != nil {
+			return err
+		}
+		report.Replayed += batchEvents
+		report.ReplayWrites += uint64(len(pending))
+		*cursor = progress
+		pending = make(map[string]replayMutation)
+		pendingBytes = 0
+		batchEvents = 0
+		sourceEvents = 0
+		return nil
+	}
+	for progress < until {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		event, err := stream.Recv()
 		if err != nil {
 			return err
 		}
-		if event.GetRevision() < *cursor {
+		if event.GetRevision() < progress {
 			return status.Error(codes.DataLoss, "source changefeed revision moved backwards")
 		}
+		progress = event.GetRevision()
+		sourceEvents++
 		if !event.GetCheckpoint() && Slot(namespace, event.GetKey()) == slot {
-			if event.GetDeleted() {
-				if _, err = target.Delete(ctx, &kvstorev1.DeleteRequest{Namespace: namespace, Key: event.GetKey()}); err != nil {
-					return fmt.Errorf("replay delete %q: %w", event.GetKey(), err)
-				}
-			} else {
-				if _, err = target.Set(ctx, &kvstorev1.SetRequest{Namespace: namespace, Key: event.GetKey(), Value: event.GetValue()}); err != nil {
-					return fmt.Errorf("replay set %q: %w", event.GetKey(), err)
-				}
+			key := event.GetKey()
+			if old, found := pending[key]; found {
+				pendingBytes -= len(old.key) + len(old.value)
 			}
-			report.Replayed++
+			mutation := replayMutation{key: key, deleted: event.GetDeleted()}
+			if !mutation.deleted {
+				mutation.value = append([]byte(nil), event.GetValue()...)
+			}
+			pending[key] = mutation
+			pendingBytes += len(key) + len(mutation.value)
+			batchEvents++
 		}
-		*cursor = event.GetRevision()
+		if len(pending) >= migrationReplayMaxKeys || pendingBytes >= migrationReplayMaxBytes || sourceEvents >= migrationReplayMaxEvents {
+			if err := flush(); err != nil {
+				return err
+			}
+		}
 	}
-	return nil
+	return flush()
 }
 
 func (r *Router) setFence(ctx context.Context, shard int, namespace string, slot uint16, sealed bool) error {

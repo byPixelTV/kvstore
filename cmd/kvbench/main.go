@@ -25,6 +25,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 )
 
 const sampleSize = 20000
@@ -366,6 +367,7 @@ func runRPC(opt options, clients []kvstorev1.KVStoreClient, namespace string, re
 	type partial struct{ get, set aggregate }
 	result := make(chan partial, opt.concurrency)
 	var wg sync.WaitGroup
+	var loggedRPCFailures atomic.Int32
 	for worker := 0; worker < opt.concurrency; worker++ {
 		wg.Add(1)
 		go func(id int) {
@@ -410,6 +412,13 @@ func runRPC(opt options, clients []kvstorev1.KVStoreClient, namespace string, re
 				}
 				if err != nil {
 					target.Errors++
+					if loggedRPCFailures.Add(1) <= 10 {
+						op := "SET"
+						if isRead {
+							op = "GET"
+						}
+						fmt.Fprintf(os.Stderr, "kvbench: %s failure (%s): %v\n", op, status.Code(err), err)
+					}
 				} else {
 					target.OK++
 					if isRead && missing {
