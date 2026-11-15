@@ -182,4 +182,28 @@ func TestThreeNodeRaftFailover(t *testing.T) {
 			t.Fatalf("batch result %d: %+v", i, batch.GetResults())
 		}
 	}
+
+	// With two of three voters stopped, no quorum remains. A former leader
+	// must NOT serve stale data as STRONG, nor acknowledge a new write.
+	leaderIdx, followerIdx := 1, 2
+	if nodes[2].RaftState() == "Leader" {
+		leaderIdx, followerIdx = 2, 1
+	}
+	servers[followerIdx].Stop()
+	if err := nodes[followerIdx].Close(); err != nil {
+		t.Fatal(err)
+	}
+	nodes[followerIdx] = nil
+
+	noQuorumCtx, noQuorumCancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer noQuorumCancel()
+	_, found, readErr := nodes[leaderIdx].Get(noQuorumCtx, "players", "123")
+	if readErr == nil {
+		t.Fatalf("STRONG read succeeded without a quorum (found=%v)", found)
+	}
+	writeCtx, writeCancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer writeCancel()
+	if revision, writeErr := nodes[leaderIdx].Set(writeCtx, "players", "must-not-ack", []byte("x")); writeErr == nil {
+		t.Fatalf("write acknowledged without a quorum: revision=%d", revision)
+	}
 }

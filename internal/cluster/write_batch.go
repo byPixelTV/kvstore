@@ -55,6 +55,9 @@ type WritePerformance struct {
 	AverageAdmissionMS float64 `json:"average_raft_admission_ms"`
 	QueueDepth         int     `json:"queue_depth"`
 	AverageQueueMS     float64 `json:"average_queue_wait_ms"`
+	P99QueueMS         float64 `json:"p99_queue_wait_ms_upper"`
+	P99AdmissionMS     float64 `json:"p99_raft_admission_ms_upper"`
+	P99ApplyMS         float64 `json:"p99_raft_apply_ms_upper"`
 	InFlight           int64   `json:"in_flight"`
 	PeakInFlight       int64   `json:"peak_in_flight"`
 	BatchRPCs          uint64  `json:"submitted_batch_rpcs"`
@@ -82,6 +85,9 @@ type writeCounters struct {
 	rejected       atomic.Uint64
 	inFlight       atomic.Int64
 	peak           atomic.Int64
+	queueLatency   latencyHistogram
+	admitLatency   latencyHistogram
+	applyLatency   latencyHistogram
 }
 
 type clusterWriteBatcher struct {
@@ -150,6 +156,9 @@ func (b *clusterWriteBatcher) Performance() WritePerformance {
 		RejectedBeforeRaft: b.stats.rejected.Load(), QueueBudgetMS: float64(b.maxQueueDelay) / 1e6,
 		BatchTarget: b.batchTarget, BatchWindowMS: float64(b.batchWindow) / 1e6,
 		BatchMaxWindowMS: float64(b.batchMaxWindow) / 1e6,
+		P99QueueMS:       b.stats.queueLatency.P99MS(),
+		P99AdmissionMS:   b.stats.admitLatency.P99MS(),
+		P99ApplyMS:       b.stats.applyLatency.P99MS(),
 	}
 	if groups > 0 {
 		perf.AverageBatch = float64(b.stats.logical.Load()) / float64(groups)
@@ -359,6 +368,7 @@ func (b *clusterWriteBatcher) dispatch(group []clusterWriteRequest, slots chan s
 	for i, req := range group {
 		wait := time.Since(req.queuedAt)
 		b.stats.queueNanos.Add(uint64(wait.Nanoseconds()))
+		b.stats.queueLatency.Observe(wait)
 		b.stats.queuedCount.Add(1)
 		if err := req.ctx.Err(); err != nil {
 			if req.isBatch() {
@@ -422,7 +432,9 @@ func (b *clusterWriteBatcher) dispatch(group []clusterWriteRequest, slots chan s
 	// to their original RPCs.
 	started := time.Now()
 	future := b.node.raft.Apply(raw, opTimeout)
-	b.stats.admissionNanos.Add(uint64(time.Since(started).Nanoseconds()))
+	admitDuration := time.Since(started)
+	b.stats.admissionNanos.Add(uint64(admitDuration.Nanoseconds()))
+	b.stats.admitLatency.Observe(admitDuration)
 	b.stats.groups.Add(1)
 	logical := uint64(0)
 	for _, item := range valid {
@@ -449,7 +461,9 @@ func (b *clusterWriteBatcher) dispatch(group []clusterWriteRequest, slots chan s
 			// A Raft timeout is UNKNOWN OUTCOME, never a safe retry signal.
 			applyErr = context.DeadlineExceeded
 		}
-		b.stats.applyNanos.Add(uint64(time.Since(started).Nanoseconds()))
+		applyDuration := time.Since(started)
+		b.stats.applyNanos.Add(uint64(applyDuration.Nanoseconds()))
+		b.stats.applyLatency.Observe(applyDuration)
 		b.stats.completed.Add(1)
 		if applyErr == nil {
 			response, ok := future.Response().(applyResult)
