@@ -9,6 +9,9 @@ import (
 func TestMeasuredRaftLogStoreAndCache(t *testing.T) {
 	stats := &raftLogMetrics{}
 	store := &measuredLogStore{inner: raft.NewInmemStore(), stats: stats}
+	if store.IsMonotonic() {
+		t.Fatal("memory store should not claim to be monotonic")
+	}
 	cache, err := raft.NewLogCache(32, store)
 	if err != nil {
 		t.Fatal(err)

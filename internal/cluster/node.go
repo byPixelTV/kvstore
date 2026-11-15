@@ -21,7 +21,7 @@ import (
 	"github.com/byPixelTV/kvstore/internal/sharding"
 	"github.com/byPixelTV/kvstore/internal/storage"
 	"github.com/hashicorp/raft"
-	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
+	raftwal "github.com/hashicorp/raft-wal"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -37,7 +37,7 @@ type Node struct {
 	cfg         config.Config
 	raft        *raft.Raft
 	fsm         *FSM
-	raftStore   *raftboltdb.BoltStore
+	raftStore   *raftwal.WAL
 	logStats    *raftLogMetrics
 	transport   *raft.NetworkTransport
 	admin       *http.Server
@@ -68,13 +68,13 @@ func Open(cfg config.Config) (_ *Node, err error) {
 	if err = os.MkdirAll(raftDir, 0700); err != nil {
 		return nil, err
 	}
-	bolt, err := raftboltdb.NewBoltStore(filepath.Join(raftDir, "raft.db"))
+	walStore, err := openRaftWAL(raftDir)
 	if err != nil {
 		return nil, err
 	}
 	defer func() {
 		if err != nil {
-			_ = bolt.Close()
+			_ = walStore.Close()
 		}
 	}()
 	snaps, err := raft.NewFileSnapshotStore(filepath.Join(raftDir, "snapshots"), 3, os.Stderr)
@@ -108,14 +108,14 @@ func Open(cfg config.Config) (_ *Node, err error) {
 	}
 	rCfg.SnapshotThreshold = 8192 // avoid snapshot churn during sustained writes
 	rCfg.SnapshotInterval = 2 * time.Minute
-	existing, err := raft.HasExistingState(bolt, bolt, snaps)
+	existing, err := raft.HasExistingState(walStore, walStore, snaps)
 	if err != nil {
 		return nil, err
 	}
 	// Recently appended log entries are re-read for follower replication.
-	// Cache only reads; every StoreLogs still passes through to durable BoltDB.
+	// Cache only reads; StoreLogs still writes to the durable raft-wal.
 	logMetrics := &raftLogMetrics{}
-	var logStore raft.LogStore = &measuredLogStore{inner: bolt, stats: logMetrics}
+	var logStore raft.LogStore = &measuredLogStore{inner: walStore, stats: logMetrics}
 	if cfg.RaftLogCacheEntries != 0 {
 		entries := cfg.RaftLogCacheEntries
 		if entries < 0 {
@@ -127,7 +127,7 @@ func Open(cfg config.Config) (_ *Node, err error) {
 		}
 		logStore = cache
 	}
-	r, err := raft.NewRaft(rCfg, fsm, logStore, bolt, snaps, transport)
+	r, err := raft.NewRaft(rCfg, fsm, logStore, walStore, snaps, transport)
 	if err != nil {
 		return nil, err
 	}
@@ -138,7 +138,7 @@ func Open(cfg config.Config) (_ *Node, err error) {
 			return nil, fmt.Errorf("bootstrap raft: %w", err)
 		}
 	}
-	node := &Node{cfg: cfg, raft: r, fsm: fsm, raftStore: bolt, transport: transport, clients: make(map[string]*grpc.ClientConn)}
+	node := &Node{cfg: cfg, raft: r, fsm: fsm, raftStore: walStore, transport: transport, clients: make(map[string]*grpc.ClientConn)}
 	node.logStats = logMetrics
 	batchWindow := cfg.ReadBatchWindow
 	if batchWindow == 0 { // support tests and manually constructed Config values

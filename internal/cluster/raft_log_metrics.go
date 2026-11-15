@@ -8,7 +8,7 @@ import (
 )
 
 // measuredLogStore wraps the *durable* backend, below Raft's LogCache.
-// Timings therefore reflect actual BoltDB reads/appends rather than cache hits.
+// Timings therefore reflect actual WAL reads/appends rather than cache hits.
 // No buffering or unsafe delayed fsync is introduced here.
 type measuredLogStore struct {
 	inner raft.LogStore
@@ -110,3 +110,14 @@ func (s *measuredLogStore) DeleteRange(min, max uint64) error {
 }
 
 var _ raft.LogStore = (*measuredLogStore)(nil)
+
+// IsMonotonic preserves the raft-wal invariant through our metrics wrapper.
+// Raft needs this for correct log handling following user snapshot restores.
+func (s *measuredLogStore) IsMonotonic() bool {
+	if m, ok := s.inner.(raft.MonotonicLogStore); ok {
+		return m.IsMonotonic()
+	}
+	return false
+}
+
+var _ raft.MonotonicLogStore = (*measuredLogStore)(nil)
