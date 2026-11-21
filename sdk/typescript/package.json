@@ -2,6 +2,7 @@
   "name": "@bypixeltv/kvstore",
   "version": "0.0.0",
   "description": "Node.js and TypeScript gRPC client for KVStore",
+  "license": "MIT",
   "type": "module",
   "exports": {
     ".": {

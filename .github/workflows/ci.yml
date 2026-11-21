@@ -153,13 +153,18 @@ jobs:
 
           go build -trimpath -ldflags="-s -w -X main.version=$BUILD_VERSION" \
             -o "staging/kvstore${suffix}" ./cmd/kvstore
+          cp LICENSE staging/
 
           archive="kvstore-${BUILD_VERSION}-${TARGET_OS}-${TARGET_ARCH}"
           if [[ "$TARGET_OS" == "windows" ]]; then
-            (cd staging && zip -q -9 "../dist/${archive}.zip" "kvstore.exe")
+            (cd staging && zip -q -9 "../dist/${archive}.zip" kvstore.exe LICENSE)
           else
-            tar -C staging -czf "dist/${archive}.tar.gz" kvstore
+            tar -C staging -czf "dist/${archive}.tar.gz" kvstore LICENSE
           fi
+
+      - name: Scan the Linux release binary
+        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.10.0 -mode binary staging/kvstore
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@v7
@@ -215,11 +220,12 @@ jobs:
             $archive = "dist/kvctl-$env:BUILD_VERSION-$env:TARGET_OS-$arch"
             New-Item -ItemType Directory -Path $stage | Out-Null
             go build -trimpath "-ldflags=-s -w -X main.version=$env:BUILD_VERSION" -o "$stage/$binary" ./cmd/kvctl
+            Copy-Item -LiteralPath LICENSE -Destination $stage
 
             if ($isWindowsTarget) {
-              Compress-Archive -LiteralPath "$stage/$binary" -DestinationPath "$archive.zip"
+              Compress-Archive -LiteralPath @("$stage/$binary", "$stage/LICENSE") -DestinationPath "$archive.zip"
             } else {
-              tar -C $stage -czf "$archive.tar.gz" $binary
+              tar -C $stage -czf "$archive.tar.gz" $binary LICENSE
             }
           }
 
@@ -243,6 +249,13 @@ jobs:
           if ($actual -cne "kvctl $env:BUILD_VERSION") {
             throw "Unexpected kvctl version: $actual"
           }
+          if ((Get-FileHash -LiteralPath smoke/LICENSE).Hash -ne (Get-FileHash -LiteralPath LICENSE).Hash) {
+            throw "The archived license does not match LICENSE"
+          }
+
+      - name: Test the native Windows server mode
+        if: matrix.goos == 'windows'
+        run: go test ./cmd/kvstore
 
       - name: Smoke-test the Windows PowerShell demo
         if: matrix.goos == 'windows'

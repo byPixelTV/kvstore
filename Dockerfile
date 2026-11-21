@@ -31,7 +31,9 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
     chown 65532:65532 /out/data
 
 FROM scratch
+LABEL org.opencontainers.image.licenses=MIT
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=builder /src/LICENSE /usr/share/licenses/kvstore/LICENSE
 COPY --from=builder /out/kvstore /usr/local/bin/kvstore
 COPY --from=builder /out/kvbench /usr/local/bin/kvbench
 COPY --from=builder /out/kvshardctl /usr/local/bin/kvshardctl

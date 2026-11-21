@@ -50,6 +50,7 @@ go test -count=1 ./sdk/go
 package_source="$fixture/source/sdk/typescript"
 proto_source="$fixture/source/api/proto/kvstore/v1"
 mkdir -p "$package_source" "$proto_source"
+cp LICENSE "$fixture/source/"
 cp -R sdk/typescript/{src,README.md,copy-proto.mjs,package.json,package-lock.json,tsconfig.json} "$package_source/"
 cp api/proto/kvstore/v1/kvstore.proto "$proto_source/"
 (

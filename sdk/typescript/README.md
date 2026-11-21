@@ -2,6 +2,8 @@
 
 Node.js 22+ gRPC client for [KVStore](https://github.com/byPixelTV/kvstore).
 
+Install the nightly preview with `npm install @bypixeltv/kvstore@snapshot`.
+
 ```ts
 import { KVStoreClient } from "@bypixeltv/kvstore";
 

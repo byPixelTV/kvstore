@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -74,8 +75,13 @@ func main() {
 }
 
 func run() (runErr error) {
-	if os.Getenv("KVSTORE_MODE") == "router" {
+	switch os.Getenv("KVSTORE_MODE") {
+	case "router":
 		return sharding.ServeRouter()
+	case config.ModeCluster:
+		if runtime.GOOS == "windows" {
+			return errors.New("Raft voters are unsupported on native Windows. Use KVSTORE_MODE=standalone or run the cluster in Linux containers")
+		}
 	}
 	cfg, err := config.Load()
 	if err != nil {

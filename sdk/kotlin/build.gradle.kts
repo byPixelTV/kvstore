@@ -39,6 +39,9 @@ java {
     withSourcesJar()
 }
 tasks.withType<JavaCompile>().configureEach { options.release.set(17) }
+tasks.withType<Jar>().configureEach {
+    from("../../LICENSE") { into("META-INF") }
+}
 kotlin { compilerOptions.jvmTarget.set(JvmTarget.JVM_17) }
 
 val liveTest = providers.environmentVariable("KVSTORE_SDK_TEST_TARGET").isPresent
@@ -76,6 +79,12 @@ publishing {
                 name.set("KVStore Kotlin SDK")
                 description.set("Kotlin/JVM gRPC client for KVStore")
                 url.set("https://github.com/byPixelTV/kvstore")
+                licenses {
+                    license {
+                        name.set("MIT License")
+                        url.set("https://opensource.org/license/mit")
+                    }
+                }
             }
         }
     }

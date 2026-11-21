@@ -15,14 +15,19 @@ The benchmark throughput assumes 50% STRONG GETs and 50% logical writes through 
 
 ## Starting containers
 
-Set up Docker Compose and persistent SSD volumes on the Linux host. Set `KVSTORE_IMAGE` to a specific image tag or digest. To build from the local checkout, run `docker compose -f compose.sharded.yml build` first. To use a published image, run `docker compose -f compose.sharded.yml pull`. Compose requires two separate secrets. Set them through environment variables or a protected local `.env` file.
+Set up Docker Compose and persistent SSD volumes on the Linux host. The following commands build the image from the checkout without GHCR access. Compose requires two separate secrets. Set them through environment variables or a protected local `.env` file.
 
 ```sh
 export KVSTORE_JOIN_TOKEN="$(openssl rand -hex 32)"
 export KVSTORE_ROUTER_ADMIN_TOKEN="$(openssl rand -hex 32)"
+export KVSTORE_IMAGE=kvstore:multiraft-dev
+docker build -t "$KVSTORE_IMAGE" .
 docker compose -f compose.sharded.yml up -d --no-build
 docker compose -f compose.sharded.yml ps
 ```
+
+If you have access to a published image, set `KVSTORE_IMAGE` to its tag or digest and run
+`docker compose -f compose.sharded.yml pull` before starting the services.
 
 Keep the same secrets across restarts. The router publishes gRPC on `127.0.0.1:50081` for local checks. Set `KVSTORE_SHARDED_GRPC_PORT` to use a different local port. The join token protects the HTTP admin API on the voters. Internal Raft and gRPC traffic uses plaintext, so use a private encrypted network for traffic between hosts.
 

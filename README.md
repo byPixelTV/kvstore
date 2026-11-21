@@ -29,6 +29,9 @@ process for local development or uses Raft replication and a routing layer for s
 deployments. Applications can read and write through Kotlin, Go or TypeScript and subscribe to
 committed changes through the same API.
 
+The current release channel is the **nightly preview**. Build the server from a checkout
+or find preview binaries on the [Releases page](https://github.com/byPixelTV/kvstore/releases).
+
 | Capability | What you can do |
 | --- | --- |
 | **Read and write** | Choose strong or eventual reads, set optional key expirations, and batch writes within a shard. |
@@ -69,11 +72,11 @@ For a hands-on terminal console, try the [Windows demo](deploy/kvctl.md#try-the-
 Connect to the server endpoint in standalone or single-Raft mode, or to the router in a
 sharded deployment. See [release channels](#release-channels) for package versions and feeds.
 
-| Runtime | SDK | Stable package |
+| Runtime | SDK | Preview package |
 | --- | --- | --- |
-| Kotlin/JVM 17+ | [sdk/kotlin](sdk/kotlin) | `dev.bypixel:kvstore` on [ByPixel Maven](https://repo.bypixel.dev/releases/) |
-| Go 1.27+ | [sdk/go](sdk/go) | `github.com/byPixelTV/kvstore/sdk/go` |
-| Node.js 22+ | [sdk/typescript](sdk/typescript) | `@bypixeltv/kvstore` on npm |
+| Kotlin/JVM 17+ | [sdk/kotlin](sdk/kotlin) | `dev.bypixel:kvstore` on [ByPixel Snapshots](https://repo.bypixel.dev/snapshots/) |
+| Go 1.27.4+ | [sdk/go](sdk/go) | `github.com/byPixelTV/kvstore/sdk/go` |
+| Node.js 22+ | [sdk/typescript](sdk/typescript) | `@bypixeltv/kvstore@snapshot` on npm |
 
 Clients use TLS by default. Pass an API key when the server requires bearer authentication.
 All three accept custom trust roots and client certificates. Use explicit plaintext settings for a local plaintext endpoint.
@@ -87,10 +90,10 @@ Use the raw operations for binary data or a custom codec.
 ```kotlin
 repositories {
     mavenCentral()
-    maven("https://repo.bypixel.dev/releases/")
+    maven("https://repo.bypixel.dev/snapshots/")
 }
 dependencies {
-    implementation("dev.bypixel:kvstore:0.1.0")
+    implementation("dev.bypixel:kvstore:0.1.0-SNAPSHOT")
 }
 ```
 
@@ -128,8 +131,10 @@ Pass a custom `Json` instance to reuse application serializers.
 ### Go
 
 ```sh
-go get github.com/byPixelTV/kvstore/sdk/go@v0.1.0
+go get github.com/byPixelTV/kvstore/sdk/go@nightly
 ```
+
+To pin the preview, use an exact snapshot tag from GitHub Releases in place of `nightly`.
 
 ```go
 import kvstore "github.com/byPixelTV/kvstore/sdk/go"
@@ -156,7 +161,7 @@ For a private GitHub checkout, authenticate Git and set `GOPRIVATE=github.com/by
 ### TypeScript
 
 ```sh
-npm install @bypixeltv/kvstore
+npm install @bypixeltv/kvstore@snapshot
 ```
 
 ```ts
@@ -202,6 +207,9 @@ Revisions and expiration timestamps in TypeScript responses are decimal strings 
 In sharded mode, the gRPC router maps each key to a Raft group. The groups replicate their writes
 independently. The checked-in Compose topology runs three voters per group.
 
+Use the native Windows server for standalone mode. Run Raft voters on Linux or in Linux
+containers, including Docker Desktop on Windows.
+
 ```mermaid
 flowchart LR
     Client["SDKs and kvctl"] -->|gRPC| Router["KVStore router"]
@@ -229,6 +237,14 @@ the release workflow publishes the packages and existing server artifacts from t
 | --- | --- | --- | --- |
 | `stable` | `v<VERSION>` | Releases repository, `<VERSION>` | `latest`, `<VERSION>` |
 | `nightly` | `v<VERSION>-SNAPSHOT.<run>.<attempt>` | Snapshots repository, `<VERSION>-SNAPSHOT` | `snapshot`, `<VERSION>-SNAPSHOT.<run>` |
+
+The stable channel becomes available after the first successful release from `stable`.
+Use the nightly SDK commands above during the preview. The [Compose quickstart](#quickstart)
+builds the server locally and works without GHCR access.
+
+GitHub configures container package visibility separately from repository visibility.
+Before advertising a GHCR pull command for a public release, make the package public
+and verify the intended tag pulls anonymously.
 
 Set `BYPIXEL_REPO_USER` and `BYPIXEL_REPO_TOKEN` in GitHub Actions for Maven publishing.
 Use the Reposilite token name as the user and its secret as the token. Give the token read and
@@ -259,7 +275,8 @@ npm publish --registry=https://registry.npmjs.org --access public --tag bootstra
 ```
 
 Approve the npm 2FA prompt. The package manifest uses version `0.0.0` for this local publish.
-The `bootstrap` tag keeps `latest` and the first stable version free for GitHub Actions.
+The initial npm publication may also appear under `latest`. The stable workflow updates `latest`
+when it publishes the first stable release.
 
 In the npm package settings under **Trusted Publisher**, choose **GitHub Actions** and enter
 organization or user `byPixelTV`, repository `kvstore`, and workflow filename `release.yml`.
@@ -276,3 +293,7 @@ isolated KVStore instance. The second command also needs JDK 21 and Node.js 24.
 go test -race ./...
 bash scripts/test-sdks.sh 0.1.0 "$PWD/tmp/sdk-packages"
 ```
+
+## License
+
+KVStore is available under the [MIT License](LICENSE).
