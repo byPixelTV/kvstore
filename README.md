@@ -93,7 +93,7 @@ repositories {
     maven("https://repo.bypixel.dev/releases/")
 }
 dependencies {
-    implementation("dev.bypixel:kvstore:1.0.0")
+    implementation("dev.bypixel:kvstore:1.1.0")
 }
 ```
 
@@ -131,7 +131,7 @@ Pass a custom `Json` instance to reuse application serializers.
 ### Go
 
 ```sh
-go get github.com/byPixelTV/kvstore/sdk/go@v1.0.0
+go get github.com/byPixelTV/kvstore/sdk/go@v1.1.0
 ```
 
 ```go
@@ -197,6 +197,23 @@ Revisions and expiration timestamps in TypeScript responses are decimal strings 
   and scans. Handle TTL locally if displaying state from a change stream.
 - `BatchWrite` groups ordered writes atomically within a shard. Check every result for a
   multi-shard batch. A transport failure can leave the write outcome unknown.
+
+### Conditional transactions
+
+`Transact` checks observed revisions or exact bytes and commits all requested writes atomically,
+including across routed Raft groups. Revision zero matches absent or expired records. Use
+strong reads for observed revisions. A response with `committed=false` means the checks or
+transaction deadline prevented the commit. After an ambiguous transport error, repeat the exact
+request with the same ID to resolve its durable outcome.
+
+Each request supports up to 4,096 checks and 4,096 ordered writes, subject to the 2 MiB request and
+3 MiB coordinator encoding limits. Deploy transaction-capable voters before starting the new
+router. As with live resharding, only one router may serve writes while routing ownership changes.
+
+The Go client includes an owner-checked `WithKeyLock` helper that renews a lease while the
+callback runs. Use its context for writes made through the transaction helper so the lease
+owner is checked at commit. API keys or client certificates using the helper need read and write
+grants on the `kvstore-leases` namespace in addition to the relevant data namespaces.
 
 ## Deployment
 
@@ -286,7 +303,7 @@ isolated KVStore instance. The second command also needs JDK 21 and Node.js 24.
 
 ```sh
 go test -race ./...
-bash scripts/test-sdks.sh 1.0.0 "$PWD/tmp/sdk-packages"
+bash scripts/test-sdks.sh 1.1.0 "$PWD/tmp/sdk-packages"
 ```
 
 ## License

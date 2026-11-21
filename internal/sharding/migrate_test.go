@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	kvstorev1 "github.com/byPixelTV/kvstore/gen/go/kvstore/v1"
+	"github.com/byPixelTV/kvstore/internal/transaction"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -33,6 +34,16 @@ type memShard struct {
 
 func newMemShard() *memShard {
 	return &memShard{data: map[string]memRecord{}, sealed: map[slotKey]bool{}}
+}
+func (s *memShard) ControlTransaction(_ context.Context, req *kvstorev1.TransactionControlRequest, _ ...grpc.CallOption) (*kvstorev1.TransactionControlResponse, error) {
+	var control transaction.Control
+	if err := json.Unmarshal(req.GetPayload(), &control); err != nil {
+		return nil, err
+	}
+	if control.Action != transaction.Current {
+		return nil, status.Error(codes.Unimplemented, "migration fixture only exposes transaction status")
+	}
+	return &kvstorev1.TransactionControlResponse{Payload: []byte("{}")}, nil
 }
 func memKey(ns, key string) string { return ns + "\x00" + key }
 func (s *memShard) Get(_ context.Context, req *kvstorev1.GetRequest, _ ...grpc.CallOption) (*kvstorev1.GetResponse, error) {

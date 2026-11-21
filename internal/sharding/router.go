@@ -19,6 +19,7 @@ import (
 	kvstorev1 "github.com/byPixelTV/kvstore/gen/go/kvstore/v1"
 	"github.com/byPixelTV/kvstore/internal/access"
 	"github.com/byPixelTV/kvstore/internal/healthcheck"
+	"github.com/byPixelTV/kvstore/internal/transaction"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -29,21 +30,23 @@ import (
 )
 
 // Router is a stateless, version-pinned routing gateway. Each shard is a
-// separate THREE-voter Raft cluster, NOT three replicas of one Raft log.
-// The router never persists data, allocates revisions or retries writes.
+// separate three-voter Raft cluster. Shards persist data and allocate
+// revisions. Only the idempotent transaction controls are replayed.
 type Router struct {
 	kvstorev1.UnimplementedKVStoreServer
-	groups             [ShardCount]*group
-	ready              atomic.Bool
-	routing            atomic.Pointer[routingState]
-	clusterFingerprint string
-	slotGates          sync.Map
-	migrationMu        sync.Mutex
-	epochMu            sync.Mutex
-	epochChange        chan struct{}
-	loaded             atomic.Bool
-	unresolved         atomic.Bool
-	fenceToken         string
+	groups                [ShardCount]*group
+	ready                 atomic.Bool
+	routing               atomic.Pointer[routingState]
+	clusterFingerprint    string
+	slotGates             sync.Map
+	migrationMu           sync.Mutex
+	uncertainRegistration *transaction.Plan
+	transactionWatch      atomic.Pointer[transactionWatchPause]
+	epochMu               sync.Mutex
+	epochChange           chan struct{}
+	loaded                atomic.Bool
+	unresolved            atomic.Bool
+	fenceToken            string
 }
 
 type group struct {
@@ -397,9 +400,12 @@ func ServeRouter() error {
 	for {
 		if e := router.Refresh(bootCtx); e == nil {
 			if e = router.LoadRouting(bootCtx); e == nil {
+				e = router.recoverTransactions(bootCtx)
+			}
+			if e == nil {
 				break
 			}
-			slog.Warn("router routing metadata unavailable", "error", e)
+			slog.Warn("router routing or transaction state unavailable", "error", e)
 		}
 		if err := bootCtx.Err(); err != nil {
 			return fmt.Errorf("router not ready to load routing metadata: %w", err)
@@ -454,6 +460,9 @@ func ServeRouter() error {
 			checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 			_ = router.Refresh(checkCtx)
 			cancel()
+			if e := router.recoverTransactions(ctx); e != nil {
+				slog.Warn("router transaction recovery incomplete", "error", e)
+			}
 			state := healthpb.HealthCheckResponse_NOT_SERVING
 			if router.Ready() {
 				state = healthpb.HealthCheckResponse_SERVING

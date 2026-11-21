@@ -53,6 +53,7 @@ tasks.test {
 sourceSets.main {
     proto.srcDir("../../api/proto")
     proto.include("kvstore/v1/kvstore.proto")
+    proto.include("kvstore/v1/console.proto")
 }
 
 protobuf {

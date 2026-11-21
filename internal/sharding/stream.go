@@ -172,6 +172,11 @@ func (r *Router) Watch(req *kvstorev1.WatchRequest, stream grpc.ServerStreamingS
 			if e.err != nil {
 				return fmt.Errorf("shard %d watch: %w", e.shard, e.err)
 			}
+			// Wait after observing the shard event. A transaction may have
+			// committed its first participant but not reached the last one yet.
+			if err := r.waitTransactionWatch(ctx); err != nil {
+				return err
+			}
 			if r.current().Epoch != epoch {
 				return status.Error(codes.FailedPrecondition, "shard ownership changed; rescan required")
 			}

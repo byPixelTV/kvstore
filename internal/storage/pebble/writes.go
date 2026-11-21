@@ -11,6 +11,7 @@ import (
 
 	"github.com/byPixelTV/kvstore/internal/changefeed"
 	"github.com/byPixelTV/kvstore/internal/storage"
+	"github.com/byPixelTV/kvstore/internal/transaction"
 	pebbledb "github.com/cockroachdb/pebble/v2"
 )
 
@@ -37,40 +38,46 @@ type writeRequest struct {
 	expiresAtUnixMS int64
 	reply           chan writeResponse
 	operations      []storage.WriteOperation
+	transaction     *transaction.Plan
 }
 
 type writeResponse struct {
 	revision  uint64
 	revisions []uint64
+	outcome   transaction.Outcome
 	err       error
 }
 
-// submit never loses an accepted write during Close: the gate's read lock
-// prevents Close from closing the queue while a sender is still enqueuing.
-// A canceled request already enqueued may still commit; like raft.Apply,
-// canceled or timed-out writes must be treated as outcome-unknown.
 func (s *Store) submit(ctx context.Context, kind writeKind, namespace, key string, value []byte, expiresAtUnixMS int64) (uint64, error) {
+	result := s.submitRequest(writeRequest{ctx: ctx, kind: kind, namespace: namespace, key: key, value: value, expiresAtUnixMS: expiresAtUnixMS})
+	return result.revision, result.err
+}
+
+// submitRequest holds the gate while enqueuing so Close drains accepted work.
+// An enqueued request may still commit after the caller cancels.
+func (s *Store) submitRequest(req writeRequest) writeResponse {
+	ctx := req.ctx
 	if err := ctx.Err(); err != nil {
-		return 0, err
+		return writeResponse{err: err}
 	}
-	req := writeRequest{ctx: ctx, kind: kind, namespace: namespace, key: key, value: value, expiresAtUnixMS: expiresAtUnixMS, reply: make(chan writeResponse, 1)}
+	req.reply = make(chan writeResponse, 1)
 	s.gate.RLock()
 	if s.closed {
 		s.gate.RUnlock()
-		return 0, ErrStoreClosed
+		return writeResponse{err: ErrStoreClosed}
 	}
 	select {
 	case s.writeQueue <- req:
 		s.gate.RUnlock()
 	case <-ctx.Done():
 		s.gate.RUnlock()
-		return 0, ctx.Err()
+		return writeResponse{err: ctx.Err()}
 	}
 	select {
 	case response := <-req.reply:
-		return response.revision, response.err
+		return response
 	case <-ctx.Done():
-		return 0, ctx.Err()
+		return writeResponse{err: ctx.Err()}
 	}
 }
 
@@ -99,25 +106,8 @@ func (s *Store) BatchWrite(ctx context.Context, operations []storage.WriteOperat
 		op.Value = bytes.Clone(op.Value)
 		copyOps[i] = op
 	}
-	req := writeRequest{ctx: ctx, operations: copyOps, reply: make(chan writeResponse, 1)}
-	s.gate.RLock()
-	if s.closed {
-		s.gate.RUnlock()
-		return nil, ErrStoreClosed
-	}
-	select {
-	case s.writeQueue <- req:
-		s.gate.RUnlock()
-	case <-ctx.Done():
-		s.gate.RUnlock()
-		return nil, ctx.Err()
-	}
-	select {
-	case result := <-req.reply:
-		return result.revisions, result.err
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
+	result := s.submitRequest(writeRequest{ctx: ctx, operations: copyOps})
+	return result.revisions, result.err
 }
 
 func (s *Store) writeLoop() {
@@ -157,7 +147,7 @@ func (s *Store) writeLoop() {
 }
 
 // applyGroup is the only mutation writer. Every accepted operation is evaluated
-// sequentially against an in-batch shadow map, not against stale DB state.
+// sequentially against the effects of earlier writes in the group.
 // One WAL sync durably publishes all successful operations and their feed
 // records; replies are sent only AFTER that sync completes.
 func (s *Store) applyGroup(group []writeRequest) {
@@ -173,11 +163,12 @@ func (s *Store) applyGroup(group []writeRequest) {
 		}
 		return
 	}
-	batch := s.db.NewBatch()
+	batch := s.newWriteBatch(group)
 	shadow := make(map[string]bool, len(group))
 	writer := changefeed.NewBatchWriter(s.db, batch, s.oldest, s.historyBytes, true)
 	next := s.revision
 	changed := false
+	receiptsWritten := false
 	var batchErr error
 
 	for i, req := range group {
@@ -186,7 +177,23 @@ func (s *Store) applyGroup(group []writeRequest) {
 			continue
 		}
 		ops := req.operations
-		if ops == nil {
+		if req.transaction != nil {
+			outcome, staged, err := stageLocalTransaction(batch, req.transaction, time.Now().UnixMilli())
+			if errors.Is(err, errTransactionIDConflict) {
+				results[i].err = err
+				continue
+			}
+			if err != nil {
+				batchErr = err
+				break
+			}
+			results[i].outcome = outcome
+			receiptsWritten = receiptsWritten || staged
+			if !staged || outcome != transaction.Committed {
+				continue
+			}
+			ops = req.transaction.Parts[0].Writes
+		} else if ops == nil {
 			ops = []storage.WriteOperation{{Namespace: req.namespace, Key: req.key, Value: req.value, Delete: req.kind == deleteKind, ExpiresAtUnixMS: req.expiresAtUnixMS}}
 		}
 		revisions := make([]uint64, len(ops))
@@ -239,6 +246,9 @@ func (s *Store) applyGroup(group []writeRequest) {
 		if batchErr != nil {
 			break
 		}
+		if req.transaction != nil {
+			continue
+		}
 		if req.operations != nil {
 			results[i].revisions = revisions
 		} else {
@@ -254,10 +264,10 @@ func (s *Store) applyGroup(group []writeRequest) {
 		var encoded [8]byte
 		binary.BigEndian.PutUint64(encoded[:], next)
 		batchErr = batch.Set(revisionKey, encoded[:], nil)
-		if batchErr == nil {
-			commitAttempted = true
-			batchErr = batch.Commit(pebbledb.Sync)
-		}
+	}
+	if batchErr == nil && (changed || receiptsWritten) {
+		commitAttempted = true
+		batchErr = batch.Commit(pebbledb.Sync)
 	}
 	_ = batch.Close()
 	if batchErr != nil {

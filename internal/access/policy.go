@@ -134,6 +134,18 @@ func (g namespaceGrants) allows(req any) bool {
 			}
 		}
 		return true
+	case *kvstorev1.TransactionRequest:
+		for _, check := range req.GetChecks() {
+			if !g.canRead(check.GetNamespace()) {
+				return false
+			}
+		}
+		for _, op := range req.GetOperations() {
+			if !g.canWrite(op.GetNamespace()) {
+				return false
+			}
+		}
+		return g.hasNamespaceAccess()
 	case *kvstorev1.HeadRequest:
 		return g.head
 	case *kvstorev1.ScanRequest:

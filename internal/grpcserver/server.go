@@ -12,6 +12,7 @@ import (
 	kvstorev1 "github.com/byPixelTV/kvstore/gen/go/kvstore/v1"
 	"github.com/byPixelTV/kvstore/internal/kvstore"
 	"github.com/byPixelTV/kvstore/internal/storage"
+	"github.com/byPixelTV/kvstore/internal/transaction"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -19,8 +20,10 @@ import (
 
 type Server struct {
 	kvstorev1.UnimplementedKVStoreServer
-	service *kvstore.Service
-	fence   interface {
+	service                 *kvstore.Service
+	transactions            transaction.Backend
+	allowTransactionControl bool
+	fence                   interface {
 		FenceSlot(context.Context, string, uint16, bool) error
 	}
 }

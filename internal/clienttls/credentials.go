@@ -22,6 +22,14 @@ func (o Options) Credentials() (credentials.TransportCredentials, error) {
 	if !o.Enabled() {
 		return insecure.NewCredentials(), nil
 	}
+	cfg, err := o.Config()
+	if err != nil {
+		return nil, err
+	}
+	return credentials.NewTLS(cfg), nil
+}
+
+func (o Options) Config() (*tls.Config, error) {
 	if (o.Cert == "") != (o.Key == "") {
 		return nil, errors.New("TLS client authentication requires both -tls-cert and -tls-key")
 	}
@@ -43,5 +51,5 @@ func (o Options) Credentials() (credentials.TransportCredentials, error) {
 		}
 		cfg.Certificates = []tls.Certificate{pair}
 	}
-	return credentials.NewTLS(cfg), nil
+	return cfg, nil
 }

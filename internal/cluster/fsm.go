@@ -16,6 +16,7 @@ import (
 	"github.com/byPixelTV/kvstore/internal/changefeed"
 	"github.com/byPixelTV/kvstore/internal/sharding"
 	"github.com/byPixelTV/kvstore/internal/storage"
+	"github.com/byPixelTV/kvstore/internal/transaction"
 	"github.com/cockroachdb/pebble/v2"
 	"github.com/hashicorp/raft"
 	"google.golang.org/grpc/codes"
@@ -40,8 +41,9 @@ const (
 	opBatch  = "batch"
 	// Each operation in a microbatch belongs to an independent point RPC.
 	// A migration fence must reject only the affected request, not its peers.
-	opMicrobatch = "microbatch"
-	opFence      = "slot-fence"
+	opMicrobatch  = "microbatch"
+	opFence       = "slot-fence"
+	opTransaction = "transaction"
 )
 
 type peerInfo struct {
@@ -52,15 +54,16 @@ type peerInfo struct {
 }
 
 type command struct {
-	Operation       string    `json:"op"`
-	Namespace       string    `json:"namespace,omitempty"`
-	Key             string    `json:"key,omitempty"`
-	Value           []byte    `json:"value,omitempty"`
-	ExpiresAtUnixMS int64     `json:"expires_at_unix_ms,omitempty"`
-	Peer            *peerInfo `json:"peer,omitempty"`
-	Commands        []command `json:"commands,omitempty"`
-	Slot            uint32    `json:"slot,omitempty"`
-	Sealed          bool      `json:"sealed,omitempty"`
+	Operation       string               `json:"op"`
+	Namespace       string               `json:"namespace,omitempty"`
+	Key             string               `json:"key,omitempty"`
+	Value           []byte               `json:"value,omitempty"`
+	ExpiresAtUnixMS int64                `json:"expires_at_unix_ms,omitempty"`
+	Peer            *peerInfo            `json:"peer,omitempty"`
+	Commands        []command            `json:"commands,omitempty"`
+	Slot            uint32               `json:"slot,omitempty"`
+	Sealed          bool                 `json:"sealed,omitempty"`
+	Transaction     *transaction.Control `json:"transaction,omitempty"`
 }
 
 func (cmd command) isWrite() bool {
@@ -83,6 +86,7 @@ type applyResult struct {
 	Errors         []error
 	BatchRevisions [][]uint64 // only populated for nested BatchWrite children
 	Err            error
+	Transaction    transaction.Reply
 }
 
 // FSM is the replicated Pebble state machine. All writes must come from Raft,
@@ -92,6 +96,7 @@ type FSM struct {
 	readMu       sync.RWMutex
 	published    *pebble.Snapshot
 	readFailure  error // guarded by readMu; GET never waits behind Pebble fsync
+	readIntent   *participantIntent
 	db           *pebble.DB
 	revision     uint64
 	applied      uint64
@@ -100,6 +105,7 @@ type FSM struct {
 	historyBytes uint64
 	notifier     changefeed.Notifier
 	sealed       map[sealID]bool
+	transactions transactionMetadata
 	failed       error
 	metrics      fsmApplyMetrics
 }
@@ -154,6 +160,7 @@ func openFSM(path string) (*FSM, error) {
 	// Publish only already-durable data. Raft Apply swaps this snapshot
 	// after the synchronous Pebble commit has succeeded.
 	f.published = db.NewSnapshot()
+	f.readIntent = f.transactions.participant
 	return f, nil
 }
 
@@ -232,7 +239,7 @@ func (f *FSM) refreshMeta() error {
 		return err
 	}
 	f.sealed = sealed
-	return nil
+	return f.refreshTransactions()
 }
 
 func (f *FSM) Close() error {
@@ -308,6 +315,9 @@ func (f *FSM) Get(ctx context.Context, ns, key string) (storage.Record, bool, er
 	}
 	if f.published == nil {
 		return storage.Record{}, false, errors.New("cluster FSM closed")
+	}
+	if f.readIntent.holdsKey(ns, key) {
+		return storage.Record{}, false, preparedTransactionError()
 	}
 	raw, closer, err := f.published.Get(encodeRecordKey(ns, key))
 	if errors.Is(err, pebble.ErrNotFound) {
@@ -385,7 +395,7 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
 	batch := f.db.NewBatch()
 	defer batch.Close()
 	history := changefeed.NewBatchWriter(f.db, batch, f.oldest, f.historyBytes, f.hasFloor)
-	shadow := make(map[string]bool, len(logs))
+	shadow := make(map[string]stagedRecord, len(logs))
 	stagedSeals := make(map[sealID]bool)
 	isSealed := func(c command) bool {
 		if len(f.sealed) == 0 && len(stagedSeals) == 0 {
@@ -399,6 +409,16 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
 	}
 	nextRevision, nextApplied := f.revision, f.applied
 	changed := false
+	txn := transactionBatch{db: f.db, batch: batch, transactionMetadata: f.transactions, isSealed: isSealed, shadow: shadow}
+	writeBlock := func(c command) error {
+		if isSealed(c) {
+			return status.Error(codes.FailedPrecondition, "write rejected by replicated migration fence; refresh routing")
+		}
+		if txn.participant.holdsKey(c.Namespace, c.Key) {
+			return preparedTransactionError()
+		}
+		return nil
+	}
 
 	// Process each logical write in Raft log order, including multiple
 	// commands packed into one log. A same-key delete must see earlier
@@ -413,7 +433,8 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
 			encoded := encodeRecordKey(cmd.Namespace, cmd.Key)
 			key := string(encoded)
 			if cmd.Operation == opDelete {
-				exists, known := shadow[key]
+				staged, known := shadow[key]
+				exists := staged.exists
 				if !known {
 					_, closer, err := f.db.Get(encoded)
 					switch {
@@ -440,10 +461,10 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
 			var err error
 			if cmd.Operation != opDelete {
 				err = batch.Set(encoded, storage.EncodeRecord(cmd.Value, revision, cmd.ExpiresAtUnixMS), nil)
-				shadow[key] = true
+				shadow[key] = stagedRecord{exists: true, record: storage.Record{Value: cmd.Value, Revision: revision, ExpiresAtUnixMS: cmd.ExpiresAtUnixMS}}
 			} else {
 				err = batch.Delete(encoded, nil)
-				shadow[key] = false
+				shadow[key] = stagedRecord{}
 			}
 			if err != nil {
 				return 0, err
@@ -534,15 +555,13 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
 			batchRevisions := make([][]uint64, len(cmd.Commands))
 			for j, item := range cmd.Commands {
 				if item.Operation == opBatch {
-					blocked := false
 					for _, nested := range item.Commands {
-						if isSealed(nested) {
-							blocked = true
+						if err := writeBlock(nested); err != nil {
+							itemErrors[j] = err
 							break
 						}
 					}
-					if blocked {
-						itemErrors[j] = status.Error(codes.FailedPrecondition, "write rejected by replicated migration fence; refresh routing")
+					if itemErrors[j] != nil {
 						continue
 					}
 					batchRevisions[j] = make([]uint64, len(item.Commands))
@@ -555,8 +574,8 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
 					}
 					continue
 				}
-				if isSealed(item) {
-					itemErrors[j] = status.Error(codes.FailedPrecondition, "write rejected by replicated migration fence; refresh routing")
+				if err := writeBlock(item); err != nil {
+					itemErrors[j] = err
 					continue
 				}
 				rev, err := applyOne(item)
@@ -571,17 +590,17 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
 				return fail(errors.New("invalid raft command batch size"))
 			}
 			revisions := make([]uint64, len(cmd.Commands))
-			blocked := false
+			var blocked error
 			for _, item := range cmd.Commands {
 				if !item.isWrite() {
 					return fail(fmt.Errorf("invalid batched operation %q", item.Operation))
 				}
-				if isSealed(item) {
-					blocked = true
+				if err := writeBlock(item); err != nil && blocked == nil {
+					blocked = err
 				}
 			}
-			if blocked {
-				responses[i] = applyResult{Err: status.Error(codes.FailedPrecondition, "write rejected by replicated migration fence; refresh routing")}
+			if blocked != nil {
+				responses[i] = applyResult{Err: blocked}
 				nextApplied = log.Index
 				continue
 			}
@@ -593,9 +612,23 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
 				revisions[j] = rev
 			}
 			responses[i] = applyResult{Revisions: revisions}
+		} else if cmd.Operation == opTransaction {
+			reply, err := txn.apply(log.Index, cmd.Transaction, applyOne)
+			if _, expected := status.FromError(err); err != nil && !expected {
+				return fail(err)
+			}
+			responses[i] = applyResult{Transaction: reply, Err: err}
 		} else {
-			if cmd.isWrite() && isSealed(cmd) {
-				responses[i] = applyResult{Err: status.Error(codes.FailedPrecondition, "write rejected by replicated migration fence; refresh routing")}
+			if cmd.isWrite() {
+				if err := writeBlock(cmd); err != nil {
+					responses[i] = applyResult{Err: err}
+					nextApplied = log.Index
+					continue
+				}
+			}
+			if cmd.Operation == opFence && cmd.Sealed && cmd.Slot < sharding.SlotCount &&
+				txn.participant.holdsSlot(sealID{cmd.Namespace, uint16(cmd.Slot)}) {
+				responses[i] = applyResult{Err: preparedTransactionError()}
 				nextApplied = log.Index
 				continue
 			}
@@ -628,6 +661,8 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
 	commitDuration := time.Since(commitStarted)
 	logicalWrites := nextRevision - f.revision
 	f.applied = nextApplied
+	intentChanged := f.transactions.participant != txn.participant
+	f.transactions = txn.transactionMetadata
 	for id, sealed := range stagedSeals {
 		if sealed {
 			f.sealed[id] = true
@@ -635,19 +670,22 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
 			delete(f.sealed, id)
 		}
 	}
-	if changed {
+	if changed || intentChanged {
 		// Do not publish until Pebble.Sync is complete. Acquire readMu only
 		// for the snapshot swap; outstanding readers finish before old.Close.
 		newRead := f.db.NewSnapshot()
 		f.readMu.Lock()
 		oldRead := f.published
 		f.published = newRead
+		f.readIntent = f.transactions.participant
 		f.readMu.Unlock()
 		// The write lock guarantees that no previous reader still uses
 		// oldRead. Close it OUTSIDE the read lock to minimize GET tail latency.
 		if oldRead != nil {
 			_ = oldRead.Close()
 		}
+	}
+	if changed {
 		f.revision = nextRevision
 		f.oldest, f.historyBytes = history.State()
 		f.hasFloor = true
@@ -777,6 +815,7 @@ func (f *FSM) Restore(reader io.ReadCloser) error {
 	f.readMu.Lock()
 	oldRead := f.published
 	f.published = newRead
+	f.readIntent = f.transactions.participant
 	f.readFailure = nil
 	f.readMu.Unlock()
 	if oldRead != nil {
@@ -814,6 +853,10 @@ func (f *FSM) ScanNamespace(ctx context.Context, namespace string, emit func(sto
 		err := f.failed
 		f.mu.RUnlock()
 		return err
+	}
+	if f.transactions.participant.holdsNamespace(namespace) {
+		f.mu.RUnlock()
+		return preparedTransactionError()
 	}
 	snapshot := f.db.NewSnapshot()
 	head := f.revision

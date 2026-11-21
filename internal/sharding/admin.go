@@ -15,6 +15,8 @@ import (
 
 	kvstorev1 "github.com/byPixelTV/kvstore/gen/go/kvstore/v1"
 	"github.com/byPixelTV/kvstore/internal/monitoring"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 type migrateRequest struct {
@@ -40,6 +42,9 @@ func (r *Router) RecoverSlot(ctx context.Context, namespace string, slot uint16)
 	}
 	r.migrationMu.Lock()
 	defer r.migrationMu.Unlock()
+	if err := r.recoverTransactionLocked(ctx); err != nil {
+		return status.Errorf(codes.Unavailable, "recover outstanding transaction before slot recovery: %v", err)
+	}
 	r.unresolved.Store(true)
 	r.ready.Store(false)
 	client, err := r.backend(0)

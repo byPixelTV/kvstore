@@ -14,6 +14,8 @@ import kotlinx.coroutines.flow.filterNot
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.onEach
 import kotlinx.serialization.json.Json
+import kvstore.v1.ConsoleGrpcKt.ConsoleCoroutineStub
+import kvstore.v1.ConsoleOuterClass.ListNamespacesRequest
 import kvstore.v1.KVStoreGrpcKt.KVStoreCoroutineStub
 import kvstore.v1.Kvstore.*
 import java.util.concurrent.TimeUnit.MILLISECONDS
@@ -50,13 +52,17 @@ class KVStoreClient private constructor(
     private val cacheTtlMillis: Long,
     private val maxCacheEntries: Int,
 ) : AutoCloseable {
-    private val stub = KVStoreCoroutineStub(channel).let { stub ->
-        if (apiKey.isNullOrEmpty()) stub else {
-            val headers = Metadata().apply {
-                put(Metadata.Key.of("authorization", Metadata.ASCII_STRING_MARSHALLER), "Bearer $apiKey")
-            }
-            stub.withInterceptors(MetadataUtils.newAttachHeadersInterceptor(headers))
+    private val authentication = apiKey?.takeIf { it.isNotEmpty() }?.let {
+        val headers = Metadata().apply {
+            put(Metadata.Key.of("authorization", Metadata.ASCII_STRING_MARSHALLER), "Bearer $it")
         }
+        MetadataUtils.newAttachHeadersInterceptor(headers)
+    }
+    private val stub = KVStoreCoroutineStub(channel).let { stub ->
+        authentication?.let { stub.withInterceptors(it) } ?: stub
+    }
+    private val console = ConsoleCoroutineStub(channel).let { stub ->
+        authentication?.let { stub.withInterceptors(it) } ?: stub
     }
 
     private data class Key(val namespace: String, val key: String)
@@ -121,6 +127,17 @@ class KVStoreClient private constructor(
     } finally {
         operations.forEach { invalidate(it.namespace, it.key) }
     }
+
+    /** Reuse the same request ID and input after an ambiguous transport failure. */
+    suspend fun transact(request: TransactionRequest): Boolean = try {
+        unary().transact(request).committed
+    } finally {
+        request.operationsList.forEach { invalidate(it.namespace, it.key) }
+    }
+
+    suspend fun listNamespaces(): List<String> =
+        console.withDeadlineAfter(timeoutMillis, MILLISECONDS)
+            .listNamespaces(ListNamespacesRequest.getDefaultInstance()).namespacesList
 
     suspend inline fun <reified T> get(namespace: String, key: String): T? {
         val response = read(namespace, key)

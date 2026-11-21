@@ -24,6 +24,7 @@ import (
 	"github.com/byPixelTV/kvstore/internal/sharding"
 	"github.com/byPixelTV/kvstore/internal/storage"
 	pebblestore "github.com/byPixelTV/kvstore/internal/storage/pebble"
+	"github.com/byPixelTV/kvstore/internal/transaction"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/health"
@@ -95,6 +96,7 @@ func run() (runErr error) {
 		return errors.New("API keys and native gRPC TLS require standalone or router mode; use a private encrypted network for Raft voters")
 	}
 	var store storage.Store
+	var transactional transaction.Backend
 	var node *cluster.Node
 	var listNamespaces func(context.Context) ([]string, error)
 	grpcOptions := endpoint.ServerOptions()
@@ -108,6 +110,7 @@ func run() (runErr error) {
 			return fmt.Errorf("start cluster admin listener: %w", err)
 		}
 		store = node
+		transactional = node
 		listNamespaces = node.ListNamespaces
 	} else {
 		persistent, openErr := pebblestore.OpenWithOptions(cfg.DataDir, pebblestore.Options{BatchWindow: cfg.WriteBatchWindow, BatchMax: cfg.WriteBatchMax})
@@ -116,6 +119,7 @@ func run() (runErr error) {
 		}
 		defer func() { runErr = errors.Join(runErr, persistent.Close()) }()
 		store = persistent
+		transactional = persistent
 		listNamespaces = persistent.ListNamespaces
 		observe, stopMetrics, err := startStandaloneMetrics(persistent, cfg.DataDir)
 		if err != nil {
@@ -146,14 +150,15 @@ func run() (runErr error) {
 			}
 			// Replicated fences are privileged. Other public RPCs cannot toggle
 			// the write protection used by online migration.
-			if info.FullMethod == "/kvstore.v1.KVStore/FenceSlot" {
+			if info.FullMethod == kvstorev1.KVStore_FenceSlot_FullMethodName ||
+				info.FullMethod == kvstorev1.KVStore_ControlTransaction_FullMethodName {
 				md, ok := metadata.FromIncomingContext(ctx)
-				if !ok {
-					return nil, status.Error(codes.PermissionDenied, "fence operation requires authorization")
+				if !ok || cfg.JoinToken == "" {
+					return nil, status.Error(codes.PermissionDenied, "internal operation requires authorization")
 				}
 				auth := md.Get("authorization")
 				if len(auth) != 1 || subtle.ConstantTimeCompare([]byte(strings.TrimSpace(strings.TrimPrefix(auth[0], "Bearer "))), []byte(cfg.JoinToken)) != 1 || !strings.HasPrefix(auth[0], "Bearer ") {
-					return nil, status.Error(codes.PermissionDenied, "fence operation requires authorization")
+					return nil, status.Error(codes.PermissionDenied, "internal operation requires authorization")
 				}
 			}
 			// Topology is revealed only when a client explicitly opts into
@@ -172,9 +177,9 @@ func run() (runErr error) {
 	grpcServer := grpc.NewServer(grpcOptions...)
 	endpoint.RegisterConsole(grpcServer, listNamespaces)
 	if node != nil {
-		kvstorev1.RegisterKVStoreServer(grpcServer, grpcserver.New(service, node))
+		kvstorev1.RegisterKVStoreServer(grpcServer, grpcserver.New(service, node).WithTransactions(transactional, true))
 	} else {
-		kvstorev1.RegisterKVStoreServer(grpcServer, grpcserver.New(service))
+		kvstorev1.RegisterKVStoreServer(grpcServer, grpcserver.New(service).WithTransactions(transactional, false))
 	}
 	healthSrv := health.NewServer()
 	healthpb.RegisterHealthServer(grpcServer, healthSrv)

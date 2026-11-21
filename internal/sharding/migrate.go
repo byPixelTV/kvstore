@@ -16,9 +16,8 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// MigrationReport summarizes ONE namespace/slot transfer. There is no
-// cluster-wide atomic transaction across shards: source and target each use
-// their own Raft log, and the router's routing metadata is committed to shard 0.
+// MigrationReport summarizes one namespace/slot transfer. Source and target
+// each use their own Raft log, and routing metadata is committed to shard 0.
 type MigrationReport struct {
 	Namespace       string  `json:"namespace"`
 	Slot            uint16  `json:"slot"`
@@ -293,6 +292,12 @@ func (r *Router) MigrateSlot(ctx context.Context, namespace string, slot uint16,
 	}
 	r.migrationMu.Lock()
 	defer r.migrationMu.Unlock()
+	if err := r.checkRouteAvailable(); err != nil {
+		return report, err
+	}
+	if err := r.recoverTransactionLocked(ctx); err != nil {
+		return report, status.Errorf(codes.Unavailable, "recover outstanding transaction before slot migration: %v", err)
+	}
 	s := r.current()
 	sourceID := s.owner(namespace, slot)
 	if sourceID == targetShard {

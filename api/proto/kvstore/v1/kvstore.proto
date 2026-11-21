@@ -11,6 +11,10 @@ service KVStore {
   // Single shard: atomic; multi-shard: independent shard batches, per-item outcomes.
   // Clients MUST NOT blindly retry UNKNOWN_OUTCOME on a network failure.
   rpc BatchWrite(BatchWriteRequest) returns (BatchWriteResponse);
+  // Atomic conditional writes, including operations routed to multiple shards.
+  rpc Transact(TransactionRequest) returns (TransactionResponse);
+  // Private coordinator-to-voter transport, authenticated by the join token.
+  rpc ControlTransaction(TransactionControlRequest) returns (TransactionControlResponse);
   rpc Head(HeadRequest) returns (HeadResponse);
   rpc Watch(WatchRequest) returns (stream WatchResponse);
   rpc Scan(ScanRequest) returns (stream ScanResponse);
@@ -82,6 +86,32 @@ message BatchWriteResult {
 }
 message BatchWriteResponse { repeated BatchWriteResult results = 1; }
 
+message TransactionCheck {
+  string namespace = 1;
+  string key = 2;
+  oneof expected {
+    // Zero means the key is absent or expired.
+    uint64 revision = 3;
+    // An exact byte match requires a currently present value.
+    bytes value = 4;
+  }
+}
+
+message TransactionRequest {
+  // Reuse an ID only to resolve the outcome of the same exact request.
+  string request_id = 1;
+  repeated TransactionCheck checks = 2;
+  repeated BatchWriteOperation operations = 3;
+}
+
+message TransactionResponse {
+  // False means a definitively aborted transaction, with no mutations.
+  // A transport error may have an unknown outcome. Retry the same request ID.
+  bool committed = 1;
+}
+
+message TransactionControlRequest { bytes payload = 1; }
+message TransactionControlResponse { bytes payload = 1; }
 
 // On standalone and single-Raft: Head gives the authoritative revision.
 // Multi-Raft requires use_vector_cursor and returns cursor (revision=0).
