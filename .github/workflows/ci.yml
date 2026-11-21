@@ -14,6 +14,8 @@ jobs:
   test:
     name: Tests and checks
     runs-on: ubuntu-latest
+    outputs:
+      build_version: ${{ steps.version.outputs.build_version }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -25,7 +27,12 @@ jobs:
           cache-dependency-path: go.mod
 
       - name: Validate release version
+        id: version
         shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           set -euo pipefail
           version="$(cat VERSION)"
@@ -33,6 +40,12 @@ jobs:
             echo "VERSION must contain only MAJOR.MINOR.PATCH (e.g. 0.1.0)"
             exit 1
           fi
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            version="${version}-PR.${PR_NUMBER}"
+          elif [[ "$REF_NAME" == "nightly" ]]; then
+            version="${version}-SNAPSHOT"
+          fi
+          echo "build_version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Check go.mod / go.sum
         run: go mod tidy -diff
@@ -88,27 +101,18 @@ jobs:
         env:
           TARGET_OS: ${{ matrix.goos }}
           TARGET_ARCH: ${{ matrix.goarch }}
-          EVENT_NAME: ${{ github.event_name }}
-          REF_NAME: ${{ github.ref_name }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BUILD_VERSION: ${{ needs.test.outputs.build_version }}
         run: |
           set -euo pipefail
-          version="$(cat VERSION)"
-          if [[ "$EVENT_NAME" == "pull_request" ]]; then
-            version="${version}-PR.${PR_NUMBER}"
-          elif [[ "$REF_NAME" == "nightly" ]]; then
-            version="${version}-SNAPSHOT"
-          fi
-
           mkdir -p staging dist
           export GOOS="$TARGET_OS" GOARCH="$TARGET_ARCH" CGO_ENABLED=0
           suffix=""
           if [[ "$TARGET_OS" == "windows" ]]; then suffix=".exe"; fi
 
-          go build -trimpath -ldflags="-s -w -X main.version=$version" \
+          go build -trimpath -ldflags="-s -w -X main.version=$BUILD_VERSION" \
             -o "staging/kvstore${suffix}" ./cmd/kvstore
 
-          archive="kvstore-${version}-${TARGET_OS}-${TARGET_ARCH}"
+          archive="kvstore-${BUILD_VERSION}-${TARGET_OS}-${TARGET_ARCH}"
           if [[ "$TARGET_OS" == "windows" ]]; then
             (cd staging && zip -q -9 "../dist/${archive}.zip" "kvstore.exe")
           else
@@ -120,5 +124,102 @@ jobs:
         with:
           name: kvstore-${{ matrix.goos }}-${{ matrix.goarch }}
           path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  build-kvctl:
+    name: Build and smoke-test kvctl for ${{ matrix.goos }}
+    needs: test
+    runs-on: ${{ matrix.runner }}
+    env:
+      BUILD_VERSION: ${{ needs.test.outputs.build_version }}
+      TARGET_OS: ${{ matrix.goos }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            runner: ubuntu-latest
+            native_arch: amd64
+          - goos: darwin
+            runner: macos-15
+            native_arch: arm64
+          - goos: windows
+            runner: windows-latest
+            native_arch: amd64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Build and archive amd64 and arm64
+        shell: pwsh
+        env:
+          CGO_ENABLED: '0'
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $env:GOOS = $env:TARGET_OS
+          $isWindowsTarget = $env:TARGET_OS -eq 'windows'
+          $binary = $isWindowsTarget ? 'kvctl.exe' : 'kvctl'
+          New-Item -ItemType Directory -Path dist | Out-Null
+
+          foreach ($arch in 'amd64', 'arm64') {
+            $env:GOARCH = $arch
+            $stage = "staging/$arch"
+            $archive = "dist/kvctl-$env:BUILD_VERSION-$env:TARGET_OS-$arch"
+            New-Item -ItemType Directory -Path $stage | Out-Null
+            go build -trimpath "-ldflags=-s -w -X main.version=$env:BUILD_VERSION" -o "$stage/$binary" ./cmd/kvctl
+
+            if ($isWindowsTarget) {
+              Compress-Archive -LiteralPath "$stage/$binary" -DestinationPath "$archive.zip"
+            } else {
+              tar -C $stage -czf "$archive.tar.gz" $binary
+            }
+          }
+
+      - name: Smoke-test the native archive
+        shell: pwsh
+        timeout-minutes: 1
+        env:
+          NATIVE_ARCH: ${{ matrix.native_arch }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $archive = "dist/kvctl-$env:BUILD_VERSION-$env:TARGET_OS-$env:NATIVE_ARCH"
+          New-Item -ItemType Directory -Path smoke | Out-Null
+          if ($env:TARGET_OS -eq 'windows') {
+            Expand-Archive -LiteralPath "$archive.zip" -DestinationPath smoke
+            $binary = './smoke/kvctl.exe'
+          } else {
+            tar -C smoke -xzf "$archive.tar.gz"
+            $binary = './smoke/kvctl'
+          }
+          $actual = @(& $binary --version) -join "`n"
+          if ($actual -cne "kvctl $env:BUILD_VERSION") {
+            throw "Unexpected kvctl version: $actual"
+          }
+
+      - name: Smoke-test the Windows PowerShell demo
+        if: matrix.goos == 'windows'
+        shell: powershell
+        timeout-minutes: 5
+        run: .\scripts\start-kvctl-demo.ps1 -CheckOnly
+
+      - name: Upload amd64 CLI artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: kvctl-${{ matrix.goos }}-amd64
+          path: dist/*-amd64.*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload arm64 CLI artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: kvctl-${{ matrix.goos }}-arm64
+          path: dist/*-arm64.*
           if-no-files-found: error
           retention-days: 14

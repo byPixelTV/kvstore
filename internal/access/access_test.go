@@ -18,6 +18,8 @@ import (
 	"time"
 
 	kv "github.com/byPixelTV/kvstore/gen/go/kvstore/v1"
+	"github.com/byPixelTV/kvstore/internal/apikeys"
+	"github.com/byPixelTV/kvstore/internal/clienttls"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
@@ -143,10 +145,153 @@ func TestLoadRejectsInsecurePolicyAndMalformedLimit(t *testing.T) {
 		t.Fatal("policy without mTLS was accepted")
 	}
 	t.Setenv("KVSTORE_ACCESS_POLICY_FILE", "")
+	t.Setenv("KVSTORE_API_KEYS_DIR", t.TempDir())
+	t.Setenv("KVSTORE_TLS_CERT_FILE", "server.pem")
+	if _, err := Load(); err == nil {
+		t.Fatal("partial TLS configuration did not fail with API keys enabled")
+	}
+	t.Setenv("KVSTORE_TLS_CERT_FILE", "")
+	t.Setenv("KVSTORE_API_KEYS_DIR", "")
 	t.Setenv("KVSTORE_MAX_INFLIGHT_RPCS", "-1")
 	if _, err := Load(); err == nil {
 		t.Fatal("negative limit was accepted")
 	}
+}
+
+func TestPlaintextAPIKeyEndpoint(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("KVSTORE_API_KEYS_DIR", dir)
+	for _, name := range []string{"KVSTORE_TLS_CERT_FILE", "KVSTORE_TLS_KEY_FILE", "KVSTORE_TLS_CLIENT_CA_FILE", "KVSTORE_ACCESS_POLICY_FILE"} {
+		t.Setenv(name, "")
+	}
+	key := createTestKey(t, dir, apikeys.Key{Name: "reporting", Read: true, Namespaces: []string{"players"}})
+	target, service := serveTestEndpoint(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	client := func(options clienttls.Options, token string) kv.KVStoreClient {
+		dial, err := options.DialOptions(token)
+		if err != nil {
+			t.Fatal(err)
+		}
+		conn, err := grpc.NewClient(target, dial...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = conn.Close() })
+		return kv.NewKVStoreClient(conn)
+	}
+	request := &kv.GetRequest{Namespace: "players"}
+	_, err := client(clienttls.Options{}, "").Get(ctx, request)
+	requireCode(t, err, codes.Unauthenticated)
+	_, err = client(clienttls.Options{}, "invalid").Get(ctx, request)
+	requireCode(t, err, codes.Unauthenticated)
+	_, err = client(clienttls.Options{TLS: true}, key).Get(ctx, request)
+	requireCode(t, err, codes.Unavailable)
+	plain := client(clienttls.Options{}, key)
+	_, err = plain.Get(ctx, request)
+	requireCode(t, err, codes.OK)
+	_, err = plain.Get(ctx, &kv.GetRequest{Namespace: "other"})
+	requireCode(t, err, codes.PermissionDenied)
+	_, err = plain.BatchWrite(ctx, &kv.BatchWriteRequest{Operations: []*kv.BatchWriteOperation{{Namespace: "players"}}})
+	requireCode(t, err, codes.PermissionDenied)
+	if service.batches.Load() != 0 {
+		t.Fatal("denied batch reached storage")
+	}
+}
+
+func TestAPIKeyEndpoint(t *testing.T) {
+	dir := t.TempDir()
+	reader := createTestKey(t, dir, apikeys.Key{Name: "reporting", Read: true, Namespaces: []string{"players"}})
+	writer := createTestKey(t, dir, apikeys.Key{Name: "collector", Write: true, Namespaces: []string{"players"}})
+	t.Setenv("KVSTORE_API_KEYS_DIR", dir)
+	target, tlsConfig, service := startTestEndpoint(t, func() {
+		t.Setenv("KVSTORE_TLS_CLIENT_CA_FILE", "")
+		t.Setenv("KVSTORE_ACCESS_POLICY_FILE", "")
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	client := connect(t, target, tlsConfig("", false))
+	readCtx := metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+reader)
+	writeCtx := metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+writer)
+	get := func(ctx context.Context, ns string) error {
+		_, err := client.Get(ctx, &kv.GetRequest{Namespace: ns})
+		return err
+	}
+	requireCode(t, get(ctx, "players"), codes.Unauthenticated)
+	requireCode(t, get(metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer invalid"), "players"), codes.Unauthenticated)
+	requireCode(t, get(metadata.AppendToOutgoingContext(readCtx, "authorization", "Bearer "+reader), "players"), codes.Unauthenticated)
+	requireCode(t, get(readCtx, "players"), codes.OK)
+	requireCode(t, get(readCtx, "other"), codes.PermissionDenied)
+	requireCode(t, get(writeCtx, "players"), codes.PermissionDenied)
+	_, err := client.Head(readCtx, &kv.HeadRequest{})
+	requireCode(t, err, codes.OK)
+	_, err = client.Head(writeCtx, &kv.HeadRequest{})
+	requireCode(t, err, codes.PermissionDenied)
+
+	batch := &kv.BatchWriteRequest{Operations: []*kv.BatchWriteOperation{{Namespace: "players"}, {Namespace: "other"}}}
+	_, err = client.BatchWrite(writeCtx, batch)
+	requireCode(t, err, codes.PermissionDenied)
+	batch.Operations = batch.Operations[:1]
+	_, err = client.BatchWrite(readCtx, batch)
+	requireCode(t, err, codes.PermissionDenied)
+	_, err = client.BatchWrite(writeCtx, batch)
+	requireCode(t, err, codes.OK)
+	if count := service.batches.Load(); count != 1 {
+		t.Fatalf("%d batches reached storage, want 1", count)
+	}
+	watch, err := client.Watch(readCtx, &kv.WatchRequest{Namespace: "players"})
+	requireCode(t, err, codes.OK)
+	waitActive(t, ctx, service.streamActive)
+	if err := apikeys.Revoke(dir, "reporting"); err != nil {
+		t.Fatal(err)
+	}
+	_, err = watch.Recv()
+	requireCode(t, err, codes.Unauthenticated)
+	requireCode(t, get(readCtx, "players"), codes.Unauthenticated)
+
+	newReader := createTestKey(t, dir, apikeys.Key{Name: "reporting", Read: true})
+	newReadCtx := metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+newReader)
+	for {
+		err := get(newReadCtx, "other")
+		if err == nil {
+			break
+		}
+		requireCode(t, err, codes.Unauthenticated)
+		select {
+		case <-time.After(30 * time.Millisecond):
+		case <-ctx.Done():
+			t.Fatal("new key was not picked up")
+		}
+	}
+}
+
+func TestAPIKeyAndCertificateModesCoexist(t *testing.T) {
+	dir := t.TempDir()
+	key := createTestKey(t, dir, apikeys.Key{Name: "read all", Read: true})
+	t.Setenv("KVSTORE_API_KEYS_DIR", dir)
+	target, config, _ := startTestEndpoint(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	certClient := connect(t, target, config("spiffe://clients/reader", false))
+	request := &kv.GetRequest{Namespace: "players"}
+	_, err := certClient.Get(ctx, request)
+	requireCode(t, err, codes.OK)
+	_, err = certClient.Get(metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer invalid"), request)
+	requireCode(t, err, codes.Unauthenticated)
+	apiClient := connect(t, target, config("", false))
+	_, err = apiClient.Get(ctx, request)
+	requireCode(t, err, codes.Unauthenticated)
+	_, err = apiClient.Get(metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+key), request)
+	requireCode(t, err, codes.OK)
+}
+
+func createTestKey(t *testing.T, dir string, key apikeys.Key) string {
+	t.Helper()
+	secret, err := apikeys.Create(dir, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return secret
 }
 
 func requireCode(t *testing.T, err error, want codes.Code) {
@@ -165,7 +310,7 @@ func waitActive(t *testing.T, ctx context.Context, active <-chan struct{}) {
 	}
 }
 
-func startTestEndpoint(t *testing.T) (string, func(string, bool) *tls.Config, *testService) {
+func startTestEndpoint(t *testing.T, configure ...func()) (string, func(string, bool) *tls.Config, *testService) {
 	t.Helper()
 	ca, caKey, caPEM := newCertificate(t, nil, nil, 1, "")
 	wrong, wrongKey, _ := newCertificate(t, nil, nil, 2, "")
@@ -190,22 +335,13 @@ func startTestEndpoint(t *testing.T) (string, func(string, bool) *tls.Config, *t
 		{"uri":"spiffe://clients/player","read":["players"],"write":["players"],"allow_head":true},
 		{"uri":"spiffe://clients/reader","read":["players"]}
 	]}`)))
-	settings, err := Load()
-	if err != nil {
-		t.Fatal(err)
+	for _, apply := range configure {
+		apply()
 	}
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	service := &testService{unaryActive: make(chan struct{}), streamActive: make(chan struct{})}
-	server := grpc.NewServer(settings.ServerOptions()...)
-	kv.RegisterKVStoreServer(server, service)
-	go func() { _ = server.Serve(listener) }()
-	t.Cleanup(server.Stop)
+	target, service := serveTestEndpoint(t)
 	pool := x509.NewCertPool()
 	pool.AddCert(ca)
-	return listener.Addr().String(), func(uri string, untrusted bool) *tls.Config {
+	return target, func(uri string, untrusted bool) *tls.Config {
 		config := &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
 		if uri != "" {
 			parent, parentKey := ca, caKey
@@ -217,6 +353,28 @@ func startTestEndpoint(t *testing.T) (string, func(string, bool) *tls.Config, *t
 		}
 		return config
 	}, service
+}
+
+func serveTestEndpoint(t *testing.T) (string, *testService) {
+	t.Helper()
+	settings, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := &testService{unaryActive: make(chan struct{}), streamActive: make(chan struct{})}
+	server := grpc.NewServer(settings.ServerOptions()...)
+	kv.RegisterKVStoreServer(server, service)
+	settings.RegisterConsole(server, consoleTestNamespaces)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	settings.WatchAPIKeys(ctx)
+	go func() { _ = server.Serve(listener) }()
+	t.Cleanup(server.Stop)
+	return listener.Addr().String(), service
 }
 
 func connect(t *testing.T, target string, config *tls.Config) kv.KVStoreClient {

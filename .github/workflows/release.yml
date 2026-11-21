@@ -95,11 +95,29 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           CI_RUN_ID: ${{ github.event.workflow_run.id }}
+          BUILD_VERSION: ${{ steps.meta.outputs.build_version }}
         run: |
           set -euo pipefail
           gh run download "$CI_RUN_ID" --repo "$GITHUB_REPOSITORY" \
-            --pattern 'kvstore-*' --dir ./dist
-          test "$(find ./dist -type f | wc -l)" -eq 4
+            --pattern 'kvstore-*' --pattern 'kvctl-*' --dir ./dist
+
+          archives=(
+            kvstore-linux-amd64 kvstore-linux-arm64 kvstore-darwin-arm64 kvstore-windows-amd64
+            kvctl-linux-amd64 kvctl-linux-arm64 kvctl-darwin-amd64 kvctl-darwin-arm64
+            kvctl-windows-amd64 kvctl-windows-arm64
+          )
+          for artifact in "${archives[@]}"; do
+            family="${artifact%%-*}"
+            platform="${artifact#*-}"
+            extension=tar.gz
+            if [[ "$platform" == windows-* ]]; then extension=zip; fi
+            archive="./dist/$artifact/$family-$BUILD_VERSION-$platform.$extension"
+            if [[ ! -s "$archive" ]]; then
+              echo "Missing or empty archive: $archive" >&2
+              exit 1
+            fi
+          done
+          test "$(find ./dist -type f | wc -l)" -eq "${#archives[@]}"
 
       - name: Set up Docker Buildx
         if: steps.gate.outputs.publish == 'true'

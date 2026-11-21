@@ -2,6 +2,7 @@ package access
 
 import (
 	"context"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,8 +21,9 @@ import (
 type namespacePolicy map[string]namespaceGrants
 
 type namespaceGrants struct {
-	read, write map[string]bool
-	head        bool
+	read, write       map[string]bool
+	readAll, writeAll bool
+	head              bool
 }
 
 func loadPolicy(path string) (namespacePolicy, error) {
@@ -82,17 +84,21 @@ func namespaceSet(namespaces []string) (map[string]bool, error) {
 	return out, nil
 }
 
-func (p namespacePolicy) grants(ctx context.Context) (namespaceGrants, error) {
+func verifiedCertificate(ctx context.Context) *x509.Certificate {
 	client, ok := peer.FromContext(ctx)
 	if !ok {
-		return namespaceGrants{}, denied()
+		return nil
 	}
 	identity, ok := client.AuthInfo.(credentials.TLSInfo)
 	if !ok || len(identity.State.VerifiedChains) == 0 || len(identity.State.VerifiedChains[0]) == 0 {
-		return namespaceGrants{}, denied()
+		return nil
 	}
-	leaf := identity.State.VerifiedChains[0][0]
-	if len(leaf.URIs) != 1 {
+	return identity.State.VerifiedChains[0][0]
+}
+
+func (p namespacePolicy) grants(ctx context.Context) (namespaceGrants, error) {
+	leaf := verifiedCertificate(ctx)
+	if leaf == nil || len(leaf.URIs) != 1 {
 		return namespaceGrants{}, denied()
 	}
 	grants, ok := p[leaf.URIs[0].String()]
@@ -102,19 +108,28 @@ func (p namespacePolicy) grants(ctx context.Context) (namespaceGrants, error) {
 	return grants, nil
 }
 
+func (g namespaceGrants) canRead(namespace string) bool { return g.readAll || g.read[namespace] }
+
+func (g namespaceGrants) canWrite(namespace string) bool { return g.writeAll || g.write[namespace] }
+
+func (g namespaceGrants) hasNamespaceAccess() bool {
+	return g.readAll || g.writeAll || len(g.read) != 0 || len(g.write) != 0
+}
+
 func (g namespaceGrants) allows(req any) bool {
-	read := func(namespace string) bool { return g.read[namespace] }
-	write := func(namespace string) bool { return g.write[namespace] }
 	switch req := req.(type) {
 	case *kvstorev1.GetRequest:
-		return read(req.GetNamespace())
+		return g.canRead(req.GetNamespace())
 	case *kvstorev1.SetRequest:
-		return write(req.GetNamespace())
+		return g.canWrite(req.GetNamespace())
 	case *kvstorev1.DeleteRequest:
-		return write(req.GetNamespace())
+		return g.canWrite(req.GetNamespace())
 	case *kvstorev1.BatchWriteRequest:
+		if !g.writeAll && len(g.write) == 0 {
+			return false
+		}
 		for _, op := range req.GetOperations() {
-			if !write(op.GetNamespace()) {
+			if !g.canWrite(op.GetNamespace()) {
 				return false
 			}
 		}
@@ -122,9 +137,9 @@ func (g namespaceGrants) allows(req any) bool {
 	case *kvstorev1.HeadRequest:
 		return g.head
 	case *kvstorev1.ScanRequest:
-		return read(req.GetNamespace())
+		return g.canRead(req.GetNamespace())
 	case *kvstorev1.WatchRequest:
-		return read(req.GetNamespace())
+		return g.canRead(req.GetNamespace())
 	default:
 		return false
 	}
@@ -132,17 +147,31 @@ func (g namespaceGrants) allows(req any) bool {
 
 type authorizedStream struct {
 	grpc.ServerStream
+	ctx    context.Context
 	grants namespaceGrants
+	key    *activeAPIKey
 }
+
+func (s *authorizedStream) Context() context.Context { return s.ctx }
 
 func (s *authorizedStream) RecvMsg(req any) error {
 	if err := s.ServerStream.RecvMsg(req); err != nil {
 		return err
 	}
+	if s.key != nil && s.key.lifetime.Err() != nil {
+		return unauthenticated()
+	}
 	if !s.grants.allows(req) {
 		return denied()
 	}
 	return nil
+}
+
+func (s *authorizedStream) SendMsg(msg any) error {
+	if s.key != nil && s.key.lifetime.Err() != nil {
+		return unauthenticated()
+	}
+	return s.ServerStream.SendMsg(msg)
 }
 
 func denied() error { return status.Error(codes.PermissionDenied, "gRPC access policy denied request") }

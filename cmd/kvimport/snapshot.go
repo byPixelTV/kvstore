@@ -18,6 +18,7 @@ import (
 	"time"
 
 	kv "github.com/byPixelTV/kvstore/gen/go/kvstore/v1"
+	"github.com/byPixelTV/kvstore/internal/clienttls"
 )
 
 const legacySnapshotHeader = "KVSTORE-IMPORT-SNAPSHOT 1"
@@ -216,7 +217,7 @@ func loadSnapshot(ctx context.Context, input io.Reader) (snapshotManifest, snaps
 	return manifest, index, nil
 }
 
-func runSnapshot(ctx context.Context, path, addr string, apply, verify, showConflicts bool, ca, cert, key string) error {
+func runSnapshot(ctx context.Context, path, addr string, apply, verify, showConflicts bool, transport clienttls.Options) error {
 	input, err := os.Open(path)
 	if err != nil {
 		return err
@@ -231,7 +232,7 @@ func runSnapshot(ctx context.Context, path, addr string, apply, verify, showConf
 	if addr == "" {
 		return nil
 	}
-	conn, err := connectTarget(addr, ca, cert, key)
+	conn, err := connectTarget(addr, transport)
 	if err != nil {
 		return err
 	}

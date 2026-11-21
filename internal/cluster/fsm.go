@@ -821,3 +821,16 @@ func (f *FSM) ScanNamespace(ctx context.Context, namespace string, emit func(sto
 	defer snapshot.Close()
 	return changefeed.ScanSnapshot(ctx, snapshot, head, namespace, emit)
 }
+
+func (f *FSM) ListNamespaces(ctx context.Context) ([]string, error) {
+	f.mu.RLock()
+	if f.failed != nil {
+		err := f.failed
+		f.mu.RUnlock()
+		return nil, err
+	}
+	snapshot := f.db.NewSnapshot()
+	f.mu.RUnlock()
+	defer snapshot.Close()
+	return changefeed.ListNamespaces(ctx, snapshot)
+}

@@ -39,6 +39,12 @@ func main() {
 		case "--version", "-version":
 			fmt.Println("kvstore", version)
 			return
+		case "apikey":
+			if err := runAPIKey(os.Args[2:], os.Stdout, os.Stderr); err != nil {
+				slog.Error("API key command failed", "error", err)
+				os.Exit(1)
+			}
+			return
 		case "healthcheck":
 			if len(os.Args) > 3 {
 				slog.Error("usage: kvstore healthcheck [readiness|liveness]")
@@ -79,11 +85,12 @@ func run() (runErr error) {
 	if err != nil {
 		return err
 	}
-	if cfg.Mode == config.ModeCluster && endpoint.UsesTLS() {
-		return errors.New("native gRPC mTLS is supported in standalone and router mode; use a private encrypted network for Raft voters")
+	if cfg.Mode == config.ModeCluster && endpoint.UsesClientAuthentication() {
+		return errors.New("API keys and native gRPC TLS require standalone or router mode; use a private encrypted network for Raft voters")
 	}
 	var store storage.Store
 	var node *cluster.Node
+	var listNamespaces func(context.Context) ([]string, error)
 	grpcOptions := endpoint.ServerOptions()
 	if cfg.Mode == config.ModeCluster {
 		node, err = cluster.Open(cfg)
@@ -95,6 +102,7 @@ func run() (runErr error) {
 			return fmt.Errorf("start cluster admin listener: %w", err)
 		}
 		store = node
+		listNamespaces = node.ListNamespaces
 	} else {
 		persistent, openErr := pebblestore.OpenWithOptions(cfg.DataDir, pebblestore.Options{BatchWindow: cfg.WriteBatchWindow, BatchMax: cfg.WriteBatchMax})
 		if openErr != nil {
@@ -102,6 +110,7 @@ func run() (runErr error) {
 		}
 		defer func() { runErr = errors.Join(runErr, persistent.Close()) }()
 		store = persistent
+		listNamespaces = persistent.ListNamespaces
 		observe, stopMetrics, err := startStandaloneMetrics(persistent, cfg.DataDir)
 		if err != nil {
 			return err
@@ -155,6 +164,7 @@ func run() (runErr error) {
 		}))
 	}
 	grpcServer := grpc.NewServer(grpcOptions...)
+	endpoint.RegisterConsole(grpcServer, listNamespaces)
 	if node != nil {
 		kvstorev1.RegisterKVStoreServer(grpcServer, grpcserver.New(service, node))
 	} else {
@@ -178,6 +188,7 @@ func run() (runErr error) {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	endpoint.WatchAPIKeys(ctx)
 	if node != nil {
 		go node.RegisterSelf(ctx)
 		go node.JoinUntilMember(ctx)

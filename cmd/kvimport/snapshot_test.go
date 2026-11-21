@@ -13,6 +13,7 @@ import (
 	"time"
 
 	kv "github.com/byPixelTV/kvstore/gen/go/kvstore/v1"
+	"github.com/byPixelTV/kvstore/internal/clienttls"
 	"google.golang.org/grpc"
 )
 
@@ -172,18 +173,18 @@ func TestSnapshotRehearsalRouter(t *testing.T) {
 	if err := os.WriteFile(path, fixture, 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := runSnapshot(t.Context(), path, addr, false, true, false, "", "", ""); err == nil || err.Error() != "target differs from snapshot" {
+	if err := runSnapshot(t.Context(), path, addr, false, true, false, clienttls.Options{}); err == nil || err.Error() != "target differs from snapshot" {
 		t.Fatalf("expected missing-record failure before apply, got %v", err)
 	}
 	for range 2 {
-		if err := runSnapshot(t.Context(), path, addr, true, false, false, "", "", ""); err != nil {
+		if err := runSnapshot(t.Context(), path, addr, true, false, false, clienttls.Options{}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := runSnapshot(t.Context(), path, addr, false, true, false, "", "", ""); err != nil {
+	if err := runSnapshot(t.Context(), path, addr, false, true, false, clienttls.Options{}); err != nil {
 		t.Fatal(err)
 	}
-	conn, err := connectTarget(addr, "", "", "")
+	conn, err := connectTarget(addr, clienttls.Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -192,7 +193,7 @@ func TestSnapshotRehearsalRouter(t *testing.T) {
 	if _, err := client.Set(t.Context(), &kv.SetRequest{Namespace: namespace, Key: "extra", Value: []byte("extra")}); err != nil {
 		t.Fatal(err)
 	}
-	if err := runSnapshot(t.Context(), path, addr, false, true, false, "", "", ""); err == nil || err.Error() != "target differs from snapshot" {
+	if err := runSnapshot(t.Context(), path, addr, false, true, false, clienttls.Options{}); err == nil || err.Error() != "target differs from snapshot" {
 		t.Fatalf("expected extra-record failure, got %v", err)
 	}
 }
@@ -211,7 +212,7 @@ func TestSnapshotRehearsalTTL(t *testing.T) {
 	if err := os.WriteFile(file, snapshotFixture(t, make(map[string]struct{}), row), 0600); err != nil {
 		t.Fatal(err)
 	}
-	conn, err := connectTarget(addr, "", "", "")
+	conn, err := connectTarget(addr, clienttls.Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -225,7 +226,7 @@ func TestSnapshotRehearsalTTL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := runSnapshot(ctx, file, addr, true, false, false, "", "", ""); err != nil {
+	if err := runSnapshot(ctx, file, addr, true, false, false, clienttls.Options{}); err != nil {
 		t.Fatal(err)
 	}
 	request := &kv.GetRequest{Namespace: namespace, Key: row.Key}
@@ -245,7 +246,7 @@ func TestSnapshotRehearsalTTL(t *testing.T) {
 			break
 		}
 	}
-	if err := runSnapshot(ctx, file, addr, false, true, false, "", "", ""); err != nil {
+	if err := runSnapshot(ctx, file, addr, false, true, false, clienttls.Options{}); err != nil {
 		t.Fatal(err)
 	}
 	timer := time.NewTimer(time.Until(time.UnixMilli(deadline).Add(250 * time.Millisecond)))
@@ -259,7 +260,7 @@ func TestSnapshotRehearsalTTL(t *testing.T) {
 	if err != nil || reply.GetFound() {
 		t.Fatalf("value still visible after original deadline: %+v %v", reply, err)
 	}
-	if err := runSnapshot(ctx, file, addr, false, true, false, "", "", ""); err != nil {
+	if err := runSnapshot(ctx, file, addr, false, true, false, clienttls.Options{}); err != nil {
 		t.Fatal(err)
 	}
 }

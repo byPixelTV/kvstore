@@ -45,6 +45,8 @@ With a policy, match each client's URI SAN to its exact `read` and `write` names
 
 With only the TLS Secret, every client certified by the client CA can use the data API. Keep the policy Secret provisioned when enforcing namespace grants. Restart the TLS workloads after updating the certificate or policy Secrets. Grant `pods/portforward` only to authorized operators. Raft admin is restricted by NetworkPolicy to same-group voters and the scraper pods described below. Router admin accepts only designated scraper pods over the pod network. Raft and router admin operations require their own tokens. In the single-group profile, label private client pods in this namespace `app.kubernetes.io/component=kvstore-client` to allow port `50051`.
 
+To use named API keys, provision them off-cluster with `kvstore apikey` and project the registry directory as a Secret on the solo pod or all routers. Set `KVSTORE_API_KEYS_DIR` to the projected mount path in the site overlay. Mount the full Secret directory so Kubernetes can propagate updates. Set `KVSTORE_TLS_CLIENT_CA_FILE` to an empty value for API-key-only access and leave the certificate access policy unset. Keep the TLS server certificate mounted. Update the Secret after each creation or revocation. Propagation to all pods depends on Kubernetes Secret projection before KVStore's reload takes effect. [API key administration](../production.md#benannte-api-keys)
+
 ```sh
 profile=path/to/site/kustomization-dir
 kubectl kustomize "$profile"

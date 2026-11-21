@@ -39,7 +39,7 @@ func TestExternalHostRecovery(t *testing.T) {
 			t.Fatal("KVSTORE_HOST_TEST_WINDOW must be a positive duration")
 		}
 	}
-	creds, err := clienttls.Credentials(ca, cert, key)
+	creds, err := (clienttls.Options{CA: ca, Cert: cert, Key: key}).Credentials()
 	if err != nil {
 		t.Fatal(err)
 	}

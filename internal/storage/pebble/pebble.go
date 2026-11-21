@@ -236,3 +236,16 @@ func (s *Store) ScanNamespace(ctx context.Context, namespace string, emit func(s
 	defer snapshot.Close()
 	return changefeed.ScanSnapshot(ctx, snapshot, head, namespace, emit)
 }
+
+func (s *Store) ListNamespaces(ctx context.Context) ([]string, error) {
+	s.mu.RLock()
+	if s.failed != nil {
+		err := s.failed
+		s.mu.RUnlock()
+		return nil, err
+	}
+	snapshot := s.db.NewSnapshot()
+	s.mu.RUnlock()
+	defer snapshot.Close()
+	return changefeed.ListNamespaces(ctx, snapshot)
+}

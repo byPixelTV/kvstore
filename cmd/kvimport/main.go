@@ -61,9 +61,11 @@ func main() {
 	verify := flag.Bool("verify", false, "compare a snapshot with the target in both directions within its namespaces")
 	showConflicts := flag.Bool("show-conflicts", false, "print the namespaces and keys that differ")
 	skipExpiring := flag.Bool("skip-expiring", false, "omit live records with a TTL")
-	ca := flag.String("tls-ca", "", "destination CA PEM (enables TLS)")
-	cert := flag.String("tls-cert", "", "destination client certificate PEM")
-	key := flag.String("tls-key", "", "destination client private key PEM")
+	var transport clienttls.Options
+	flag.BoolVar(&transport.TLS, "tls", false, "enable TLS with the system trust store")
+	flag.StringVar(&transport.CA, "tls-ca", "", "enable TLS with a custom PEM CA")
+	flag.StringVar(&transport.Cert, "tls-cert", "", "destination client certificate PEM")
+	flag.StringVar(&transport.Key, "tls-key", "", "destination client private key PEM")
 	flag.Parse()
 	if (*dryRun && (*apply || *verify || *exportPath != "")) || (*apply && (*verify || *exportPath != "")) {
 		log.Fatal("-dry-run, -apply, -verify and -export-file are separate modes")
@@ -87,16 +89,16 @@ func main() {
 	defer stop()
 	var err error
 	if *inputPath != "" {
-		err = runSnapshot(ctx, *inputPath, *addr, *apply, *verify, *showConflicts, *ca, *cert, *key)
+		err = runSnapshot(ctx, *inputPath, *addr, *apply, *verify, *showConflicts, transport)
 	} else {
-		err = run(ctx, *database, *addr, *exportPath, *apply, *skipExpiring, *showConflicts, *ca, *cert, *key)
+		err = run(ctx, *database, *addr, *exportPath, *apply, *skipExpiring, *showConflicts, transport)
 	}
 	if err != nil {
 		log.Fatal(err)
 	}
 }
 
-func run(ctx context.Context, database, addr, exportPath string, apply, skipExpiring, showConflicts bool, ca, cert, key string) error {
+func run(ctx context.Context, database, addr, exportPath string, apply, skipExpiring, showConflicts bool, transport clienttls.Options) error {
 	uri := os.Getenv("KVSTORE_MONGO_URI")
 	if uri == "" || database == "" {
 		return errors.New("set KVSTORE_MONGO_URI and pass -database")
@@ -138,7 +140,7 @@ func run(ctx context.Context, database, addr, exportPath string, apply, skipExpi
 		fmt.Println("dry run complete: source checked")
 		return nil
 	}
-	conn, err := connectTarget(addr, ca, cert, key)
+	conn, err := connectTarget(addr, transport)
 	if err != nil {
 		return err
 	}
@@ -252,12 +254,12 @@ func requireTargetExpiration(ctx context.Context, client kv.KVStoreClient) error
 	return nil
 }
 
-func connectTarget(addr, ca, cert, key string) (*grpc.ClientConn, error) {
-	creds, err := clienttls.Credentials(ca, cert, key)
+func connectTarget(addr string, transport clienttls.Options) (*grpc.ClientConn, error) {
+	dial, err := transport.DialOptions(os.Getenv("KVSTORE_API_KEY"))
 	if err != nil {
 		return nil, err
 	}
-	return grpc.NewClient(addr, grpc.WithTransportCredentials(creds), grpc.WithDisableRetry())
+	return grpc.NewClient(addr, append(dial, grpc.WithDisableRetry())...)
 }
 
 func sourceCollections(ctx context.Context, db *mongo.Database) ([]selection, error) {

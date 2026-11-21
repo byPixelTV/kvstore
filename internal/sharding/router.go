@@ -432,6 +432,7 @@ func ServeRouter() error {
 	defer listener.Close()
 	server := grpc.NewServer(serverOptions...)
 	kvstorev1.RegisterKVStoreServer(server, router)
+	endpoint.RegisterConsole(server, router.ListNamespaces)
 	healthServer := health.NewServer()
 	healthServer.SetServingStatus("liveness", healthpb.HealthCheckResponse_SERVING)
 	healthServer.SetServingStatus("readiness", healthpb.HealthCheckResponse_SERVING)
@@ -443,6 +444,7 @@ func ServeRouter() error {
 	defer stopLocalHealth()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	endpoint.WatchAPIKeys(ctx)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)

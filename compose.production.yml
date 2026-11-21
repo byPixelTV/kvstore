@@ -16,8 +16,9 @@ services:
     environment:
       KVSTORE_TLS_CERT_FILE: /etc/kvstore/tls/server.crt
       KVSTORE_TLS_KEY_FILE: /etc/kvstore/tls/server.key
-      KVSTORE_TLS_CLIENT_CA_FILE: /etc/kvstore/tls/client-ca.crt
+      KVSTORE_TLS_CLIENT_CA_FILE: ${KVSTORE_TLS_CLIENT_CA_FILE-/etc/kvstore/tls/client-ca.crt}
       KVSTORE_ACCESS_POLICY_FILE: ${KVSTORE_ACCESS_POLICY_FILE:-}
+      KVSTORE_API_KEYS_DIR: ${KVSTORE_API_KEYS_DIR:-}
       KVSTORE_HEALTH_LISTEN_ADDR: '127.0.0.1:50052'
       KVSTORE_HEALTH_ADDR: '127.0.0.1:50052'
       KVSTORE_MAX_INFLIGHT_RPCS: ${KVSTORE_MAX_INFLIGHT_RPCS:-1024}

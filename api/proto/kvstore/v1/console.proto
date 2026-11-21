@@ -1,0 +1,39 @@
+syntax = "proto3";
+
+package kvstore.v1;
+
+option go_package = "github.com/byPixelTV/kvstore/gen/go/kvstore/v1;kvstorev1";
+
+service Console {
+  rpc GetSession(GetSessionRequest) returns (GetSessionResponse);
+  rpc ListNamespaces(ListNamespacesRequest) returns (ListNamespacesResponse);
+  rpc ListAccessKeys(ListAccessKeysRequest) returns (ListAccessKeysResponse);
+  rpc CreateAccessKey(CreateAccessKeyRequest) returns (CreateAccessKeyResponse);
+  rpc RevokeAccessKey(RevokeAccessKeyRequest) returns (RevokeAccessKeyResponse);
+}
+
+// AccessKey describes a key's grants. Empty namespaces mean all namespaces
+// for each granted data permission. Manage grants registry-wide access.
+message AccessKey {
+  string name = 1;
+  bool read = 2;
+  bool write = 3;
+  bool manage = 4;
+  repeated string namespaces = 5;
+}
+
+message GetSessionRequest {}
+message GetSessionResponse { AccessKey key = 1; }
+
+message ListNamespacesRequest {}
+message ListNamespacesResponse { repeated string namespaces = 1; }
+
+message ListAccessKeysRequest {}
+message ListAccessKeysResponse { repeated AccessKey keys = 1; }
+
+message CreateAccessKeyRequest { AccessKey key = 1; }
+// The secret is returned once, when the key is created.
+message CreateAccessKeyResponse { string secret = 1; }
+
+message RevokeAccessKeyRequest { string name = 1; }
+message RevokeAccessKeyResponse {}

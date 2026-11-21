@@ -154,9 +154,7 @@ type options struct {
 	jsonOutput    bool
 	leaderMap     string
 	leaderRefresh time.Duration
-	tlsCA         string
-	tlsCert       string
-	tlsKey        string
+	transport     clienttls.Options
 }
 
 func main() {
@@ -181,9 +179,10 @@ func main() {
 	flag.IntVar(&opt.watchRate, "watch-rate", 100, "target writes/second in watch mode")
 	flag.StringVar(&opt.leaderMap, "leader-map", "", "route directly to Raft leader using gRPC metadata; map advertised=reachable targets, comma-separated")
 	flag.DurationVar(&opt.leaderRefresh, "leader-refresh", 2*time.Second, "leader re-discovery interval when -leader-map is set; 0 disables periodic refresh")
-	flag.StringVar(&opt.tlsCA, "tls-ca", "", "PEM CA for the server certificate; -addr must match the certificate name")
-	flag.StringVar(&opt.tlsCert, "tls-cert", "", "PEM mTLS client certificate chain")
-	flag.StringVar(&opt.tlsKey, "tls-key", "", "PEM mTLS client private key")
+	flag.BoolVar(&opt.transport.TLS, "tls", false, "enable TLS with the system trust store")
+	flag.StringVar(&opt.transport.CA, "tls-ca", "", "enable TLS with a custom PEM CA; -addr must match the certificate name")
+	flag.StringVar(&opt.transport.Cert, "tls-cert", "", "PEM mTLS client certificate chain")
+	flag.StringVar(&opt.transport.Key, "tls-key", "", "PEM mTLS client private key")
 	flag.BoolVar(&opt.jsonOutput, "json", false, "write JSON report to standard output")
 	flag.Parse()
 	if !valid(opt) {
@@ -235,10 +234,11 @@ func resolveLeaderAddress(bootstrap, mapping string, timeout time.Duration) (str
 }
 
 func run(opt options) error {
-	if opt.leaderMap != "" && (opt.tlsCA != "" || opt.tlsCert != "" || opt.tlsKey != "") {
-		return errors.New("use the TLS router endpoint without -leader-map")
+	apiKey := os.Getenv("KVSTORE_API_KEY")
+	if opt.leaderMap != "" && (opt.transport.Enabled() || apiKey != "") {
+		return errors.New("connect to the client endpoint without -leader-map when using TLS or an API key")
 	}
-	creds, err := clienttls.Credentials(opt.tlsCA, opt.tlsCert, opt.tlsKey)
+	dial, err := opt.transport.DialOptions(apiKey)
 	if err != nil {
 		return err
 	}
@@ -271,7 +271,7 @@ func run(opt options) error {
 			}
 		}()
 		for i := 0; i < opt.connections; i++ {
-			conn, err := grpc.NewClient(target, grpc.WithTransportCredentials(creds))
+			conn, err := grpc.NewClient(target, dial...)
 			if err != nil {
 				return err
 			}

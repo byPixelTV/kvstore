@@ -1,0 +1,14 @@
+# Apply with compose.yml for an authenticated endpoint on a trusted network.
+services:
+  kvstore:
+    image: ${KVSTORE_IMAGE:-kvstore:dev}
+    environment:
+      KVSTORE_API_KEYS_DIR: /run/kvstore/api-keys
+    volumes:
+      - type: bind
+        source: ${KVSTORE_API_KEYS_HOST_DIR:?Set KVSTORE_API_KEYS_HOST_DIR}
+        target: /run/kvstore/api-keys
+        bind:
+          create_host_path: false
+    ports: !override
+      - '${KVSTORE_INGRESS_IP:-127.0.0.1}:${KVSTORE_INGRESS_PORT:-50051}:50051'

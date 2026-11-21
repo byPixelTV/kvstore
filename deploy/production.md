@@ -72,6 +72,51 @@ Optional `KVSTORE_ACCESS_POLICY_FILE=/etc/kvstore/tls/policy.json` setzen und di
 
 Ohne Policy dürfen alle Clients der Client-CA auf die Daten-API zugreifen. Die Produktionsprofile begrenzen pro Solo-Instanz oder Router standardmäßig auf 1024 zeitgleiche Unary-Requests und 256 Streams. `KVSTORE_MAX_INFLIGHT_RPCS` und `KVSTORE_MAX_STREAMS` setzen diese Grenzen. Bei Überschreitung antwortet der Server vor der Ausführung mit `RESOURCE_EXHAUSTED`.
 
+### Benannte API-Keys
+
+Solo und Router unterstützen API-Keys mit und ohne TLS. `KVSTORE_API_KEYS_DIR` aktiviert die Schlüsselprüfung am Daten-Endpunkt. Für das TLS-Compose-Profil kann die Registry im TLS-Bind liegen. Der Container muss die Dateien als UID oder GID 65532 lesen können. Auf Linux erbt das Verzeichnis im Beispiel die Gruppe an neue Einträge.
+
+```sh
+keydir="$KVSTORE_TLS_DIR/api-keys"
+install -d -m 2750 -g 65532 "$keydir"
+kvstore apikey create --dir "$keydir" --name reporting --read --namespace players
+kvstore apikey create --dir "$keydir" --name game --read --write --namespace players
+kvstore apikey list --dir "$keydir"
+kvstore apikey revoke --dir "$keydir" --name reporting
+```
+
+`create` gibt den zufälligen Key einmal aus. Das Verzeichnis enthält den SHA-256-Digest und die Rechte. `list` zeigt Name und Rechte. `--read` erlaubt `Get`, `Head`, `Scan` und `Watch`. `--write` erlaubt `Set`, `Delete` und `BatchWrite`. `Head` enthält einen globalen Cursor. Mit wiederholtem `--namespace` lassen sich Datenzugriffe auf bestimmte Namespaces beschränken. Ohne Namespace-Liste umfasst das Recht alle Namespaces.
+
+```sh
+export KVSTORE_API_KEYS_DIR=/etc/kvstore/tls/api-keys
+# Im reinen API-Key-Betrieb ohne Clientzertifikate setzen.
+export KVSTORE_TLS_CLIENT_CA_FILE=''
+```
+
+Clients senden `authorization: Bearer <key>` als gRPC-Metadatum. `kvbench` und `kvimport` unterstützen dafür `KVSTORE_API_KEY`. Im TLS-Betrieb benötigt der Server `server.crt` und `server.key`. In den Tools wählt `-tls` den System-Truststore und `-tls-ca` eine eigene CA-Datei. Mit gesetzter Client-CA können bestehende Clients weiter ihr Zertifikat verwenden. Wird bei einer Anfrage ein Bearer-Key gesendet, gelten dessen Rechte. Ein ungültiger Bearer-Key wird auch bei gültigem Clientzertifikat abgewiesen. Im reinen API-Key-Betrieb `KVSTORE_ACCESS_POLICY_FILE` für Zertifikate leer lassen.
+
+Änderungen am Verzeichnis werden auf jedem Endpunkt im Sekundentakt eingelesen. Ein Widerruf beendet dort auch offene Streams des Keys. Bei mehreren Routern die aktuelle Registry an alle Router verteilen und den Widerruf an jedem Endpunkt wirksam werden lassen. Für lokale Key-Verwaltung genügt ein schreibgeschützter Server-Mount. Soll das Terminal-TUI `kvctl` Keys verwalten, braucht der Endpunkt Schreibzugriff auf die Registry. [Terminal-Konsole und Einrichtung](kvctl.md)
+
+#### Solo ohne Zertifikate
+
+Für einen lokalen oder privaten Solo-Endpunkt verwendet `compose.solo.apikey.yml` die Registry ohne TLS. Die Host-Adresse ist standardmäßig `127.0.0.1:50051`. Ohne TLS laufen Key und Nutzdaten im Klartext. Für öffentliche Endpunkte das TLS-Profil verwenden.
+
+```sh
+export KVSTORE_API_KEYS_HOST_DIR="$PWD/data/kvstore-api-keys"
+install -d -m 2770 -g 65532 "$KVSTORE_API_KEYS_HOST_DIR"
+kvstore apikey create --dir "$KVSTORE_API_KEYS_HOST_DIR" --name minecraft --read --write
+docker compose -f compose.yml -f compose.solo.apikey.yml up -d --build
+```
+
+Beim direkten Start von Solo oder Router genügt `KVSTORE_API_KEYS_DIR`, wenn die TLS-Dateivariablen leer sind. Für diesen Endpunkt verwenden `kvbench` und `kvimport` den `KVSTORE_API_KEY` ohne TLS-Flags.
+
+Für die erste Anmeldung am TUI auf dem Host einen Management-Key anlegen. Verwende dasselbe Verzeichnis, aus dem der Server seine Keys liest. Der Befehl funktioniert auch mit einer leeren Registry.
+
+```sh
+kvstore apikey create --dir "$KVSTORE_API_KEYS_HOST_DIR" --name admin --manage --read --write
+kvctl --addr 127.0.0.1:50051
+```
+
 ### Monitoring und Endpunkt-Abnahme
 
 Für Shards `deploy/prometheus/prometheus.yml`, für Solo `deploy/prometheus/prometheus-standalone.yml` auf dem Compose-Host verwenden. Den Wert von `KVSTORE_METRICS_TOKEN` als Datei `token` neben der Konfiguration ablegen, lesbar nur für den Scraper. Das Prometheus-Target muss `UP` melden. Die Regeln prüfen Scrapes, Shard-Routen, Mutationsfehler, p99, Ressourcenlimits, wenig freien Speicher und Pebble-Compaction-Fehler. Bei der Abnahme auf einer isolierten Staging-Instanz das Unary-Limit vorübergehend auf `1` setzen, mit 32 gleichzeitigen Schreibern wiederholt `ResourceExhausted` auslösen und den Eingang von `KVStoreResourceExhausted` im Alertmanager prüfen. Anschließend das Produktionslimit wiederherstellen.

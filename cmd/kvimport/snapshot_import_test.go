@@ -10,6 +10,7 @@ import (
 	"time"
 
 	kv "github.com/byPixelTV/kvstore/gen/go/kvstore/v1"
+	"github.com/byPixelTV/kvstore/internal/clienttls"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 )
@@ -128,7 +129,7 @@ func TestBatchedSnapshotRehearsal(t *testing.T) {
 	if err := os.WriteFile(path, snapshotFixture(t, make(map[string]struct{}), rows...), 0600); err != nil {
 		t.Fatal(err)
 	}
-	conn, err := connectTarget(addr, "", "", "")
+	conn, err := connectTarget(addr, clienttls.Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,11 +145,11 @@ func TestBatchedSnapshotRehearsal(t *testing.T) {
 	}
 	serialDuration := time.Since(start)
 	start = time.Now()
-	if err := runSnapshot(t.Context(), path, addr, true, false, false, "", "", ""); err != nil {
+	if err := runSnapshot(t.Context(), path, addr, true, false, false, clienttls.Options{}); err != nil {
 		t.Fatal(err)
 	}
 	batchDuration := time.Since(start)
-	if err := runSnapshot(t.Context(), path, addr, false, true, false, "", "", ""); err != nil {
+	if err := runSnapshot(t.Context(), path, addr, false, true, false, clienttls.Options{}); err != nil {
 		t.Fatal(err)
 	}
 	t.Logf("%d synthetic 1 KiB records: serial=%s batch=%s", records, serialDuration, batchDuration)

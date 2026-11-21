@@ -5,6 +5,7 @@ protoc -I=api/proto `
   --go_opt=module=github.com/byPixelTV/kvstore `
   --go-grpc_out=. `
   --go-grpc_opt=module=github.com/byPixelTV/kvstore `
-  api/proto/kvstore/v1/kvstore.proto
+  api/proto/kvstore/v1/kvstore.proto `
+  api/proto/kvstore/v1/console.proto
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-Write-Host "Generated gen/go/kvstore/v1/kvstore*.pb.go"
+Write-Host "Generated KVStore and Console Go protobufs"

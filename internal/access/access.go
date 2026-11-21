@@ -11,17 +11,22 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/byPixelTV/kvstore/internal/apikeys"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/status"
 )
 
-const dataMethodPrefix = "/kvstore.v1.KVStore/"
+const (
+	dataMethodPrefix    = "/kvstore.v1.KVStore/"
+	consoleMethodPrefix = "/kvstore.v1.Console/"
+)
 
 type Settings struct {
 	tlsConfig        *tls.Config
 	policy           namespacePolicy
+	apiKeys          *apiKeyStore
 	unary, streams   chan struct{}
 	HealthListenAddr string
 }
@@ -32,34 +37,49 @@ func Load() (Settings, error) {
 	keyFile := os.Getenv("KVSTORE_TLS_KEY_FILE")
 	caFile := os.Getenv("KVSTORE_TLS_CLIENT_CA_FILE")
 	policyFile := os.Getenv("KVSTORE_ACCESS_POLICY_FILE")
+	apiKeyDir := os.Getenv("KVSTORE_API_KEYS_DIR")
 	s.HealthListenAddr = os.Getenv("KVSTORE_HEALTH_LISTEN_ADDR")
 	if certFile != "" || keyFile != "" || caFile != "" {
-		if certFile == "" || keyFile == "" || caFile == "" {
-			return s, errors.New("mTLS requires KVSTORE_TLS_CERT_FILE, KVSTORE_TLS_KEY_FILE and KVSTORE_TLS_CLIENT_CA_FILE")
+		if certFile == "" || keyFile == "" || (caFile == "" && apiKeyDir == "") {
+			return s, errors.New("TLS access requires a server certificate and key plus KVSTORE_TLS_CLIENT_CA_FILE or KVSTORE_API_KEYS_DIR")
 		}
 		if s.HealthListenAddr == "" {
-			return s, errors.New("mTLS requires a loopback KVSTORE_HEALTH_LISTEN_ADDR for local probes")
+			return s, errors.New("TLS requires a loopback KVSTORE_HEALTH_LISTEN_ADDR for local probes")
 		}
 		certificate, err := tls.LoadX509KeyPair(certFile, keyFile)
 		if err != nil {
 			return s, fmt.Errorf("load gRPC TLS certificate: %w", err)
 		}
-		pem, err := os.ReadFile(caFile)
-		if err != nil {
-			return s, fmt.Errorf("read gRPC client CA: %w", err)
-		}
-		clientCAs := x509.NewCertPool()
-		if !clientCAs.AppendCertsFromPEM(pem) {
-			return s, errors.New("KVSTORE_TLS_CLIENT_CA_FILE contains no certificates")
-		}
 		s.tlsConfig = &tls.Config{
-			Certificates: []tls.Certificate{certificate}, ClientCAs: clientCAs,
-			ClientAuth: tls.RequireAndVerifyClientCert, MinVersion: tls.VersionTLS12,
+			Certificates: []tls.Certificate{certificate}, MinVersion: tls.VersionTLS12,
+		}
+		if caFile != "" {
+			pem, err := os.ReadFile(caFile)
+			if err != nil {
+				return s, fmt.Errorf("read gRPC client CA: %w", err)
+			}
+			clientCAs := x509.NewCertPool()
+			if !clientCAs.AppendCertsFromPEM(pem) {
+				return s, errors.New("KVSTORE_TLS_CLIENT_CA_FILE contains no certificates")
+			}
+			s.tlsConfig.ClientCAs = clientCAs
+			s.tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
+			if apiKeyDir != "" {
+				s.tlsConfig.ClientAuth = tls.VerifyClientCertIfGiven
+			}
 		}
 	}
+	if apiKeyDir != "" {
+		keys, err := apikeys.Load(apiKeyDir)
+		if err != nil {
+			return s, fmt.Errorf("load API key directory: %w", err)
+		}
+		s.apiKeys = &apiKeyStore{dir: apiKeyDir}
+		s.apiKeys.replace(keys)
+	}
 	if policyFile != "" {
-		if !s.UsesTLS() {
-			return s, errors.New("KVSTORE_ACCESS_POLICY_FILE requires gRPC mTLS")
+		if caFile == "" {
+			return s, errors.New("KVSTORE_ACCESS_POLICY_FILE requires KVSTORE_TLS_CLIENT_CA_FILE")
 		}
 		var err error
 		s.policy, err = loadPolicy(policyFile)
@@ -78,6 +98,8 @@ func Load() (Settings, error) {
 
 func (s Settings) UsesTLS() bool { return s.tlsConfig != nil }
 
+func (s Settings) UsesClientAuthentication() bool { return s.UsesTLS() || s.apiKeys != nil }
+
 func loadLimit(name string) (chan struct{}, error) {
 	value := os.Getenv(name)
 	if value == "" || value == "0" {
@@ -95,27 +117,29 @@ func (s Settings) ServerOptions() []grpc.ServerOption {
 	if s.UsesTLS() {
 		options = append(options, grpc.Creds(credentials.NewTLS(s.tlsConfig)))
 	}
-	if s.policy != nil || s.unary != nil {
+	if s.policy != nil || s.apiKeys != nil || s.unary != nil {
 		options = append(options, grpc.ChainUnaryInterceptor(s.interceptUnary))
 	}
-	if s.policy != nil || s.streams != nil {
+	if s.policy != nil || s.apiKeys != nil || s.streams != nil {
 		options = append(options, grpc.ChainStreamInterceptor(s.interceptStream))
 	}
 	return options
 }
 
 func (s Settings) interceptUnary(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
-	if !strings.HasPrefix(info.FullMethod, dataMethodPrefix) {
-		return handler(ctx, req)
-	}
-	if s.policy != nil {
-		grants, err := s.policy.grants(ctx)
+	switch {
+	case strings.HasPrefix(info.FullMethod, dataMethodPrefix):
+		grants, _, err := s.authorize(ctx)
 		if err != nil {
 			return nil, err
 		}
-		if !grants.allows(req) {
+		if grants != nil && !grants.allows(req) {
 			return nil, denied()
 		}
+	case strings.HasPrefix(info.FullMethod, consoleMethodPrefix):
+		// Console methods verify their own session and management grants.
+	default:
+		return handler(ctx, req)
 	}
 	if s.unary != nil {
 		select {
@@ -132,12 +156,20 @@ func (s Settings) interceptStream(srv any, stream grpc.ServerStream, info *grpc.
 	if !strings.HasPrefix(info.FullMethod, dataMethodPrefix) {
 		return handler(srv, stream)
 	}
-	if s.policy != nil {
-		grants, err := s.policy.grants(stream.Context())
-		if err != nil {
-			return err
-		}
-		stream = &authorizedStream{ServerStream: stream, grants: grants}
+	grants, key, err := s.authorize(stream.Context())
+	if err != nil {
+		return err
+	}
+	ctx := stream.Context()
+	if key != nil {
+		var cancel context.CancelCauseFunc
+		ctx, cancel = context.WithCancelCause(ctx)
+		stop := context.AfterFunc(key.lifetime, func() { cancel(errAPIKeyRevoked) })
+		defer stop()
+		defer cancel(nil)
+	}
+	if grants != nil {
+		stream = &authorizedStream{ServerStream: stream, ctx: ctx, grants: *grants, key: key}
 	}
 	if s.streams != nil {
 		select {
@@ -147,5 +179,9 @@ func (s Settings) interceptStream(srv any, stream grpc.ServerStream, info *grpc.
 			return status.Error(codes.ResourceExhausted, "gRPC stream limit reached before admission")
 		}
 	}
-	return handler(srv, stream)
+	err = handler(srv, stream)
+	if errors.Is(context.Cause(ctx), errAPIKeyRevoked) {
+		return unauthenticated()
+	}
+	return err
 }

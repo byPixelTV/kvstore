@@ -351,17 +351,25 @@ func (n *Node) leaderPeer() (peerInfo, error) {
 }
 
 func (n *Node) client(target string) (kvstorev1.KVStoreClient, error) {
+	conn, err := n.peerConn(target)
+	if err != nil {
+		return nil, err
+	}
+	return kvstorev1.NewKVStoreClient(conn), nil
+}
+
+func (n *Node) peerConn(target string) (*grpc.ClientConn, error) {
 	n.clientsMu.Lock()
 	defer n.clientsMu.Unlock()
 	if conn := n.clients[target]; conn != nil {
-		return kvstorev1.NewKVStoreClient(conn), nil
+		return conn, nil
 	}
 	conn, err := grpc.NewClient(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return nil, err
 	}
 	n.clients[target] = conn
-	return kvstorev1.NewKVStoreClient(conn), nil
+	return conn, nil
 }
 
 // strongFence proves quorum leadership for each batch, while the expensive

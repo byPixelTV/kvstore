@@ -10,7 +10,7 @@ services:
     init: true
     read_only: true
     ports:
-      # Deliberately localhost-only: gRPC has no TLS/auth yet.
+      # The default standalone endpoint is local to the host.
       - "127.0.0.1:50051:50051"
     environment:
       KVSTORE_MODE: standalone
