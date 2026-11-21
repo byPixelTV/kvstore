@@ -80,6 +80,8 @@ sharded deployment. See [release channels](#release-channels) for package versio
 
 Clients use TLS by default. Pass an API key when the server requires bearer authentication.
 All three accept custom trust roots and client certificates. Use explicit plaintext settings for a local plaintext endpoint.
+All three support atomic callback transactions across shards, renewable key leases, and local
+namespace caches that follow committed changes.
 
 KVStore stores bytes. The typed helpers store UTF-8 JSON, so the same value can be read from
 Kotlin, Go and TypeScript. EraMC's `storeName` maps to `namespace` and its key stays the same.
@@ -93,7 +95,7 @@ repositories {
     maven("https://repo.bypixel.dev/releases/")
 }
 dependencies {
-    implementation("dev.bypixel:kvstore:1.1.0")
+    implementation("dev.bypixel:kvstore:1.2.0")
 }
 ```
 
@@ -128,10 +130,32 @@ Collect `watch` or `onChange` for the keys you want invalidated by remote writes
 Values with a server expiration also expire locally. Use `get<T>` for a fresh strong read.
 Pass a custom `Json` instance to reuse application serializers.
 
+Use `transaction` for a callback whose staged writes commit atomically across namespaces
+and shards. The SDK executes the callback once and checks the recorded revisions and leases
+at commit. Use `withKeyLock` for a renewable distributed lease. Lease-backed writes such as
+`writeText` check ownership when they commit.
+
+```kotlin
+kvstore.transaction { tx ->
+    tx.set("players", "alice", "active")
+    tx.set("audit", "alice-login", "recorded")
+}
+kvstore.loadNamespace("players")
+val cachedStatus = kvstore.cachedText("players", "alice")
+```
+
+`loadNamespace` starts a resumable watch from the scan checkpoint. Use `cachedText` for a
+synchronous local lookup and `subscribeToNamespace` for change notifications. Use `cachedBytes`
+and the transaction's `getBytes` and `setBytes` for binary values. A null key in
+a notification means the client rescanned the namespace. Close the subscription when it is no
+longer needed and close the client to stop its watches.
+
 ### Go
 
+See the [Go SDK guide](sdk/go/README.md) for namespace cache examples.
+
 ```sh
-go get github.com/byPixelTV/kvstore/sdk/go@v1.1.0
+go get github.com/byPixelTV/kvstore/sdk/go@v1.2.0
 ```
 
 ```go
@@ -303,7 +327,7 @@ isolated KVStore instance. The second command also needs JDK 21 and Node.js 24.
 
 ```sh
 go test -race ./...
-bash scripts/test-sdks.sh 1.1.0 "$PWD/tmp/sdk-packages"
+bash scripts/test-sdks.sh 1.2.0 "$PWD/tmp/sdk-packages"
 ```
 
 ## License

@@ -11,8 +11,9 @@ import (
 )
 
 const (
-	LeaseNamespace = "kvstore-leases"
-	DefaultLockTTL = 10 * time.Second
+	LeaseNamespace    = "kvstore-leases"
+	DefaultLockTTL    = 10 * time.Second
+	leaseCommitWindow = 3 * time.Second
 )
 
 var ErrLeaseLost = errors.New("kvstore: distributed lock was lost")
@@ -95,13 +96,16 @@ func (c *Client) WithKeyLock(ctx context.Context, namespace, key string, ttl tim
 	}
 	stopAcquire()
 	initialExpiry := expires
+	// Sharded transactions require an owned record to outlive preparation.
+	// Use half the spare time if a short TTL has less room for a slow RPC.
+	renewAfter := min(ttl/3, (ttl-leaseCommitWindow)/2)
 
 	lockCtx, cancel := context.WithCancelCause(context.WithValue(ctx, heldLeaseKey{}, l))
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		for {
-			renewAt := time.NewTimer(time.Until(expires.Add(-2 * ttl / 3)))
+			renewAt := time.NewTimer(time.Until(expires.Add(renewAfter - ttl)))
 			select {
 			case <-lockCtx.Done():
 				renewAt.Stop()

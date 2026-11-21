@@ -28,6 +28,7 @@ dependencies {
     api("com.google.protobuf:protobuf-java:$protobufVersion")
     api("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0")
     api("org.jetbrains.kotlinx:kotlinx-serialization-json:1.11.0")
+    implementation("com.github.ben-manes.caffeine:caffeine:3.2.3")
     runtimeOnly("io.grpc:grpc-netty-shaded")
     compileOnly("javax.annotation:javax.annotation-api:1.3.2")
     testImplementation(kotlin("test-junit"))

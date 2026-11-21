@@ -26,9 +26,11 @@ type Options struct {
 }
 
 type Client struct {
-	rpc    pb.KVStoreClient
-	conn   *grpc.ClientConn
-	apiKey string
+	rpc          pb.KVStoreClient
+	conn         *grpc.ClientConn
+	apiKey       string
+	cacheContext context.Context
+	stopCaches   context.CancelFunc
 }
 
 // Dial creates a client that owns its connection. gRPC connects on demand.
@@ -55,10 +57,17 @@ func Dial(target string, options Options) (*Client, error) {
 
 // FromConn uses a caller-managed connection, for example one with interceptors.
 func FromConn(conn grpc.ClientConnInterface, apiKey string) *Client {
-	return &Client{rpc: pb.NewKVStoreClient(conn), apiKey: apiKey}
+	cacheContext, stopCaches := context.WithCancel(context.Background())
+	return &Client{
+		rpc: pb.NewKVStoreClient(conn), apiKey: apiKey,
+		cacheContext: cacheContext, stopCaches: stopCaches,
+	}
 }
 
 func (c *Client) Close() error {
+	if c.stopCaches != nil {
+		c.stopCaches()
+	}
 	if c.conn != nil {
 		return c.conn.Close()
 	}

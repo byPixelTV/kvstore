@@ -1,6 +1,20 @@
 import * as grpc from "@grpc/grpc-js";
 import { loadSync } from "@grpc/proto-loader";
+import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
+import { LeaseManager, type LockOptions } from "./lease.js";
+import { NamespaceCache } from "./namespace-cache.js";
+import { errorCode, pause } from "./retry.js";
+import {
+  StagedTransaction, TransactionConflictError, type Transaction, type TransactionCheck, type TransactionRequest,
+} from "./transaction.js";
+
+export { cursorFromChange, cursorFromScan, needsRescan } from "./cursor.js";
+export { LeaseLostError, defaultLockTtlMs, leaseNamespace } from "./lease.js";
+export type { LockOptions } from "./lease.js";
+export { NamespaceCache } from "./namespace-cache.js";
+export { TransactionConflictError } from "./transaction.js";
+export type { Transaction, TransactionCheck, TransactionRequest } from "./transaction.js";
 
 export interface ClientOptions {
   apiKey?: string;
@@ -68,6 +82,7 @@ export interface BatchResult extends DeleteResult { grpcCode: number; error: str
 
 type Vector = { useVectorCursor: true };
 type SetRequest = Key & { value: Uint8Array; expiresAtUnixMs: string };
+type WireOperation = SetRequest | (Key & { delete: true });
 type Unary<Request, Response> = (
   request: Request, metadata: grpc.Metadata, options: grpc.CallOptions,
   callback: (err: grpc.ServiceError | null, response?: Response) => void,
@@ -78,7 +93,8 @@ interface RPC extends grpc.Client {
   get: Unary<Key & { consistency: 0 | 1 }, GetResult>;
   set: Unary<SetRequest, SetResult>;
   delete: Unary<Key, DeleteResult>;
-  batchWrite: Unary<{ operations: (SetRequest | (Key & { delete: true }))[] }, { results: BatchResult[] }>;
+  batchWrite: Unary<{ operations: WireOperation[] }, { results: BatchResult[] }>;
+  transact: Unary<{ requestId: string; checks: TransactionCheck[]; operations: WireOperation[] }, { committed: boolean }>;
   head: Unary<Vector, Head>;
   watch: Stream<Key & Vector & { afterRevision: string; cursor: string }, Change>;
   scan: Stream<Vector & { namespace: string }, ScanRecord>;
@@ -99,6 +115,12 @@ function expiration(ms: number): string {
   return String(ms);
 }
 
+function encodeOperations(operations: readonly BatchOperation[]): WireOperation[] {
+  return operations.map(op => op.delete
+    ? { namespace: op.namespace, key: op.key, delete: true }
+    : { namespace: op.namespace, key: op.key, value: op.value, expiresAtUnixMs: expiration(op.expiresAtUnixMs ?? 0) });
+}
+
 async function* frames<T>(open: () => grpc.ClientReadableStream<T>, signal?: AbortSignal): AsyncGenerator<T> {
   signal?.throwIfAborted();
   const stream = open();
@@ -114,25 +136,12 @@ async function* frames<T>(open: () => grpc.ClientReadableStream<T>, signal?: Abo
   }
 }
 
-export function cursorFromChange(change: Change): Cursor {
-  return change.cursor ? { vector: change.cursor } : { revision: change.revision };
-}
-
-/** Use the checkpoint from a completed scan. Sharded scans checkpoint at the end. */
-export function cursorFromScan(checkpoint: ScanRecord): Cursor {
-  if (!checkpoint.checkpoint) throw new TypeError("Expected a scan checkpoint");
-  return checkpoint.cursor ? { vector: checkpoint.cursor } : { revision: checkpoint.snapshotRevision };
-}
-
-export function needsRescan(error: unknown): boolean {
-  if (typeof error !== "object" || error === null || !("code" in error)) return false;
-  return error.code === grpc.status.OUT_OF_RANGE || error.code === grpc.status.FAILED_PRECONDITION;
-}
-
 export class KVStoreClient {
   private readonly rpc: RPC;
   private readonly metadata = new grpc.Metadata();
   private readonly timeoutMs: number;
+  private readonly lifetime = new AbortController();
+  private readonly leases: LeaseManager;
 
   constructor(target: string, { apiKey, plaintext = false, tls, timeoutMs = 5000 }: ClientOptions = {}) {
     if (plaintext && tls) throw new TypeError("plaintext and tls are mutually exclusive");
@@ -143,9 +152,15 @@ export class KVStoreClient {
       grpc.credentials.createSsl(tls?.ca, tls?.key, tls?.cert);
     this.rpc = new service.kvstore.v1.KVStore(target, credentials);
     if (apiKey) this.metadata.set("authorization", `Bearer ${apiKey}`);
+    this.leases = new LeaseManager(
+      this.lifetime.signal,
+      (namespace, key, signal) => this.readForTransaction(namespace, key, signal),
+      (checks, operations, signal) => this.transactWithRetry(checks, operations, signal),
+    );
   }
 
   close(): void {
+    this.lifetime.abort();
     this.rpc.close();
   }
 
@@ -164,8 +179,8 @@ export class KVStoreClient {
     });
   }
 
-  get(namespace: string, key: string, consistency: "strong" | "eventual" = "strong"): Promise<GetResult> {
-    return this.unary(this.rpc.get, { namespace, key, consistency: consistency === "strong" ? 0 : 1 });
+  get(namespace: string, key: string, consistency: "strong" | "eventual" = "strong", signal?: AbortSignal): Promise<GetResult> {
+    return this.unary(this.rpc.get, { namespace, key, consistency: consistency === "strong" ? 0 : 1 }, signal);
   }
 
   set(namespace: string, key: string, value: Uint8Array, expiresAtUnixMs = 0): Promise<SetResult> {
@@ -178,10 +193,86 @@ export class KVStoreClient {
 
   /** Results are ordered. A transport failure can leave the outcome unknown. */
   async batchWrite(operations: BatchOperation[]): Promise<BatchResult[]> {
-    const request = operations.map(op => op.delete
-      ? { namespace: op.namespace, key: op.key, delete: true as const }
-      : { namespace: op.namespace, key: op.key, value: op.value, expiresAtUnixMs: expiration(op.expiresAtUnixMs ?? 0) });
-    return (await this.unary(this.rpc.batchWrite, { operations: request })).results;
+    return (await this.unary(this.rpc.batchWrite, { operations: encodeOperations(operations) })).results;
+  }
+
+  /** Retry an unknown outcome with the same request ID and exact input. */
+  async transact(request: TransactionRequest, signal?: AbortSignal): Promise<boolean> {
+    const reply = await this.unary(this.rpc.transact, {
+      requestId: request.requestId,
+      checks: [...request.checks ?? []],
+      operations: encodeOperations(request.operations ?? []),
+    }, signal);
+    return reply.committed;
+  }
+
+  /** Run the callback once, then atomically validate its read set and apply its writes. */
+  async transaction<T>(callback: (transaction: Transaction) => T | Promise<T>, signal?: AbortSignal): Promise<T> {
+    const active = this.leases.signal(signal);
+    active.throwIfAborted();
+    const transaction = new StagedTransaction(active, (namespace, key) => this.readForTransaction(namespace, key, active));
+    try {
+      const result = await callback(transaction);
+      const { checks, operations } = await transaction.prepare();
+      checks.unshift(...this.leases.checks);
+      if (checks.length + operations.length > 0 && !(await this.transactWithRetry(checks, operations, active))) {
+        throw new TransactionConflictError();
+      }
+      return result;
+    } finally {
+      transaction.close();
+    }
+  }
+
+  /** Keep an exclusive, renewable lease for callback-scoped transactions. */
+  withKeyLock<T>(
+    namespace: string, key: string, callback: (signal: AbortSignal) => T | Promise<T>, options: LockOptions = {},
+  ): Promise<T> {
+    return this.leases.withKeyLock(namespace, key, callback, options);
+  }
+
+  /** Load a local snapshot and maintain it through changefeed replay. */
+  loadNamespaceCache(namespace: string, signal?: AbortSignal): Promise<NamespaceCache> {
+    const active = signal ? AbortSignal.any([signal, this.lifetime.signal]) : this.lifetime.signal;
+    return NamespaceCache.open(this, namespace, active);
+  }
+
+  private async readForTransaction(namespace: string, key: string, signal: AbortSignal): Promise<GetResult> {
+    const bounded = AbortSignal.any([signal, AbortSignal.timeout(this.timeoutMs)]);
+    for (;;) {
+      try {
+        return await this.get(namespace, key, "strong", bounded);
+      } catch (error) {
+        bounded.throwIfAborted();
+        if (errorCode(error) !== grpc.status.UNAVAILABLE) throw error;
+      }
+      await pause(25, bounded);
+    }
+  }
+
+  private async transactWithRetry(
+    checks: TransactionCheck[], operations: BatchOperation[], signal: AbortSignal,
+  ): Promise<boolean> {
+    signal.throwIfAborted();
+    const request = { requestId: randomUUID(), checks, operations };
+    const bounded = AbortSignal.any([signal, AbortSignal.timeout(10_000)]);
+    try {
+      for (;;) {
+        try {
+          return await this.transact(request, bounded);
+        } catch (error) {
+          bounded.throwIfAborted();
+          const code = errorCode(error);
+          if (code !== grpc.status.UNAVAILABLE && code !== grpc.status.DEADLINE_EXCEEDED && code !== grpc.status.ABORTED) {
+            throw error;
+          }
+        }
+        await pause(25, bounded);
+      }
+    } catch (error) {
+      if (bounded.aborted) throw new Error(`KVStore transaction ${request.requestId} outcome unknown`, { cause: error });
+      throw error;
+    }
   }
 
   async getJson<T>(namespace: string, key: string): Promise<T | undefined> {
