@@ -13,7 +13,6 @@ spec:
       port: 50051
       targetPort: grpc
 ---
-# Stable pod DNS for a future Raft cluster. This does not enable clustering.
 apiVersion: v1
 kind: Service
 metadata:
@@ -22,7 +21,6 @@ metadata:
     app: kvstore
 spec:
   clusterIP: None
-  publishNotReadyAddresses: true
   selector:
     app: kvstore
   ports:

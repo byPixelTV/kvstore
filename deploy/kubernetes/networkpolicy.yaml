@@ -1,0 +1,17 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kvstore-solo
+spec:
+  podSelector:
+    matchLabels: {app: kvstore}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - ports:
+        - {protocol: TCP, port: 50051}
+    - from:
+        - podSelector:
+            matchLabels: {app.kubernetes.io/component: kvstore-metrics-scraper}
+      ports:
+        - {protocol: TCP, port: 7002}
+  egress: []

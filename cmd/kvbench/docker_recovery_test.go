@@ -64,9 +64,10 @@ func startRecoveryCompose(t *testing.T, ctx context.Context) recoveryCompose {
 	yaml.WriteString("services:\n  router:\n    restart: 'no'\n    ports: !override ['127.0.0.1::50051']\n")
 	for s := range sharding.ShardCount {
 		for n := range 3 {
-			fmt.Fprintf(&yaml, "  s%dn%d:\n    restart: 'no'\n    ports: !override ['127.0.0.1::7001', '127.0.0.1::50051']\n", s, n)
+			fmt.Fprintf(&yaml, "  s%dn%d:\n    restart: 'no'\n    ports: !override ['127.0.0.1::7001', '127.0.0.1::50051']\n    environment:\n      KVSTORE_RAFT_BOOTSTRAP_MODE: explicit\n", s, n)
 		}
 	}
+	yaml.WriteString("volumes:\n  s0n0-replacement-data:\n")
 	if err := os.WriteFile(override, []byte(yaml.String()), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -85,6 +86,28 @@ func startRecoveryCompose(t *testing.T, ctx context.Context) recoveryCompose {
 		}
 	})
 	recoveryDocker(t, ctx, c, "up", "-d", "--no-build", "--pull", "never")
+	for s := range sharding.ShardCount {
+		var admins [3]string
+		for n := range admins {
+			admins[n] = recoveryDocker(t, ctx, c, "port", fmt.Sprintf("s%dn%d", s, n), "7001")
+		}
+		waitRecovery(t, ctx, fmt.Sprintf("all shard %d admin endpoints eligible for bootstrap", s), func() bool {
+			for _, addr := range admins {
+				if code, _ := recoveryBootstrap(ctx, addr, http.MethodGet); code != http.StatusOK {
+					return false
+				}
+			}
+			return true
+		})
+		// compose.sharded.yml designates node s for shard s.
+		waitRecovery(t, ctx, fmt.Sprintf("shard %d bootstrap", s), func() bool {
+			code, err := recoveryBootstrap(ctx, admins[s], http.MethodPost)
+			if err == nil && code != http.StatusNoContent && code != http.StatusServiceUnavailable {
+				t.Fatalf("bootstrap shard %d: status=%d", s, code)
+			}
+			return err == nil && code == http.StatusNoContent
+		})
+	}
 	return c
 }
 
@@ -106,6 +129,23 @@ func recoveryClient(t *testing.T, ctx context.Context, c recoveryCompose, servic
 	}
 	t.Cleanup(func() { _ = conn.Close() })
 	return kvstorev1.NewKVStoreClient(conn)
+}
+
+func recoveryBootstrap(ctx context.Context, addr, method string) (int, error) {
+	call, cancel := context.WithTimeout(ctx, 6*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(call, method, "http://"+addr+"/v1/cluster/bootstrap", nil)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("Authorization", "Bearer "+recoveryJoinToken)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer res.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(res.Body, 16<<10))
+	return res.StatusCode, nil
 }
 
 type recoveryReplica struct {
@@ -172,13 +212,17 @@ const (
 )
 
 type recoveryLoad struct {
-	phaseMu  sync.RWMutex
-	phase    int
-	mu       sync.Mutex
-	attempts [recoveryPhases][sharding.ShardCount]int
-	acks     [recoveryPhases][sharding.ShardCount]int
-	journal  map[string]uint64 // Values equal their unique keys.
-	err      error
+	namespace string
+	keyPrefix string
+	phaseMu   sync.RWMutex
+	phase     int
+	mu        sync.Mutex
+	attempts  [recoveryPhases][sharding.ShardCount]int
+	acks      [recoveryPhases][sharding.ShardCount]int
+	lastAck   [sharding.ShardCount]time.Time
+	maxAckGap [sharding.ShardCount]time.Duration
+	journal   map[string]uint64 // Values equal their unique keys.
+	err       error
 }
 
 func recoveryTransient(code codes.Code) bool {
@@ -202,9 +246,9 @@ func (l *recoveryLoad) run(ctx context.Context, client kvstorev1.KVStoreClient, 
 		ops := make([]*kvstorev1.BatchWriteOperation, 0, batchSize)
 		for len(ops) < batchSize {
 			seq++
-			key := fmt.Sprintf("%d/%d", worker, seq)
-			if sharding.Shard(recoveryNamespace, key) == shard {
-				ops = append(ops, &kvstorev1.BatchWriteOperation{Namespace: recoveryNamespace, Key: key, Value: []byte(key)})
+			key := fmt.Sprintf("%s%d/%d", l.keyPrefix, worker, seq)
+			if sharding.Shard(l.namespace, key) == shard {
+				ops = append(ops, &kvstorev1.BatchWriteOperation{Namespace: l.namespace, Key: key, Value: []byte(key)})
 			}
 		}
 		call, cancel := context.WithTimeout(ctx, 2*time.Second)
@@ -221,14 +265,23 @@ func (l *recoveryLoad) run(ctx context.Context, client kvstorev1.KVStoreClient, 
 		case len(reply.GetResults()) != len(ops):
 			l.err = fmt.Errorf("unexpected BatchWrite result count: %d", len(reply.GetResults()))
 		default:
+			acknowledged := false
 			for i, item := range reply.GetResults() {
 				code := codes.Code(item.GetGrpcCode())
 				if code == codes.OK && item.GetRevision() > 0 {
 					l.acks[phase][shard]++
 					l.journal[ops[i].Key] = item.GetRevision()
+					acknowledged = true
 				} else if !recoveryTransient(code) && l.err == nil {
 					l.err = fmt.Errorf("invalid result for %s: %v", ops[i].Key, item)
 				}
+			}
+			if acknowledged {
+				now := time.Now()
+				if last := l.lastAck[shard]; !last.IsZero() {
+					l.maxAckGap[shard] = max(l.maxAckGap[shard], now.Sub(last))
+				}
+				l.lastAck[shard] = now
 			}
 		}
 		l.mu.Unlock()
@@ -280,7 +333,7 @@ func TestDockerClusterRecovery(t *testing.T) {
 	if err != nil || sentinel.GetRevision() == 0 {
 		t.Fatalf("write sentinel: %v %v", sentinel, err)
 	}
-	load := &recoveryLoad{journal: map[string]uint64{key: sentinel.GetRevision()}}
+	load := &recoveryLoad{namespace: recoveryNamespace, journal: map[string]uint64{key: sentinel.GetRevision()}}
 	var workers sync.WaitGroup
 	workCtx, stopWork := context.WithCancel(ctx)
 	defer func() { stopWork(); workers.Wait() }()
@@ -353,9 +406,48 @@ func TestDockerClusterRecovery(t *testing.T) {
 	t.Logf("leader failover and quorum loss verified: attempts=%v acknowledgements=%v", attempts, acks)
 
 	recoveryDocker(t, ctx, c, "start", affected[leader], affected[follower])
+	// Docker can assign a different published port when a stopped container
+	// rejoins the test network.
+	for _, restarted := range []int{leader, follower} {
+		admin[restarted] = recoveryDocker(t, ctx, c, "port", affected[restarted], "7001")
+	}
 	waitRecovery(t, ctx, "acknowledged writes after quorum restore", func() bool {
 		_, acks := load.counts(t, afterQuorumRestore)
 		return acks[0] >= 256
+	})
+
+	// Recreate the original bootstrap voter with a fresh project-scoped volume.
+	// The other two voters retain their storage and the original volume is
+	// left alone until the isolated project is cleaned up.
+	recoveryDocker(t, ctx, c, "stop", "-t", "3", affected[0])
+	_, beforeReplacement := load.counts(t, afterQuorumRestore)
+	waitRecovery(t, ctx, "surviving quorum before empty volume replacement", func() bool {
+		_, acks := load.counts(t, afterQuorumRestore)
+		return acks[0] >= beforeReplacement[0]+256
+	})
+	override := filepath.Join(t.TempDir(), "replacement.yml")
+	replacementYAML := []byte("services:\n  s0n0:\n    volumes:\n      - s0n0-replacement-data:/data\n")
+	if err := os.WriteFile(override, replacementYAML, 0600); err != nil {
+		t.Fatal(err)
+	}
+	c.args = append(append([]string(nil), c.args...), "-f", override)
+	recoveryDocker(t, ctx, c, "up", "-d", "--no-build", "--pull", "never", "--no-deps", "--force-recreate", affected[0])
+	replacement := recoveryClient(t, ctx, c, affected[0])
+	var replacementProbe string
+	defer func() {
+		if t.Failed() {
+			t.Logf("empty replacement probe: %s", replacementProbe)
+		}
+	}()
+	waitRecovery(t, ctx, "original revision restored locally on the empty replacement", func() bool {
+		call, cancel := context.WithTimeout(ctx, time.Second)
+		defer cancel()
+		value, err := replacement.Get(call, &kvstorev1.GetRequest{
+			Namespace: recoveryNamespace, Key: key, Consistency: kvstorev1.ReadConsistency_READ_CONSISTENCY_EVENTUAL,
+		})
+		encoded, encodeErr := sharding.EncodeRevision(0, value.GetRevision())
+		replacementProbe = fmt.Sprintf("found=%t encoded revision=%d want=%d read error=%v encoding error=%v", value.GetFound(), encoded, sentinel.GetRevision(), err, encodeErr)
+		return err == nil && encodeErr == nil && value.GetFound() && string(value.GetValue()) == key && encoded == sentinel.GetRevision()
 	})
 
 	// Kill every service while the writers are active. Do not replace any volume.
@@ -366,13 +458,13 @@ func TestDockerClusterRecovery(t *testing.T) {
 	recoveryDocker(t, ctx, c, "start")
 	router = recoveryClient(t, ctx, c, "router")
 	waitRecoveryRouter(t, ctx, router)
-	verifyAcknowledgedWrites(t, ctx, router, load.journal)
+	verifyAcknowledgedWrites(t, ctx, router, recoveryNamespace, load.journal)
 }
 
-func verifyAcknowledgedWrites(t *testing.T, ctx context.Context, router kvstorev1.KVStoreClient, journal map[string]uint64) {
+func verifyAcknowledgedWrites(t *testing.T, ctx context.Context, router kvstorev1.KVStoreClient, namespace string, journal map[string]uint64) {
 	t.Helper()
 	total := len(journal)
-	stream, err := router.Scan(ctx, &kvstorev1.ScanRequest{Namespace: recoveryNamespace, UseVectorCursor: true})
+	stream, err := router.Scan(ctx, &kvstorev1.ScanRequest{Namespace: namespace, UseVectorCursor: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -397,7 +489,7 @@ func verifyAcknowledgedWrites(t *testing.T, ctx context.Context, router kvstorev
 		}
 	}
 	if !checkpoint || len(journal) != 0 {
-		t.Fatalf("full crash lost %d/%d acknowledged writes, scan checkpoint=%t", len(journal), total, checkpoint)
+		t.Fatalf("%d/%d acknowledged writes missing, scan checkpoint=%t", len(journal), total, checkpoint)
 	}
 	t.Logf("crash recovery verified: %d acknowledged keys, values and revisions", total)
 }

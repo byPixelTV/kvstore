@@ -30,23 +30,84 @@ Jeder Voter braucht seine eigene persistente `/data`-Zuordnung und eine stabile 
 
 Compose setzt `KVSTORE_CLUSTER_MIN_VOTERS=3`. Der Leader gibt Client-RPCs nach einer Raft-Barriere mit der erwarteten Voter-Konfiguration frei. Membership und Bootstrap laufen unabhängig davon über Raft und die Admin-API. Bei eigener Orchestrierung dieselbe Variable auf allen Votern setzen.
 
-## Authentifizierter Clientzugang und Monitoring
+## Production mit Compose
 
-Für mTLS den Compose-Overlay ergänzen. Im Verzeichnis `KVSTORE_TLS_DIR` liegen `server.crt` mit Zertifikatskette, `server.key` und `client-ca.crt` für eine dedizierte Client-CA. Der Envoy-Prozess braucht Lesezugriff. Clients brauchen ein von dieser CA signiertes Clientzertifikat und müssen die Identität des Serverzertifikats prüfen. Alle von der Client-CA autorisierten Clients haben Zugriff auf die gRPC-Daten-API.
+Für einen einzelnen Server `compose.solo.production.yml` ergänzen. Für Shards wird `compose.production.yml` mit `compose.sharded.yml` kombiniert. Für beide Profile `KVSTORE_IMAGE` auf den freigegebenen Image-Digest setzen. Im Verzeichnis `KVSTORE_TLS_DIR` liegen `server.crt` mit Zertifikatskette, `server.key` und `client-ca.crt` für die dedizierte Client-CA. Der Container läuft mit UID 65532 und braucht Lesezugriff auf diese Dateien. Die in `-addr` oder der Anwendung verwendete gRPC-Adresse muss zum Serverzertifikat passen.
 
 ```sh
 export KVSTORE_TLS_DIR=/pfad/zu/kvstore-tls
 export KVSTORE_METRICS_TOKEN="$(openssl rand -hex 32)"
-docker compose -f compose.sharded.yml -f compose.production.yml up -d --no-build
+export KVSTORE_IMAGE=registry.example/kvstore@sha256:IMAGE_DIGEST
+docker compose -p kvstore-solo -f compose.yml -f compose.solo.production.yml up -d --no-build
 ```
 
-Der Overlay veröffentlicht Envoy standardmäßig auf `127.0.0.1:5443` und entfernt den veröffentlichten Klartext-gRPC-Port des Routers. Für externe Clients `KVSTORE_INGRESS_IP` auf die vorgesehene Host-Adresse setzen. Admin und Metriken bleiben auf Loopback. Nach einem Zertifikatswechsel Envoy neu starten.
+Für Shards außerdem `KVSTORE_JOIN_TOKEN` und `KVSTORE_ROUTER_ADMIN_TOKEN` aus dem Secret-Store setzen. Der Produktions-Overlay schaltet den automatischen Raft-Bootstrap ab. Nach dem Start mit drei leeren Volumes je Gruppe einmal gezielt den vorgesehenen Voter initialisieren. Alle drei Admin-Endpunkte einer Gruppe müssen erreichbar sein und denselben Bootstrap-Plan melden. Bei einer vorhandenen Gruppe bleiben die Daten und die Mitgliedschaft auf den Volumes erhalten. Nach Ausfall und Ersatz eines Voters wird derselbe Voter mit seiner bisherigen ID und Adresse gestartet. Der Ersatz holt seinen Stand von der bestehenden Mehrheit.
 
-Der Overlay verwendet Envoy 1.40.2. `KVSTORE_ENVOY_IMAGE` erlaubt einen eigenen Image-Tag oder Digest. [Envoy-Versionshistorie](https://www.envoyproxy.io/docs/envoy/v1.40.2/version_history/current)
+```sh
+docker compose -p kvstore-live -f compose.sharded.yml -f compose.production.yml up -d --no-build
+# Nur beim erstmaligen Aufbau mit leeren Volumes, sobald alle Voter gestartet sind.
+for port in 17101 17105 17109; do
+  printf 'Authorization: Bearer %s\n' "$KVSTORE_JOIN_TOKEN" | \
+    curl --fail --silent --show-error --retry 12 --retry-connrefused --retry-delay 1 \
+      --header @- --request POST "http://127.0.0.1:$port/v1/cluster/bootstrap" || break
+done
+```
 
-Prometheus auf dem Compose-Host mit `deploy/prometheus/prometheus.yml` konfigurieren. Den Wert von `KVSTORE_METRICS_TOKEN` als Datei `token` neben der Konfiguration ablegen, lesbar nur für den Scraper. Die beiliegenden Regeln erkennen ausgefallene Scrapes, unerreichbare Shards, fehlgeschlagene Mutationen einschließlich Teilfehlern in BatchWrite, p99 ab 100 ms, wenig freien Speicher und Pebble-Compaction-Fehler. Den Benachrichtigungskanal im vorhandenen Alertmanager konfigurieren und bei der Abnahme eine Meldung auslösen.
+Der Daten-Endpunkt verwendet natives gRPC-mTLS und bindet standardmäßig an `127.0.0.1:5443`. Für externe Clients `KVSTORE_INGRESS_IP` auf die vorgesehene Host-Adresse setzen. Admin und Metriken sind nur über die Host-Loopback-Adresse veröffentlicht. TLS-Dateien und Zugriffsregeln werden beim Start gelesen. Nach einem Wechsel die Solo-Instanz im Wartungsfenster oder die Router nacheinander neu starten.
+
+Bei einem Upgrade vom früheren Envoy-Overlay den bisherigen `ingress`-Container des Projekts im Wartungsfenster stoppen, damit der Router den TLS-Port übernehmen kann. Die Raft-Volumes behalten.
+
+### Rechte pro Namespace
+
+Optional `KVSTORE_ACCESS_POLICY_FILE=/etc/kvstore/tls/policy.json` setzen und die Datei ins TLS-Verzeichnis legen. Jedes Clientzertifikat braucht genau einen URI-SAN. Die Regel gilt für exakt diese Identität und die angegebenen Namespaces. `read` deckt `Get`, `Scan` und `Watch` ab. `write` deckt `Set`, `Delete` und `BatchWrite` ab. Ein gemischter Batch wird vollständig abgewiesen, sobald für einen Eintrag das Schreibrecht fehlt. `allow_head` erlaubt ausdrücklich den globalen Cursor. Für `kvimport` sind `allow_head` sowie Lese- und Schreibrechte auf die Ziel-Namespaces nötig.
+
+```json
+{
+  "clients": [
+    {"uri": "spiffe://example.org/apps/game", "read": ["players"], "write": ["players"], "allow_head": true},
+    {"uri": "spiffe://example.org/apps/reporting", "read": ["players"]}
+  ]
+}
+```
+
+Ohne Policy dürfen alle Clients der Client-CA auf die Daten-API zugreifen. Die Produktionsprofile begrenzen pro Solo-Instanz oder Router standardmäßig auf 1024 zeitgleiche Unary-Requests und 256 Streams. `KVSTORE_MAX_INFLIGHT_RPCS` und `KVSTORE_MAX_STREAMS` setzen diese Grenzen. Bei Überschreitung antwortet der Server vor der Ausführung mit `RESOURCE_EXHAUSTED`.
+
+### Monitoring und Endpunkt-Abnahme
+
+Für Shards `deploy/prometheus/prometheus.yml`, für Solo `deploy/prometheus/prometheus-standalone.yml` auf dem Compose-Host verwenden. Den Wert von `KVSTORE_METRICS_TOKEN` als Datei `token` neben der Konfiguration ablegen, lesbar nur für den Scraper. Das Prometheus-Target muss `UP` melden. Die Regeln prüfen Scrapes, Shard-Routen, Mutationsfehler, p99, Ressourcenlimits, wenig freien Speicher und Pebble-Compaction-Fehler. Bei der Abnahme auf einer isolierten Staging-Instanz das Unary-Limit vorübergehend auf `1` setzen, mit 32 gleichzeitigen Schreibern wiederholt `ResourceExhausted` auslösen und den Eingang von `KVStoreResourceExhausted` im Alertmanager prüfen. Anschließend das Produktionslimit wiederherstellen.
+
+```sh
+kvbench -addr kvstore.example.org:5443 -namespace staging-perf \
+  -tls-ca server-ca.crt -tls-cert client.crt -tls-key client.key \
+  -mode mixed -consistency strong -read-percent 50 -batch-size 16 \
+  -concurrency 256 -connections 16 -keys 16384 -target-ops 23000 -duration 5m -json
+```
+
+Auf Staging zusätzlich die Verbindung ohne Clientzertifikat und mit einem Zertifikat einer fremden CA prüfen. Bei gesetzter Policy auch einen Client mit gültigem Zertifikat ohne Namespace-Recht prüfen. Der erste `Get` von `kvbench` prüft die Verbindung, bevor der Benchmark Daten schreibt.
 
 ## Offline-Backup und Restore
+
+### Solo
+
+Schreibverkehr beenden und den Container stoppen. Während der Sicherung und Wiederherstellung automatische und manuelle Starts des Projekts sperren. Der Helper findet das persistente `/data`-Volume anhand des gestoppten Compose-Dienstes. Das Backup-Verzeichnis muss neu sein. Anschließend das vollständige Verzeichnis samt Prüfsummen verschlüsselt außerhalb des Hosts ablegen.
+
+```sh
+docker compose -p kvstore-solo -f compose.yml -f compose.solo.production.yml stop kvstore
+bash scripts/backup-standalone-linux.sh backup kvstore-solo /pfad/zu/neu/kvstore-backup
+docker compose -p kvstore-solo -f compose.yml -f compose.solo.production.yml start kvstore
+```
+
+Nach Verlust der Platte auf einem anderen Host ein neues Compose-Projekt mit einem leeren Volume und demselben Image-Digest anlegen. `create` bereitet den Container vor, damit der Helper das Zielvolume eindeutig prüfen kann.
+
+```sh
+docker compose -p kvstore-solo-restore -f compose.yml -f compose.solo.production.yml create --no-build kvstore
+bash scripts/backup-standalone-linux.sh restore kvstore-solo-restore /pfad/zu/kvstore-backup
+docker compose -p kvstore-solo-restore -f compose.yml -f compose.solo.production.yml start kvstore
+```
+
+Vor Freigabe am Restore-Endpunkt Werte, Revisionen und aktive TTL-Fristen mit dem Sicherungsstand vergleichen. `KVSTORE_TEST_IMAGE` auf das lokal verfügbare Image setzen und `bash scripts/test-backup-standalone-linux.sh` für eine isolierte Probe ausführen. Beim Verlust des Solo-Hosts bleibt der Dienst während des Wiederanlaufs offline. Bei Plattenverlust ist der letzte extern gesicherte Stand das Wiederherstellungsziel.
+
+### Shards
 
 Dieses Verfahren sichert die neun Compose-Volumes gemeinsam. Es erhält Raft-Logs, Pebble-Daten, Revisionen und Routing-Metadaten. Die Quelltopologie muss für die gesamte Sicherung gestoppt bleiben. Vor dem Stoppen laufende Slot-Migrationen abschließen und neuen Clientverkehr sperren.
 
@@ -86,11 +147,27 @@ Den Ausfalltest mit demselben lokal verfügbaren Image und Docker Compose ab Ver
 KVSTORE_TEST_IMAGE=kvstore:multiraft-dev go test -tags integration -count=1 -v ./cmd/kvbench -run '^TestDockerClusterRecovery$'
 ```
 
-Der Ausfalltest sendet fortlaufend BatchWrites durch den Router, beendet den Leader eines Shards abrupt und wartet auf bestätigte Writes vom neuen Leader. Beim anschließenden Quorumverlust prüft er abgelehnte STRONG Reads und ausbleibende Write-Bestätigungen auf dem betroffenen Shard sowie weiterlaufende Writes auf den anderen Shards. Nach einem abrupten Neustart der gesamten Topologie vergleicht er alle bestätigten Schlüssel, Werte und Revisionen vom Client mit dem persistierten Zustand.
+Der Ausfalltest sendet fortlaufend BatchWrites durch den Router, beendet den Leader eines Shards abrupt und wartet auf bestätigte Writes vom neuen Leader. Beim anschließenden Quorumverlust prüft er abgelehnte STRONG Reads und ausbleibende Write-Bestätigungen auf dem betroffenen Shard sowie weiterlaufende Writes auf den anderen Shards. Der ursprüngliche Bootstrap-Voter wird mit einem leeren Ersatzvolume gestartet, und ein lokaler Read prüft den replizierten Stand. Nach einem abrupten Neustart der gesamten Topologie vergleicht der Test alle bestätigten Schlüssel, Werte und Revisionen vom Client mit dem persistierten Zustand.
 
-## Mehrere Hosts
+## Mehrere Hosts und Kubernetes
 
 Auf drei physischen Hosts je einen Voter aus jeder der drei Gruppen platzieren. Pro Gruppe denselben Bootstrap-Voter und dieselbe Liste der Admin-Seeds auf allen drei Votern konfigurieren. Pro Voter `KVSTORE_NODE_ID`, `KVSTORE_RAFT_ADVERTISE_ADDR`, `KVSTORE_GRPC_ADVERTISE_ADDR` und `KVSTORE_ADMIN_ADVERTISE_ADDR` stabil halten. Werden mehrere Voter vom selben Host veröffentlicht, brauchen sie unterscheidbare Ports. Beim Router die gRPC-Endpunkte in `KVSTORE_SHARDS` in derselben Gruppenzuordnung eintragen. Der Einzelhost-Compose-Aufbau eignet sich für die lokale Qualifikation. Vor einer Freigabe für mehrere Hosts den Lasttest mit einem Client am produktionsnahen Router und den Ausfall einer ganzen Fehlerdomäne auf Staging prüfen.
+
+Jede der drei Gruppen verwendet `KVSTORE_RAFT_BOOTSTRAP_MODE=explicit` und `KVSTORE_CLUSTER_MIN_VOTERS=3`. Den ersten Bootstrap je Gruppe ausschließlich bei der Erstinstallation ausführen. Nach Verlust eines Hosts auf einem Ersatzhost dieselben Voter-Identitäten und erreichbaren Adressen verwenden. Erst sicherstellen, dass der alte Host diese Identitäten nicht gleichzeitig verwendet. Den öffentlichen gRPC-Endpunkt über mindestens zwei Router auf getrennten Hosts mit mTLS und einem redundanten Load Balancer betreiben.
+
+Die [Kubernetes-Profile](kubernetes/README.md) dokumentieren Solo, eine Raft-Gruppe und die vollständige sharded Topologie. Die Abnahme umfasst einen echten Worker-Ausfall bei Schreiblast, den Catch-up eines Ersatz-Voters auf frischem Speicher und einen kontrollierten Rollout.
+
+Der externe Recovery-Test sendet während eines angekündigten Zeitfensters BatchWrites in einen reservierten Staging-Namespace. Er meldet die längste Unterbrechung zwischen Bestätigungen je Shard und prüft anschließend alle bestätigten Werte und Revisionen über mTLS. Den Host während des angezeigten Fensters abschalten und den tatsächlichen Ausfall separat anhand der Infrastrukturmeldungen belegen. Der Test verändert keine Hosts.
+
+```sh
+KVSTORE_HOST_TEST_ADDR=kvstore-staging.example.org:5443 \
+KVSTORE_HOST_TEST_NAMESPACE=staging-host-recovery \
+KVSTORE_HOST_TEST_TLS_CA=server-ca.crt \
+KVSTORE_HOST_TEST_TLS_CERT=client.crt \
+KVSTORE_HOST_TEST_TLS_KEY=client.key \
+KVSTORE_HOST_TEST_WINDOW=2m \
+  go test -tags integration -count=1 -v ./cmd/kvbench -run '^TestExternalHostRecovery$'
+```
 
 ## KVStore v1 aus MongoDB importieren
 

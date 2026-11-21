@@ -10,23 +10,3 @@ spec:
     - name: grpc
       port: 50051
       targetPort: grpc
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: kvstore-raft-headless
-spec:
-  clusterIP: None
-  publishNotReadyAddresses: true
-  selector:
-    app: kvstore-raft
-  ports:
-    - name: grpc
-      port: 50051
-      targetPort: grpc
-    - name: raft
-      port: 7000
-      targetPort: raft
-    - name: admin
-      port: 7001
-      targetPort: admin

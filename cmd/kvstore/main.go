@@ -14,6 +14,7 @@ import (
 	"time"
 
 	kvstorev1 "github.com/byPixelTV/kvstore/gen/go/kvstore/v1"
+	"github.com/byPixelTV/kvstore/internal/access"
 	"github.com/byPixelTV/kvstore/internal/cluster"
 	"github.com/byPixelTV/kvstore/internal/config"
 	"github.com/byPixelTV/kvstore/internal/grpcserver"
@@ -33,19 +34,27 @@ import (
 var version = "dev" // -ldflags=-X main.version=...
 
 func main() {
-	if len(os.Args) == 2 {
+	if len(os.Args) >= 2 {
 		switch os.Args[1] {
 		case "--version", "-version":
 			fmt.Println("kvstore", version)
 			return
 		case "healthcheck":
+			if len(os.Args) > 3 {
+				slog.Error("usage: kvstore healthcheck [readiness|liveness]")
+				os.Exit(1)
+			}
+			service := "readiness"
+			if len(os.Args) == 3 {
+				service = os.Args[2]
+			}
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			defer cancel()
 			addr := os.Getenv("KVSTORE_HEALTH_ADDR")
 			if addr == "" {
 				addr = "127.0.0.1:50051"
 			}
-			if err := healthcheck.Check(ctx, addr); err != nil {
+			if err := healthcheck.CheckService(ctx, addr, service); err != nil {
 				slog.Error("healthcheck failed", "error", err)
 				os.Exit(1)
 			}
@@ -66,8 +75,16 @@ func run() (runErr error) {
 	if err != nil {
 		return err
 	}
+	endpoint, err := access.Load()
+	if err != nil {
+		return err
+	}
+	if cfg.Mode == config.ModeCluster && endpoint.UsesTLS() {
+		return errors.New("native gRPC mTLS is supported in standalone and router mode; use a private encrypted network for Raft voters")
+	}
 	var store storage.Store
 	var node *cluster.Node
+	grpcOptions := endpoint.ServerOptions()
 	if cfg.Mode == config.ModeCluster {
 		node, err = cluster.Open(cfg)
 		if err != nil {
@@ -85,6 +102,14 @@ func run() (runErr error) {
 		}
 		defer func() { runErr = errors.Join(runErr, persistent.Close()) }()
 		store = persistent
+		observe, stopMetrics, err := startStandaloneMetrics(persistent, cfg.DataDir)
+		if err != nil {
+			return err
+		}
+		defer stopMetrics()
+		if observe != nil {
+			grpcOptions = append(grpcOptions, grpc.UnaryInterceptor(observe))
+		}
 	}
 
 	listener, err := net.Listen("tcp", cfg.ListenAddr)
@@ -93,7 +118,6 @@ func run() (runErr error) {
 	}
 	defer listener.Close()
 	service := kvstore.New(store)
-	grpcOptions := []grpc.ServerOption{}
 	if node != nil {
 		grpcOptions = append(grpcOptions, grpc.StreamInterceptor(func(srv any, stream grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
 			if strings.HasPrefix(info.FullMethod, "/kvstore.v1.KVStore/") && !node.ClientTrafficReady() {
@@ -138,6 +162,11 @@ func run() (runErr error) {
 	}
 	healthSrv := health.NewServer()
 	healthpb.RegisterHealthServer(grpcServer, healthSrv)
+	stopLocalHealth, err := healthcheck.ListenLocal(endpoint.HealthListenAddr, healthSrv)
+	if err != nil {
+		return err
+	}
+	defer stopLocalHealth()
 	healthSrv.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)
 	healthSrv.SetServingStatus("liveness", healthpb.HealthCheckResponse_SERVING)
 	if node == nil {

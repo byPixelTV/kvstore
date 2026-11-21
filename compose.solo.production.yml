@@ -1,0 +1,20 @@
+# Apply together with compose.yml for a single production instance.
+services:
+  kvstore:
+    image: ${KVSTORE_IMAGE:?Set KVSTORE_IMAGE to a release image digest}
+    environment:
+      KVSTORE_TLS_CERT_FILE: /etc/kvstore/tls/server.crt
+      KVSTORE_TLS_KEY_FILE: /etc/kvstore/tls/server.key
+      KVSTORE_TLS_CLIENT_CA_FILE: /etc/kvstore/tls/client-ca.crt
+      KVSTORE_ACCESS_POLICY_FILE: ${KVSTORE_ACCESS_POLICY_FILE:-}
+      KVSTORE_HEALTH_LISTEN_ADDR: '127.0.0.1:50052'
+      KVSTORE_HEALTH_ADDR: '127.0.0.1:50052'
+      KVSTORE_METRICS_TOKEN: ${KVSTORE_METRICS_TOKEN:?Set KVSTORE_METRICS_TOKEN}
+      KVSTORE_STANDALONE_ADMIN_ADDR: ':7002'
+      KVSTORE_MAX_INFLIGHT_RPCS: ${KVSTORE_MAX_INFLIGHT_RPCS:-1024}
+      KVSTORE_MAX_STREAMS: ${KVSTORE_MAX_STREAMS:-256}
+    volumes:
+      - ${KVSTORE_TLS_DIR:?Set KVSTORE_TLS_DIR}:/etc/kvstore/tls:ro
+    ports: !override
+      - '${KVSTORE_INGRESS_IP:-127.0.0.1}:${KVSTORE_INGRESS_PORT:-5443}:50051'
+      - '127.0.0.1:17110:7002'

@@ -1,0 +1,24 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kvstore-raft
+spec:
+  podSelector:
+    matchLabels: {app: kvstore-raft}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: {app: kvstore-raft}
+      ports:
+        - {protocol: TCP, port: 50051}
+        - {protocol: TCP, port: 7000}
+        - {protocol: TCP, port: 7001}
+  egress:
+    - to:
+        - podSelector:
+            matchLabels: {app: kvstore-raft}
+      ports:
+        - {protocol: TCP, port: 50051}
+        - {protocol: TCP, port: 7000}
+        - {protocol: TCP, port: 7001}

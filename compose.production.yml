@@ -1,21 +1,30 @@
-# Apply together with compose.sharded.yml.
+# Apply together with compose.sharded.yml. Bootstrap each group explicitly on first install.
+x-raft-production: &raft-production
+  environment:
+    KVSTORE_RAFT_BOOTSTRAP_MODE: explicit
 services:
+  s0n0: *raft-production
+  s0n1: *raft-production
+  s0n2: *raft-production
+  s1n0: *raft-production
+  s1n1: *raft-production
+  s1n2: *raft-production
+  s2n0: *raft-production
+  s2n1: *raft-production
+  s2n2: *raft-production
   router:
+    environment:
+      KVSTORE_TLS_CERT_FILE: /etc/kvstore/tls/server.crt
+      KVSTORE_TLS_KEY_FILE: /etc/kvstore/tls/server.key
+      KVSTORE_TLS_CLIENT_CA_FILE: /etc/kvstore/tls/client-ca.crt
+      KVSTORE_ACCESS_POLICY_FILE: ${KVSTORE_ACCESS_POLICY_FILE:-}
+      KVSTORE_HEALTH_LISTEN_ADDR: '127.0.0.1:50052'
+      KVSTORE_HEALTH_ADDR: '127.0.0.1:50052'
+      KVSTORE_MAX_INFLIGHT_RPCS: ${KVSTORE_MAX_INFLIGHT_RPCS:-1024}
+      KVSTORE_MAX_STREAMS: ${KVSTORE_MAX_STREAMS:-256}
+    volumes:
+      - ${KVSTORE_TLS_DIR:?Set KVSTORE_TLS_DIR}:/etc/kvstore/tls:ro
     ports: !override
+      - '${KVSTORE_INGRESS_IP:-127.0.0.1}:${KVSTORE_INGRESS_PORT:-5443}:50051'
       - '127.0.0.1:17110:7002'
     stop_grace_period: 30s
-  ingress:
-    image: ${KVSTORE_ENVOY_IMAGE:-envoyproxy/envoy:v1.40.2}
-    command: ["-c", "/etc/envoy/production.yaml", "--log-level", "warning"]
-    depends_on:
-      router:
-        condition: service_healthy
-    restart: unless-stopped
-    read_only: true
-    security_opt: ["no-new-privileges:true"]
-    cap_drop: [ALL]
-    volumes:
-      - ./deploy/envoy/production.yaml:/etc/envoy/production.yaml:ro
-      - ${KVSTORE_TLS_DIR:?Set KVSTORE_TLS_DIR}:/etc/kvstore/tls:ro
-    ports:
-      - '${KVSTORE_INGRESS_IP:-127.0.0.1}:${KVSTORE_INGRESS_PORT:-5443}:5443'

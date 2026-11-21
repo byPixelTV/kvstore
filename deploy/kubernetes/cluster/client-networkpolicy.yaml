@@ -1,0 +1,14 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kvstore-raft-clients
+spec:
+  podSelector:
+    matchLabels: {app: kvstore-raft}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: {app.kubernetes.io/component: kvstore-client}
+      ports:
+        - {protocol: TCP, port: 50051}

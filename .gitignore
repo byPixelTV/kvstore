@@ -74,6 +74,7 @@ mem.prof
 # ==========================================
 /tmp/
 /temp/
+.unlazy/
 *.tmp
 *.kvsnapshot
 *.temp

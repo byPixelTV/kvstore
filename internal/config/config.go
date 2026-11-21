@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -12,6 +13,9 @@ import (
 const (
 	ModeStandalone = "standalone"
 	ModeCluster    = "cluster"
+
+	RaftBootstrapLegacy   = "legacy"
+	RaftBootstrapExplicit = "explicit"
 )
 
 type Config struct {
@@ -28,6 +32,7 @@ type Config struct {
 	ClusterSeeds          []string
 	Bootstrap             bool
 	BootstrapNode         string
+	RaftBootstrapMode     string
 	JoinToken             string
 	MinRaftVoters         int
 	ReadBatchWindow       time.Duration
@@ -61,6 +66,37 @@ func validAddr(addr string) error {
 		return fmt.Errorf("invalid numeric port: %q", port)
 	}
 	return nil
+}
+
+// RaftBootstrapPeers returns the canonical set of planned admin endpoints,
+// including this node's own endpoint even if it is omitted from the seeds.
+func (c Config) RaftBootstrapPeers() []string {
+	peers := append(slices.Clone(c.ClusterSeeds), c.AdminAdvertiseAddr)
+	slices.Sort(peers)
+	return slices.Compact(peers)
+}
+
+func (c Config) ValidateRaftBootstrap() error {
+	switch c.RaftBootstrapMode {
+	case "", RaftBootstrapLegacy:
+		return nil
+	case RaftBootstrapExplicit:
+		if c.BootstrapNode == "" || strings.ContainsAny(c.BootstrapNode, " \r\t\n/") {
+			return fmt.Errorf("invalid KVSTORE_CLUSTER_BOOTSTRAP_NODE %q", c.BootstrapNode)
+		}
+		if c.JoinToken == "" {
+			return fmt.Errorf("KVSTORE_JOIN_TOKEN must be set in explicit bootstrap mode")
+		}
+		if c.MinRaftVoters < 3 {
+			return fmt.Errorf("KVSTORE_CLUSTER_MIN_VOTERS must be at least 3 in explicit bootstrap mode")
+		}
+		if len(c.RaftBootstrapPeers()) < c.MinRaftVoters {
+			return fmt.Errorf("KVSTORE_CLUSTER_SEEDS must include at least %d distinct other admin endpoints in explicit bootstrap mode", c.MinRaftVoters-1)
+		}
+		return nil
+	default:
+		return fmt.Errorf("invalid KVSTORE_RAFT_BOOTSTRAP_MODE %q", c.RaftBootstrapMode)
+	}
 }
 
 func Load() (Config, error) {
@@ -165,6 +201,10 @@ func Load() (Config, error) {
 	if err != nil || c.MinRaftVoters < 1 {
 		return c, fmt.Errorf("KVSTORE_CLUSTER_MIN_VOTERS must be a positive integer")
 	}
+	c.RaftBootstrapMode = getenv("KVSTORE_RAFT_BOOTSTRAP_MODE", RaftBootstrapLegacy)
+	if c.RaftBootstrapMode == "" {
+		return c, fmt.Errorf("invalid KVSTORE_RAFT_BOOTSTRAP_MODE %q", c.RaftBootstrapMode)
+	}
 	c.Bootstrap = c.NodeID == c.BootstrapNode
 	for _, v := range strings.Split(os.Getenv("KVSTORE_CLUSTER_SEEDS"), ",") {
 		if v = strings.TrimSpace(v); v != "" {
@@ -189,6 +229,9 @@ func Load() (Config, error) {
 	}
 	if c.JoinToken == "" {
 		return c, fmt.Errorf("KVSTORE_JOIN_TOKEN must be set in cluster mode")
+	}
+	if err := c.ValidateRaftBootstrap(); err != nil {
+		return c, err
 	}
 	if !c.Bootstrap && len(c.ClusterSeeds) == 0 {
 		return c, fmt.Errorf("KVSTORE_CLUSTER_SEEDS required for joining nodes")

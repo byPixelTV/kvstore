@@ -17,6 +17,8 @@ import (
 	"time"
 
 	kvstorev1 "github.com/byPixelTV/kvstore/gen/go/kvstore/v1"
+	"github.com/byPixelTV/kvstore/internal/access"
+	"github.com/byPixelTV/kvstore/internal/healthcheck"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -359,13 +361,16 @@ func (r *Router) Head(ctx context.Context, req *kvstorev1.HeadRequest) (*kvstore
 }
 
 // ServeRouter starts the existing KVStore binary in stateless router mode.
-// Production deployments put the router behind the mTLS proxy.
 func ServeRouter() error {
 	listen := getenv("KVSTORE_LISTEN_ADDR", ":50051")
 	if _, _, err := net.SplitHostPort(listen); err != nil {
 		return fmt.Errorf("router listen address: %w", err)
 	}
 	layout, err := ParseLayout(os.Getenv("KVSTORE_SHARDS"))
+	if err != nil {
+		return err
+	}
+	endpoint, err := access.Load()
 	if err != nil {
 		return err
 	}
@@ -403,7 +408,7 @@ func ServeRouter() error {
 	}
 	router.ready.Store(true)
 	var metrics http.Handler
-	var serverOptions []grpc.ServerOption
+	serverOptions := endpoint.ServerOptions()
 	if os.Getenv("KVSTORE_METRICS_TOKEN") != "" {
 		var observe grpc.UnaryServerInterceptor
 		metrics, observe = router.metrics()
@@ -431,6 +436,11 @@ func ServeRouter() error {
 	healthServer.SetServingStatus("liveness", healthpb.HealthCheckResponse_SERVING)
 	healthServer.SetServingStatus("readiness", healthpb.HealthCheckResponse_SERVING)
 	healthpb.RegisterHealthServer(server, healthServer)
+	stopLocalHealth, err := healthcheck.ListenLocal(endpoint.HealthListenAddr, healthServer)
+	if err != nil {
+		return err
+	}
+	defer stopLocalHealth()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	done := make(chan struct{})

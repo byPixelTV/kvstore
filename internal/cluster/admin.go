@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/byPixelTV/kvstore/internal/config"
 	"github.com/byPixelTV/kvstore/internal/monitoring"
 	"github.com/hashicorp/raft"
 )
@@ -23,6 +24,10 @@ func (n *Node) StartAdmin() error {
 	mux.HandleFunc("POST /v1/cluster/join", n.handleJoin)
 	mux.HandleFunc("POST /v1/cluster/snapshot", n.handleSnapshot)
 	mux.HandleFunc("GET /v1/cluster/performance", n.handlePerformance)
+	if n.cfg.RaftBootstrapMode == config.RaftBootstrapExplicit {
+		mux.HandleFunc("GET "+raftBootstrapPath, n.handleBootstrapStatus)
+		mux.HandleFunc("POST "+raftBootstrapPath, n.handleBootstrap)
+	}
 	if token := os.Getenv("KVSTORE_METRICS_TOKEN"); token != "" {
 		mux.HandleFunc("GET /metrics", monitoring.Protect(token, http.HandlerFunc(n.handleMetrics)))
 	}
@@ -140,7 +145,9 @@ func (n *Node) addVoter(ctx context.Context, peer peerInfo) error {
 		return err
 	}
 	for _, existing := range configFuture.Configuration().Servers {
-		if string(existing.ID) == peer.ID && string(existing.Address) == peer.RaftAddr {
+		if string(existing.ID) == peer.ID && string(existing.Address) == peer.RaftAddr && existing.Suffrage == raft.Voter {
+			// An empty replacement with the same identity and address is
+			// repaired by the existing replication stream.
 			return nil
 		}
 	}
@@ -167,7 +174,11 @@ func (n *Node) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 // RegisterSelf runs until the bootstrapped leader has replicated its own
 // routing metadata. Re-elections may occur, so failures are retried.
 func (n *Node) RegisterSelf(ctx context.Context) {
-	if !n.cfg.Bootstrap {
+	designated := n.cfg.Bootstrap
+	if n.cfg.RaftBootstrapMode == config.RaftBootstrapExplicit {
+		designated = n.cfg.NodeID == n.cfg.BootstrapNode
+	}
+	if !designated {
 		return
 	}
 	ticker := time.NewTicker(time.Second)

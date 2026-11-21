@@ -4,8 +4,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"errors"
 	"flag"
 	"fmt"
@@ -19,12 +17,11 @@ import (
 	"time"
 
 	kv "github.com/byPixelTV/kvstore/gen/go/kvstore/v1"
+	"github.com/byPixelTV/kvstore/internal/clienttls"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/credentials/insecure"
 )
 
 const (
@@ -255,34 +252,8 @@ func requireTargetExpiration(ctx context.Context, client kv.KVStoreClient) error
 	return nil
 }
 
-func targetCredentials(ca, cert, key string) (credentials.TransportCredentials, error) {
-	if ca == "" && cert == "" && key == "" {
-		return insecure.NewCredentials(), nil
-	}
-	if ca == "" || (cert == "") != (key == "") {
-		return nil, errors.New("TLS requires -tls-ca and both or neither of -tls-cert and -tls-key")
-	}
-	pem, err := os.ReadFile(ca)
-	if err != nil {
-		return nil, err
-	}
-	roots := x509.NewCertPool()
-	if !roots.AppendCertsFromPEM(pem) {
-		return nil, errors.New("TLS CA file contains no valid certificates")
-	}
-	cfg := &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12}
-	if cert != "" {
-		pair, err := tls.LoadX509KeyPair(cert, key)
-		if err != nil {
-			return nil, err
-		}
-		cfg.Certificates = []tls.Certificate{pair}
-	}
-	return credentials.NewTLS(cfg), nil
-}
-
 func connectTarget(addr, ca, cert, key string) (*grpc.ClientConn, error) {
-	creds, err := targetCredentials(ca, cert, key)
+	creds, err := clienttls.Credentials(ca, cert, key)
 	if err != nil {
 		return nil, err
 	}

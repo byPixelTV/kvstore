@@ -201,6 +201,16 @@ func (s *Store) ReadChanges(ctx context.Context, after uint64, limit int) (chang
 }
 func (s *Store) Notify() <-chan struct{} { return s.notifier.Subscribe() }
 
+func (s *Store) CompactionCounts() (completed, failed int64) {
+	s.gate.RLock()
+	defer s.gate.RUnlock()
+	if s.closed {
+		return 0, 0
+	}
+	metrics := s.db.Metrics()
+	return metrics.Compact.Count, metrics.Compact.FailedCount
+}
+
 func (s *Store) Head(ctx context.Context) (uint64, uint64, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, 0, err

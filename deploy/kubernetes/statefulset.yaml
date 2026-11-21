@@ -6,7 +6,7 @@ metadata:
     app: kvstore
 spec:
   serviceName: kvstore-headless
-  replicas: 1  # DO NOT scale beyond 1 before implementing Raft.
+  replicas: 1
   selector:
     matchLabels:
       app: kvstore
@@ -15,6 +15,10 @@ spec:
       labels:
         app: kvstore
     spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      nodeSelector:
+        kubernetes.io/os: linux
       terminationGracePeriodSeconds: 30
       securityContext:
         runAsUser: 65532
@@ -32,6 +36,8 @@ spec:
             - name: grpc
               containerPort: 50051
               protocol: TCP
+            - name: metrics
+              containerPort: 7002
           env:
             - name: KVSTORE_MODE
               value: standalone
@@ -48,27 +54,55 @@ spec:
               value: /data
             - name: KVSTORE_SHUTDOWN_TIMEOUT
               value: 15s
+            - name: KVSTORE_HEALTH_LISTEN_ADDR
+              value: 127.0.0.1:50052
+            - name: KVSTORE_HEALTH_ADDR
+              value: 127.0.0.1:50052
+            - name: KVSTORE_MAX_INFLIGHT_RPCS
+              value: '1024'
+            - name: KVSTORE_MAX_STREAMS
+              value: '256'
+            - name: KVSTORE_STANDALONE_ADMIN_ADDR
+              value: ':7002'
+            - name: KVSTORE_METRICS_TOKEN
+              valueFrom:
+                secretKeyRef: {name: kvstore-metrics, key: token, optional: true}
+            - name: KVSTORE_TLS_CERT_FILE
+              value: /etc/kvstore/tls/server.crt
+            - name: KVSTORE_TLS_KEY_FILE
+              value: /etc/kvstore/tls/server.key
+            - name: KVSTORE_TLS_CLIENT_CA_FILE
+              value: /etc/kvstore/tls/client-ca.crt
+            - name: KVSTORE_ACCESS_POLICY_FILE
+              valueFrom:
+                secretKeyRef:
+                  name: kvstore-access-policy
+                  key: path
+                  optional: true
           volumeMounts:
             - name: data
               mountPath: /data
+            - name: tls
+              mountPath: /etc/kvstore/tls
+              readOnly: true
+            - name: access-policy
+              mountPath: /etc/kvstore/access
+              readOnly: true
           startupProbe:
-            grpc:
-              port: 50051
-              service: liveness
+            exec:
+              command: [/usr/local/bin/kvstore, healthcheck, liveness]
             periodSeconds: 5
             timeoutSeconds: 2
             failureThreshold: 30
           readinessProbe:
-            grpc:
-              port: 50051
-              service: readiness
+            exec:
+              command: [/usr/local/bin/kvstore, healthcheck, readiness]
             periodSeconds: 5
             timeoutSeconds: 2
             failureThreshold: 3
           livenessProbe:
-            grpc:
-              port: 50051
-              service: liveness
+            exec:
+              command: [/usr/local/bin/kvstore, healthcheck, liveness]
             periodSeconds: 10
             timeoutSeconds: 2
             failureThreshold: 3
@@ -84,6 +118,19 @@ spec:
             readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
+      volumes:
+        - name: tls
+          secret:
+            secretName: kvstore-server-tls
+            defaultMode: 0440
+        - name: access-policy
+          secret:
+            secretName: kvstore-access-policy
+            optional: true
+            defaultMode: 0440
+            items:
+              - key: policy.json
+                path: policy.json
   volumeClaimTemplates:
     - metadata:
         name: data

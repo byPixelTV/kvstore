@@ -2,7 +2,7 @@ groups:
   - name: kvstore
     rules:
       - alert: KVStoreScrapeUnavailable
-        expr: up{job=~"kvstore-(router|voters)"} == 0
+        expr: up{job=~"kvstore-(router|voters|standalone)"} == 0
         for: 1m
         annotations:
           summary: "KVStore metrics unavailable on {{ $labels.instance }}"
@@ -26,6 +26,11 @@ groups:
         for: 5m
         annotations:
           summary: "KVStore p99 is at least 100 ms for {{ $labels.method }}"
+      - alert: KVStoreResourceExhausted
+        expr: sum by (instance, method) (increase(kvstore_rpc_total{code="ResourceExhausted"}[5m])) > 0
+        for: 1m
+        annotations:
+          summary: "KVStore rejected {{ $labels.method }} requests due to a resource limit"
       - alert: KVStoreDiskSpaceLow
         expr: kvstore_disk_available_bytes / kvstore_disk_total_bytes < 0.15
         for: 5m

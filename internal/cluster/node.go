@@ -39,6 +39,7 @@ type Node struct {
 	raft        *raft.Raft
 	fsm         *FSM
 	raftStore   *raftwal.WAL
+	snapshots   raft.SnapshotStore
 	logStats    *raftLogMetrics
 	transport   *raft.NetworkTransport
 	admin       *http.Server
@@ -57,6 +58,9 @@ var _ storage.Store = (*Node)(nil)
 func Open(cfg config.Config) (_ *Node, err error) {
 	if cfg.Mode != config.ModeCluster {
 		return nil, errors.New("cluster node requires cluster mode")
+	}
+	if err := cfg.ValidateRaftBootstrap(); err != nil {
+		return nil, err
 	}
 	fsm, err := openFSM(filepath.Join(cfg.DataDir, "state"))
 	if err != nil {
@@ -115,6 +119,10 @@ func Open(cfg config.Config) (_ *Node, err error) {
 	if err != nil {
 		return nil, err
 	}
+	explicitBootstrap := cfg.RaftBootstrapMode == config.RaftBootstrapExplicit
+	if explicitBootstrap && !existing && (fsm.applied != 0 || fsm.revision != 0) {
+		return nil, errors.New("replicated FSM data exists without Raft state")
+	}
 	// Recently appended log entries are re-read for follower replication.
 	// Cache only reads; StoreLogs still writes to the durable raft-wal.
 	logMetrics := &raftLogMetrics{}
@@ -134,14 +142,16 @@ func Open(cfg config.Config) (_ *Node, err error) {
 	if err != nil {
 		return nil, err
 	}
-	if cfg.Bootstrap && !existing {
-		future := r.BootstrapCluster(raft.Configuration{Servers: []raft.Server{{ID: raft.ServerID(cfg.NodeID), Address: raft.ServerAddress(cfg.RaftAdvertiseAddr), Suffrage: raft.Voter}}})
-		if err = future.Error(); err != nil {
+	if cfg.Bootstrap && !explicitBootstrap && !existing {
+		if err = bootstrapRaft(r, cfg); err != nil {
 			_ = r.Shutdown().Error()
 			return nil, fmt.Errorf("bootstrap raft: %w", err)
 		}
 	}
-	node := &Node{cfg: cfg, raft: r, fsm: fsm, raftStore: walStore, transport: transport, clients: make(map[string]*grpc.ClientConn)}
+	node := &Node{
+		cfg: cfg, raft: r, fsm: fsm, raftStore: walStore, snapshots: snaps,
+		transport: transport, clients: make(map[string]*grpc.ClientConn),
+	}
 	node.logStats = logMetrics
 	batchWindow := cfg.ReadBatchWindow
 	if batchWindow == 0 { // support tests and manually constructed Config values
@@ -533,9 +543,10 @@ func (n *Node) member() bool {
 }
 
 // JoinUntilMember requests membership from seeds until added or shutdown.
-// The first voter is explicitly bootstrapped; joiners NEVER self-bootstrap.
+// A legacy bootstrap node starts its own group. All explicit-mode nodes
+// attempt to join, including the designated node after volume replacement.
 func (n *Node) JoinUntilMember(ctx context.Context) {
-	if n.cfg.Bootstrap {
+	if n.cfg.Bootstrap && n.cfg.RaftBootstrapMode != config.RaftBootstrapExplicit {
 		return
 	}
 	ticker := time.NewTicker(2 * time.Second)
@@ -546,6 +557,9 @@ func (n *Node) JoinUntilMember(ctx context.Context) {
 			return
 		}
 		for _, seed := range n.cfg.ClusterSeeds {
+			if seed == n.cfg.AdminAdvertiseAddr {
+				continue
+			}
 			if err := n.tryJoin(ctx, seed); err != nil {
 				slog.Debug("join seed unavailable", "seed", seed, "error", err)
 			}

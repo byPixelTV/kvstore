@@ -7,12 +7,32 @@ spec:
   serviceName: kvstore-raft-headless
   replicas: 3
   podManagementPolicy: Parallel  # avoids waiting for quorum/joins in ordinal order
+  updateStrategy:
+    type: OnDelete
   selector:
     matchLabels: {app: kvstore-raft}
   template:
     metadata:
-      labels: {app: kvstore-raft}
+      labels:
+        app: kvstore-raft
+        app.kubernetes.io/component: kvstore-voter
     spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      nodeSelector:
+        kubernetes.io/os: linux
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - {key: node-role.kubernetes.io/control-plane, operator: DoesNotExist}
+                  - {key: node-role.kubernetes.io/master, operator: DoesNotExist}
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels: {app: kvstore-raft}
       terminationGracePeriodSeconds: 40
       securityContext:
         runAsUser: 65532
@@ -34,21 +54,30 @@ spec:
               valueFrom: {fieldRef: {fieldPath: metadata.name}}
             - name: POD_NAMESPACE
               valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+            - {name: STATEFULSET_NAME, value: kvstore-raft}
+            - {name: CLUSTER_DOMAIN, value: cluster.local}
+            - {name: PEER_DNS, value: '$(STATEFULSET_NAME)-headless.$(POD_NAMESPACE).svc.$(CLUSTER_DOMAIN)'}
             - {name: KVSTORE_MODE, value: cluster}
             - {name: KVSTORE_NODE_ID, value: '$(POD_NAME)'}
             - {name: KVSTORE_LISTEN_ADDR, value: ':50051'}
             - {name: KVSTORE_RAFT_BIND_ADDR, value: ':7000'}
             - {name: KVSTORE_ADMIN_LISTEN_ADDR, value: ':7001'}
-            - {name: KVSTORE_RAFT_ADVERTISE_ADDR, value: '$(POD_NAME).kvstore-raft-headless.$(POD_NAMESPACE).svc.cluster.local:7000'}
-            - {name: KVSTORE_GRPC_ADVERTISE_ADDR, value: '$(POD_NAME).kvstore-raft-headless.$(POD_NAMESPACE).svc.cluster.local:50051'}
-            - {name: KVSTORE_ADMIN_ADVERTISE_ADDR, value: '$(POD_NAME).kvstore-raft-headless.$(POD_NAMESPACE).svc.cluster.local:7001'}
-            - {name: KVSTORE_CLUSTER_BOOTSTRAP_NODE, value: kvstore-raft-0}
-            - {name: KVSTORE_CLUSTER_SEEDS, value: 'kvstore-raft-0.kvstore-raft-headless:7001,kvstore-raft-1.kvstore-raft-headless:7001,kvstore-raft-2.kvstore-raft-headless:7001'}
+            - {name: KVSTORE_RAFT_ADVERTISE_ADDR, value: '$(POD_NAME).$(PEER_DNS):7000'}
+            - {name: KVSTORE_GRPC_ADVERTISE_ADDR, value: '$(POD_NAME).$(PEER_DNS):50051'}
+            - {name: KVSTORE_ADMIN_ADVERTISE_ADDR, value: '$(POD_NAME).$(PEER_DNS):7001'}
+            - {name: KVSTORE_RAFT_BOOTSTRAP_MODE, value: explicit}
+            - {name: KVSTORE_CLUSTER_MIN_VOTERS, value: '3'}
+            - {name: KVSTORE_CLUSTER_BOOTSTRAP_NODE, value: '$(STATEFULSET_NAME)-0'}
+            - name: KVSTORE_CLUSTER_SEEDS
+              value: '$(STATEFULSET_NAME)-0.$(PEER_DNS):7001,$(STATEFULSET_NAME)-1.$(PEER_DNS):7001,$(STATEFULSET_NAME)-2.$(PEER_DNS):7001'
             - name: KVSTORE_JOIN_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: kvstore-raft-auth
                   key: join-token
+            - name: KVSTORE_METRICS_TOKEN
+              valueFrom:
+                secretKeyRef: {name: kvstore-metrics, key: token, optional: true}
             - {name: KVSTORE_DATA_DIR, value: /data}
             - {name: KVSTORE_SHUTDOWN_TIMEOUT, value: 20s}
           volumeMounts: [{name: data, mountPath: /data}]

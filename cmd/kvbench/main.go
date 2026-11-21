@@ -22,6 +22,7 @@ import (
 	"time"
 
 	kvstorev1 "github.com/byPixelTV/kvstore/gen/go/kvstore/v1"
+	"github.com/byPixelTV/kvstore/internal/clienttls"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -153,6 +154,9 @@ type options struct {
 	jsonOutput    bool
 	leaderMap     string
 	leaderRefresh time.Duration
+	tlsCA         string
+	tlsCert       string
+	tlsKey        string
 }
 
 func main() {
@@ -177,6 +181,9 @@ func main() {
 	flag.IntVar(&opt.watchRate, "watch-rate", 100, "target writes/second in watch mode")
 	flag.StringVar(&opt.leaderMap, "leader-map", "", "route directly to Raft leader using gRPC metadata; map advertised=reachable targets, comma-separated")
 	flag.DurationVar(&opt.leaderRefresh, "leader-refresh", 2*time.Second, "leader re-discovery interval when -leader-map is set; 0 disables periodic refresh")
+	flag.StringVar(&opt.tlsCA, "tls-ca", "", "PEM CA for the server certificate; -addr must match the certificate name")
+	flag.StringVar(&opt.tlsCert, "tls-cert", "", "PEM mTLS client certificate chain")
+	flag.StringVar(&opt.tlsKey, "tls-key", "", "PEM mTLS client private key")
 	flag.BoolVar(&opt.jsonOutput, "json", false, "write JSON report to standard output")
 	flag.Parse()
 	if !valid(opt) {
@@ -228,6 +235,13 @@ func resolveLeaderAddress(bootstrap, mapping string, timeout time.Duration) (str
 }
 
 func run(opt options) error {
+	if opt.leaderMap != "" && (opt.tlsCA != "" || opt.tlsCert != "" || opt.tlsKey != "") {
+		return errors.New("use the TLS router endpoint without -leader-map")
+	}
+	creds, err := clienttls.Credentials(opt.tlsCA, opt.tlsCert, opt.tlsKey)
+	if err != nil {
+		return err
+	}
 	var runID [8]byte
 	if _, err := rand.Read(runID[:]); err != nil {
 		return err
@@ -257,7 +271,7 @@ func run(opt options) error {
 			}
 		}()
 		for i := 0; i < opt.connections; i++ {
-			conn, err := grpc.NewClient(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
+			conn, err := grpc.NewClient(target, grpc.WithTransportCredentials(creds))
 			if err != nil {
 				return err
 			}
@@ -266,7 +280,7 @@ func run(opt options) error {
 		}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), opt.timeout)
-	_, err := clients[0].Get(ctx, &kvstorev1.GetRequest{Namespace: namespace, Key: "__kvbench_connectivity_probe", Consistency: kvstorev1.ReadConsistency_READ_CONSISTENCY_STRONG})
+	_, err = clients[0].Get(ctx, &kvstorev1.GetRequest{Namespace: namespace, Key: "__kvbench_connectivity_probe", Consistency: kvstorev1.ReadConsistency_READ_CONSISTENCY_STRONG})
 	cancel()
 	if err != nil {
 		return fmt.Errorf("GET connectivity check: %w", err)

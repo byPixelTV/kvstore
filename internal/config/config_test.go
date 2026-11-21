@@ -2,6 +2,7 @@ package config
 
 import (
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -51,6 +52,7 @@ func TestStandaloneDefaults(t *testing.T) {
 }
 func TestClusterConfiguration(t *testing.T) {
 	t.Setenv("KVSTORE_MODE", "cluster")
+	t.Setenv("KVSTORE_RAFT_BOOTSTRAP_MODE", "legacy")
 	t.Setenv("KVSTORE_NODE_ID", "kvstore-1")
 	t.Setenv("KVSTORE_CLUSTER_BOOTSTRAP_NODE", "kvstore-0")
 	t.Setenv("KVSTORE_RAFT_ADVERTISE_ADDR", "kvstore-1:7000")
@@ -64,6 +66,42 @@ func TestClusterConfiguration(t *testing.T) {
 	}
 	if c.Bootstrap || len(c.ClusterSeeds) != 1 {
 		t.Fatalf("unexpected config %+v", c)
+	}
+}
+
+func TestExplicitRaftBootstrapConfiguration(t *testing.T) {
+	t.Setenv("KVSTORE_MODE", "cluster")
+	t.Setenv("KVSTORE_NODE_ID", "kvstore-0")
+	t.Setenv("KVSTORE_CLUSTER_BOOTSTRAP_NODE", "kvstore-0")
+	t.Setenv("KVSTORE_RAFT_ADVERTISE_ADDR", "kvstore-0:7000")
+	t.Setenv("KVSTORE_GRPC_ADVERTISE_ADDR", "kvstore-0:50051")
+	t.Setenv("KVSTORE_ADMIN_ADVERTISE_ADDR", "kvstore-0:7001")
+	t.Setenv("KVSTORE_JOIN_TOKEN", "secret")
+	t.Setenv("KVSTORE_CLUSTER_MIN_VOTERS", "3")
+	t.Setenv("KVSTORE_CLUSTER_SEEDS", "kvstore-0:7001, kvstore-1:7001, kvstore-2:7001")
+	t.Setenv("KVSTORE_RAFT_BOOTSTRAP_MODE", "explicit")
+
+	cfg, err := Load()
+	if err != nil || !cfg.Bootstrap || cfg.RaftBootstrapMode != RaftBootstrapExplicit || len(cfg.RaftBootstrapPeers()) != 3 {
+		t.Fatalf("explicit bootstrap config %+v, error %v", cfg, err)
+	}
+	for _, tc := range []struct {
+		key   string
+		value string
+	}{
+		{"KVSTORE_RAFT_BOOTSTRAP_MODE", "automatic"},
+		{"KVSTORE_RAFT_BOOTSTRAP_MODE", ""},
+		{"KVSTORE_CLUSTER_SEEDS", ""},
+		{"KVSTORE_CLUSTER_SEEDS", "kvstore-0:7001,kvstore-1:7001,kvstore-1:7001"},
+		{"KVSTORE_CLUSTER_MIN_VOTERS", "2"},
+		{"KVSTORE_CLUSTER_BOOTSTRAP_NODE", ""},
+	} {
+		t.Run(tc.key+"/"+tc.value, func(t *testing.T) {
+			t.Setenv(tc.key, tc.value)
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), tc.key) {
+				t.Fatalf("expected %s error, got %v", tc.key, err)
+			}
+		})
 	}
 }
 func TestRejectMissingJoinToken(t *testing.T) {
