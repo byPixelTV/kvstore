@@ -45,7 +45,7 @@ With a policy, match each client's URI SAN to its exact `read` and `write` names
 
 With only the TLS Secret, every client certified by the client CA can use the data API. Keep the policy Secret provisioned when enforcing namespace grants. Restart the TLS workloads after updating the certificate or policy Secrets. Grant `pods/portforward` only to authorized operators. Raft admin is restricted by NetworkPolicy to same-group voters and the scraper pods described below. Router admin accepts only designated scraper pods over the pod network. Raft and router admin operations require their own tokens. In the single-group profile, label private client pods in this namespace `app.kubernetes.io/component=kvstore-client` to allow port `50051`.
 
-To use named API keys, provision them off-cluster with `kvstore apikey` and project the registry directory as a Secret on the solo pod or all routers. Set `KVSTORE_API_KEYS_DIR` to the projected mount path in the site overlay. Mount the full Secret directory so Kubernetes can propagate updates. Set `KVSTORE_TLS_CLIENT_CA_FILE` to an empty value for API-key-only access and leave the certificate access policy unset. Keep the TLS server certificate mounted. Update the Secret after each creation or revocation. Propagation to all pods depends on Kubernetes Secret projection before KVStore's reload takes effect. [API key administration](../production.md#benannte-api-keys)
+To use named API keys, provision them off-cluster with `kvstore apikey` and project the registry directory as a Secret on the solo pod or all routers. Set `KVSTORE_API_KEYS_DIR` to the projected mount path in the site overlay. Mount the full Secret directory so Kubernetes can propagate updates. Set `KVSTORE_TLS_CLIENT_CA_FILE` to an empty value for API-key-only access and leave the certificate access policy unset. Keep the TLS server certificate mounted. Update the Secret after each creation or revocation. Propagation to all pods depends on Kubernetes Secret projection before KVStore's reload takes effect. [API key administration](../production.md#named-api-keys)
 
 ```sh
 profile=path/to/site/kustomization-dir
@@ -81,7 +81,9 @@ Repeat for every new group, moving the forward each time. The POST checks that a
 
 ### Metrics
 
-To enable scraping, create `kvstore-metrics` with `--from-file=token` before startup. Label the authorized Prometheus scraper pods in the same namespace `app.kubernetes.io/component=kvstore-metrics-scraper`. Give the scraper the metrics token as a bearer credential. Use Kubernetes pod discovery to scrape `/metrics` from each voter pod on `7001` (`kvstore-voters`), each router pod on `7002` (`kvstore-router`), and the solo pod on `7002` (`kvstore-standalone`) for the deployed profile. Load the rules in `deploy/prometheus/kvstore-alerts.yml` and test delivery through the site's Alertmanager. Solo and router start with caps of `1024` in-flight RPCs and `256` concurrent streams. Tune for the target workload and track rejected RPCs.
+All profiles start with `/metrics` disabled by default. To enable scraping, create the optional `kvstore-metrics` Secret with `--from-file=token` and roll out the affected workloads if they are already running. Label the authorized Prometheus scraper pods in the same namespace `app.kubernetes.io/component=kvstore-metrics-scraper`. Give the scraper the metrics token as a bearer credential. Use Kubernetes pod discovery to scrape `/metrics` from each voter pod on `7001` (`kvstore-voters`), each router pod on `7002` (`kvstore-router`), and the solo pod on `7002` (`kvstore-standalone`) for the deployed profile. Load the rules in `deploy/prometheus/kvstore-alerts.yml` and test delivery through the site's Alertmanager.
+
+Solo and router enforce caps of `1024` in-flight RPCs and `256` concurrent streams with any monitoring configuration. Tune for the target workload and track rejected RPCs.
 
 ## Scheduled upgrades
 
@@ -91,7 +93,7 @@ After the voters are healthy on the new image, update `deployment/kvstore-router
 
 ## Staging host loss and fresh-volume recovery
 
-Run the [external recovery test](../production.md#mehrere-hosts-und-kubernetes) against the staging LoadBalancer during this drill. Set `KVSTORE_HOST_TEST_NAMESPACE` to the namespace in the client's access policy. The client needs `allow_head` to read the cluster cursor. The test verifies values and revisions for all acknowledged writes and reports the longest gap between acknowledgements per shard. Record the actual worker shutdown independently.
+Run the [external recovery test](../production.md#multiple-hosts-and-kubernetes) against the staging LoadBalancer during this drill. Set `KVSTORE_HOST_TEST_NAMESPACE` to the namespace in the client's access policy. The client needs `allow_head` to read the cluster cursor. The test verifies values and revisions for all acknowledged writes and reports the longest gap between acknowledgements per shard. Record the actual worker shutdown independently.
 
 Run on an isolated staging installation with three healthy groups, two routers, a spare worker, a portable StorageClass, and disposable data. Record the output of `kubectl -n "$ns" get pod,pvc -o wide`, the expected voters on each worker, and existing Pod and PVC UIDs. Run the tests through the real TLS load balancer, using `grpcurl`, `jq` and `openssl` from the repository root.
 

@@ -19,6 +19,8 @@ services:
       KVSTORE_HEALTH_ADDR: "127.0.0.1:50051"
       KVSTORE_DATA_DIR: "/data"
       KVSTORE_SHUTDOWN_TIMEOUT: "15s"
+      KVSTORE_METRICS_TOKEN: ${KVSTORE_METRICS_TOKEN:-}
+      KVSTORE_STANDALONE_ADMIN_ADDR: ":7002"
     volumes:
       - kvstore-data:/data
     healthcheck:

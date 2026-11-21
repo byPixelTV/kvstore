@@ -21,26 +21,26 @@ for option in "$@"; do
   case "$option" in
     --volumes) remove_volumes=true ;;
     --dry-run) dry_run=true ;;
-    *) echo "Unbekannte Option: $option" >&2; exit 2 ;;
+    *) echo "Unknown option: $option" >&2; exit 2 ;;
   esac
 done
 
 case "$mode" in
   benchmarks)
     if $remove_volumes; then
-      echo "--volumes ist nur im Modus 'all' nötig (Benchmarks entfernen Projekt-Volumes automatisch)." >&2
+      echo "--volumes applies only in 'all' mode. Benchmark cleanup removes project volumes automatically." >&2
       exit 2
     fi
     ;;
   all) ;;
   *)
-    echo "Aufruf: $0 [benchmarks|all] [--volumes] [--dry-run]" >&2
+    echo "Usage: $0 [benchmarks|all] [--volumes] [--dry-run]" >&2
     exit 2
     ;;
 esac
 
-command -v docker >/dev/null || { echo "Docker fehlt." >&2; exit 1; }
-docker info >/dev/null 2>&1 || { echo "Docker-Daemon nicht erreichbar." >&2; exit 1; }
+command -v docker >/dev/null || { echo "Docker is required." >&2; exit 1; }
+docker info >/dev/null 2>&1 || { echo "Docker daemon is unreachable." >&2; exit 1; }
 
 run() {
   if $dry_run; then
@@ -56,20 +56,20 @@ if [[ "$mode" == "all" ]]; then
   mapfile -t containers < <(docker ps -aq)
   mapfile -t volumes < <(docker volume ls -q)
 
-  echo "ACHTUNG: Dieser Modus entfernt ALLE ${#containers[@]} Docker-Container, auch PRODUKTIVE!"
-  echo "Container-Dateisysteme und anonyme Volumes werden gelöscht. Images bleiben erhalten."
+  echo "WARNING: This mode removes all ${#containers[@]} Docker containers, including production containers."
+  echo "It deletes container filesystems and anonymous volumes. Images are kept."
   if $remove_volumes; then
-    echo "ZUSÄTZLICH werden ALLE ${#volumes[@]} benannten Docker-Volumes gelöscht (Datenbanken, Welten usw.)!"
+    echo "It also deletes all ${#volumes[@]} named Docker volumes, including databases and game worlds."
   else
-    echo "Benannte Volumes bleiben erhalten. Mit '--volumes' würden auch sie gelöscht."
+    echo "Named volumes are kept. Pass '--volumes' to delete them as well."
   fi
 
   if ! $dry_run; then
-    [[ -t 0 ]] || { echo "Nur interaktiv ausführbar. Kein Cleanup durchgeführt." >&2; exit 1; }
+    [[ -t 0 ]] || { echo "Cleanup requires an interactive terminal. No resources were removed." >&2; exit 1; }
     expected="DELETE ALL CONTAINERS"
     if $remove_volumes; then expected="DELETE ALL DOCKER DATA"; fi
-    read -r -p "Zur Bestätigung exakt '$expected' eingeben: " confirmation
-    [[ "$confirmation" == "$expected" ]] || { echo "Abgebrochen."; exit 1; }
+    read -r -p "Type '$expected' exactly to confirm: " confirmation
+    [[ "$confirmation" == "$expected" ]] || { echo "Cancelled."; exit 1; }
   fi
 
   if ((${#containers[@]} > 0)); then
@@ -78,7 +78,7 @@ if [[ "$mode" == "all" ]]; then
   if $remove_volumes && ((${#volumes[@]} > 0)); then
     run docker volume rm "${volumes[@]}"
   fi
-  echo "Fertig."
+  echo "Done."
   exit 0
 fi
 
@@ -97,15 +97,15 @@ mapfile -t projects < <(
 )
 
 if ((${#projects[@]} == 0)); then
-  echo "Keine kvbench-* Docker-Compose-Projekte gefunden."
+  echo "No kvbench-* Docker Compose projects found."
   exit 0
 fi
 
-printf 'Benchmark-Projekte (%s):\n' "${#projects[@]}"
+printf 'Benchmark projects (%s):\n' "${#projects[@]}"
 printf '  %s\n' "${projects[@]}"
 
 for project in "${projects[@]}"; do
-  echo "== Entferne $project =="
+  echo "== Removing $project =="
   mapfile -t containers < <(docker ps -aq --filter "label=com.docker.compose.project=$project")
   mapfile -t networks < <(docker network ls -q --filter "label=com.docker.compose.project=$project")
   mapfile -t volumes < <(docker volume ls -q --filter "label=com.docker.compose.project=$project")
@@ -116,4 +116,4 @@ for project in "${projects[@]}"; do
   if ((${#volumes[@]} > 0)); then run docker volume rm "${volumes[@]}"; fi
 done
 
-echo "Benchmark-Cleanup abgeschlossen. Andere Docker-Projekte wurden nicht angerührt."
+echo "Benchmark cleanup complete. Other Docker projects were left untouched."

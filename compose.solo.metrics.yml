@@ -1,0 +1,7 @@
+# Publish the authenticated Solo metrics endpoint for a scraper on the Compose host.
+services:
+  kvstore:
+    environment:
+      KVSTORE_METRICS_TOKEN: ${KVSTORE_METRICS_TOKEN:?Set KVSTORE_METRICS_TOKEN}
+    ports:
+      - '127.0.0.1:17110:7002'
