@@ -1,0 +1,32 @@
+{
+  "name": "@bypixeltv/kvstore",
+  "version": "0.0.0",
+  "description": "Node.js and TypeScript gRPC client for KVStore",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": ["dist"],
+  "engines": { "node": ">=22" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/byPixelTV/kvstore.git",
+    "directory": "sdk/typescript"
+  },
+  "scripts": {
+    "build": "tsc && node copy-proto.mjs",
+    "test": "npm run build && node --test",
+    "prepack": "npm run build"
+  },
+  "dependencies": {
+    "@grpc/grpc-js": "^1.14.0",
+    "@grpc/proto-loader": "^0.8.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.9.3"
+  }
+}

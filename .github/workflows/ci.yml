@@ -70,6 +70,48 @@ jobs:
       - name: Test (race detector)
         run: go test -race -count=1 ./...
 
+  test-sdks:
+    name: Test and package SDKs
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: sdk/typescript/package-lock.json
+
+      - name: Test clients against KVStore and verify packages
+        shell: bash
+        env:
+          BUILD_VERSION: ${{ needs.test.outputs.build_version }}
+        run: |
+          set -euo pipefail
+          version="$BUILD_VERSION"
+          if [[ "$version" == *-SNAPSHOT ]]; then
+            version="$version.$GITHUB_RUN_NUMBER"
+          fi
+          bash scripts/test-sdks.sh "$version" "$RUNNER_TEMP/kvstore-npm"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: sdk-npm
+          path: ${{ runner.temp }}/kvstore-npm/*.tgz
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 14
+
   build:
     name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
     needs: test

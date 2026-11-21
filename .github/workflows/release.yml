@@ -9,9 +9,7 @@ on:
     branches: [stable, nightly]
 
 permissions:
-  contents: write
-  packages: write
-  actions: read
+  contents: read
 
 concurrency:
   group: kvstore-publish-${{ github.event.workflow_run.head_branch }}
@@ -26,6 +24,11 @@ jobs:
           (github.event.workflow_run.head_branch == 'stable' ||
            github.event.workflow_run.head_branch == 'nightly') }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+      actions: read
+      id-token: write
     steps:
       - name: Checkout tested commit
         uses: actions/checkout@v7
@@ -53,11 +56,15 @@ jobs:
           if [[ "$BRANCH" == "stable" ]]; then
             build_version="$version"
             release_tag="v${version}"
+            npm_version="$version"
+            npm_channel=latest
             tags="${image}:${version}"
             tags+=$'\n'"${image}:latest"
           else
             build_version="${version}-SNAPSHOT"
             release_tag="v${version}-SNAPSHOT.${CI_RUN_NUMBER}.${CI_RUN_ATTEMPT}"
+            npm_version="${version}-SNAPSHOT.${CI_RUN_NUMBER}"
+            npm_channel=snapshot
             tags="${image}:${version}-SNAPSHOT.${CI_RUN_NUMBER}.${CI_RUN_ATTEMPT}"
             tags+=$'\n'"${image}:${version}-SNAPSHOT"
             tags+=$'\n'"${image}:nightly"
@@ -67,6 +74,8 @@ jobs:
             echo "branch=$BRANCH"
             echo "build_version=$build_version"
             echo "tag=$release_tag"
+            echo "npm_version=$npm_version"
+            echo "npm_channel=$npm_channel"
             echo "sha=$CI_SHA"
             echo 'docker_tags<<EOF'
             echo "$tags"
@@ -119,6 +128,76 @@ jobs:
           done
           test "$(find ./dist -type f | wc -l)" -eq "${#archives[@]}"
 
+      - name: Download the tested npm package
+        if: steps.gate.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_RUN_ID: ${{ github.event.workflow_run.id }}
+        run: gh run download "$CI_RUN_ID" --repo "$GITHUB_REPOSITORY" --name sdk-npm --dir "$RUNNER_TEMP/kvstore-npm"
+
+      - uses: actions/setup-java@v5
+        if: steps.gate.outputs.publish == 'true'
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: actions/setup-node@v6
+        if: steps.gate.outputs.publish == 'true'
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
+      - name: Publish Kotlin SDK
+        if: steps.gate.outputs.publish == 'true'
+        working-directory: sdk/kotlin
+        shell: bash
+        env:
+          MAVEN_VERSION: ${{ steps.meta.outputs.build_version }}
+          CHANNEL: ${{ steps.meta.outputs.branch }}
+          ORG_GRADLE_PROJECT_bypixelUsername: ${{ secrets.BYPIXEL_REPO_USER }}
+          ORG_GRADLE_PROJECT_bypixelPassword: ${{ secrets.BYPIXEL_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ "$CHANNEL" == "stable" ]]; then
+            # A previous attempt may have published Maven before a later step failed.
+            bash ./gradlew --no-daemon "-PsdkVersion=$MAVEN_VERSION" publishMavenPublicationToVerificationRepository
+            artifact="kvstore-$MAVEN_VERSION"
+            base="dev/bypixel/kvstore/$MAVEN_VERSION"
+            complete=true
+            for file in "$artifact.jar" "$artifact-sources.jar" "$artifact.pom" "$artifact.module"; do
+              if ! curl -fs --max-time 20 "https://repo.bypixel.dev/releases/$base/$file" \
+                | cmp -s "build/verification-repo/$base/$file" -; then
+                complete=false
+                break
+              fi
+            done
+            if [[ "$complete" == true ]]; then
+              echo "Maven version $MAVEN_VERSION already matches this build"
+              exit 0
+            fi
+          fi
+          bash ./gradlew --no-daemon "-PsdkVersion=$MAVEN_VERSION" publishMavenPublicationToBypixelRepository
+
+      - name: Publish TypeScript SDK
+        if: steps.gate.outputs.publish == 'true'
+        shell: bash
+        env:
+          NPM_CONFIG_REGISTRY: https://registry.npmjs.org
+          NPM_VERSION: ${{ steps.meta.outputs.npm_version }}
+          NPM_CHANNEL: ${{ steps.meta.outputs.npm_channel }}
+        run: |
+          set -euo pipefail
+          package="@bypixeltv/kvstore"
+          archive="$RUNNER_TEMP/kvstore-npm/bypixeltv-kvstore-$NPM_VERSION.tgz"
+          test -s "$archive"
+          if npm publish "$archive" --access public --tag "$NPM_CHANNEL"; then
+            exit 0
+          fi
+          # npm versions are immutable. Retry only succeeds if an earlier attempt published these bytes.
+          expected="sha512-$(openssl dgst -sha512 -binary "$archive" | openssl base64 -A)"
+          actual="$(npm view "$package@$NPM_VERSION" dist.integrity)"
+          test "$expected" = "$actual"
+
       - name: Set up Docker Buildx
         if: steps.gate.outputs.publish == 'true'
         uses: docker/setup-buildx-action@v4
@@ -147,7 +226,7 @@ jobs:
             org.opencontainers.image.revision=${{ steps.meta.outputs.sha }}
             org.opencontainers.image.version=${{ steps.meta.outputs.build_version }}
 
-      - name: Create GitHub release
+      - name: Create GitHub release and Go module tag
         if: steps.gate.outputs.publish == 'true'
         shell: bash
         env:

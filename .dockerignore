@@ -22,3 +22,4 @@ README.md
 compose*.yml
 compose*.yaml
 deploy/
+sdk/

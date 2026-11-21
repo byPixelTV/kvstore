@@ -6,6 +6,12 @@
 /build/
 /dist/
 /out/
+/sdk/kotlin/.gradle/
+/sdk/kotlin/.kotlin/
+/sdk/kotlin/build/
+/sdk/typescript/dist/
+/sdk/typescript/node_modules/
+/sdk/typescript/*.tgz
 
 *.exe
 *.exe~

@@ -12,6 +12,7 @@ go.sum text eol=lf
 
 # Shell Scripts
 *.sh text eol=lf
+/sdk/kotlin/gradlew text eol=lf
 
 # PowerShell
 *.ps1 text eol=lf
