@@ -206,7 +206,9 @@ jobs:
         if: matrix.goos == 'windows'
         shell: powershell
         timeout-minutes: 5
-        run: .\scripts\start-kvctl-demo.ps1 -CheckOnly
+        run: |
+          $OutputEncoding = [Text.Encoding]::Unicode
+          .\scripts\start-kvctl-demo.ps1 -CheckOnly
 
       - name: Upload amd64 CLI artifact
         uses: actions/upload-artifact@v7

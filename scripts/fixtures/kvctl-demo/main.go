@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/byPixelTV/kvstore/internal/apikeys"
 	"github.com/byPixelTV/kvstore/internal/console"
 )
 
@@ -22,9 +23,13 @@ func main() {
 	if !input.Scan() {
 		log.Fatal("missing demo access key on stdin")
 	}
+	accessKey := strings.TrimSpace(input.Text())
+	if _, ok := apikeys.Digest(accessKey); !ok {
+		log.Fatal("invalid demo access key on stdin; use printable ASCII")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	client, identity, err := console.Open(ctx, console.Endpoint{Address: os.Args[1]}, strings.TrimSpace(input.Text()))
+	client, identity, err := console.Open(ctx, console.Endpoint{Address: os.Args[1]}, accessKey)
 	if err != nil {
 		log.Fatal(err)
 	}

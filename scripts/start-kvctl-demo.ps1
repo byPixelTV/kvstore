@@ -78,8 +78,15 @@ try {
         }
     }
 
-    $accessKey | go run ./scripts/fixtures/kvctl-demo $address
-    if ($LASTEXITCODE -ne 0) { throw 'Could not seed the demo data.' }
+    $previousOutputEncoding = $OutputEncoding
+    try {
+        # The access key is printable ASCII. Keep native stdin independent of the caller's encoding.
+        $OutputEncoding = [Text.Encoding]::ASCII
+        $accessKey | go run ./scripts/fixtures/kvctl-demo $address
+        if ($LASTEXITCODE -ne 0) { throw 'Could not seed the demo data.' }
+    } finally {
+        $OutputEncoding = $previousOutputEncoding
+    }
     if ($CheckOnly) {
         & $console --version
         if ($LASTEXITCODE -ne 0) { throw 'Could not run kvctl.' }
