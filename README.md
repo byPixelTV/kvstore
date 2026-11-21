@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/byPixelTV/kvstore/actions/workflows/ci.yml"><img src="https://github.com/byPixelTV/kvstore/actions/workflows/ci.yml/badge.svg?branch=nightly&amp;event=push" alt="Nightly CI"></a>
+  <a href="https://github.com/byPixelTV/kvstore/actions/workflows/ci.yml"><img src="https://github.com/byPixelTV/kvstore/actions/workflows/ci.yml/badge.svg?branch=stable&amp;event=push" alt="Stable CI"></a>
   <a href="https://github.com/byPixelTV/kvstore/actions/workflows/release.yml"><img src="https://github.com/byPixelTV/kvstore/actions/workflows/release.yml/badge.svg?event=workflow_run" alt="Release workflow"></a>
 </p>
 
@@ -29,8 +29,8 @@ process for local development or uses Raft replication and a routing layer for s
 deployments. Applications can read and write through Kotlin, Go or TypeScript and subscribe to
 committed changes through the same API.
 
-The current release channel is the **nightly preview**. Build the server from a checkout
-or find preview binaries on the [Releases page](https://github.com/byPixelTV/kvstore/releases).
+Download stable binaries from the [Releases page](https://github.com/byPixelTV/kvstore/releases/latest)
+or build the server from a checkout with the Compose quickstart.
 
 | Capability | What you can do |
 | --- | --- |
@@ -72,11 +72,11 @@ For a hands-on terminal console, try the [Windows demo](deploy/kvctl.md#try-the-
 Connect to the server endpoint in standalone or single-Raft mode, or to the router in a
 sharded deployment. See [release channels](#release-channels) for package versions and feeds.
 
-| Runtime | SDK | Preview package |
+| Runtime | SDK | Stable package |
 | --- | --- | --- |
-| Kotlin/JVM 17+ | [sdk/kotlin](sdk/kotlin) | `dev.bypixel:kvstore` on [ByPixel Snapshots](https://repo.bypixel.dev/snapshots/) |
+| Kotlin/JVM 17+ | [sdk/kotlin](sdk/kotlin) | `dev.bypixel:kvstore` on [ByPixel Maven](https://repo.bypixel.dev/releases/) |
 | Go 1.27.4+ | [sdk/go](sdk/go) | `github.com/byPixelTV/kvstore/sdk/go` |
-| Node.js 22+ | [sdk/typescript](sdk/typescript) | `@bypixeltv/kvstore@snapshot` on npm |
+| Node.js 22+ | [sdk/typescript](sdk/typescript) | `@bypixeltv/kvstore` on npm |
 
 Clients use TLS by default. Pass an API key when the server requires bearer authentication.
 All three accept custom trust roots and client certificates. Use explicit plaintext settings for a local plaintext endpoint.
@@ -90,10 +90,10 @@ Use the raw operations for binary data or a custom codec.
 ```kotlin
 repositories {
     mavenCentral()
-    maven("https://repo.bypixel.dev/snapshots/")
+    maven("https://repo.bypixel.dev/releases/")
 }
 dependencies {
-    implementation("dev.bypixel:kvstore:0.1.0-SNAPSHOT")
+    implementation("dev.bypixel:kvstore:1.0.0")
 }
 ```
 
@@ -131,10 +131,8 @@ Pass a custom `Json` instance to reuse application serializers.
 ### Go
 
 ```sh
-go get github.com/byPixelTV/kvstore/sdk/go@nightly
+go get github.com/byPixelTV/kvstore/sdk/go@v1.0.0
 ```
-
-To pin the preview, use an exact snapshot tag from GitHub Releases in place of `nightly`.
 
 ```go
 import kvstore "github.com/byPixelTV/kvstore/sdk/go"
@@ -155,8 +153,6 @@ player, found, err := kvstore.GetJSON[Player](ctx, client, "players", "alice")
 // Pass a cursor to resume, or nil to start at the current head.
 stream, err := client.Watch(ctx, "players", "", nil)
 ```
-
-For a private GitHub checkout, authenticate Git and set `GOPRIVATE=github.com/byPixelTV/kvstore`.
 
 ### TypeScript
 
@@ -238,8 +234,7 @@ the release workflow publishes the packages and existing server artifacts from t
 | `stable` | `v<VERSION>` | Releases repository, `<VERSION>` | `latest`, `<VERSION>` |
 | `nightly` | `v<VERSION>-SNAPSHOT.<run>.<attempt>` | Snapshots repository, `<VERSION>-SNAPSHOT` | `snapshot`, `<VERSION>-SNAPSHOT.<run>` |
 
-The stable channel becomes available after the first successful release from `stable`.
-Use the nightly SDK commands above during the preview. The [Compose quickstart](#quickstart)
+Use the SDK commands above for the stable release. The [Compose quickstart](#quickstart)
 builds the server locally and works without GHCR access.
 
 GitHub configures container package visibility separately from repository visibility.
@@ -291,7 +286,7 @@ isolated KVStore instance. The second command also needs JDK 21 and Node.js 24.
 
 ```sh
 go test -race ./...
-bash scripts/test-sdks.sh 0.1.0 "$PWD/tmp/sdk-packages"
+bash scripts/test-sdks.sh 1.0.0 "$PWD/tmp/sdk-packages"
 ```
 
 ## License
