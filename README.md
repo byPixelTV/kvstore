@@ -231,6 +231,15 @@ the release workflow publishes the packages and existing server artifacts from t
 | `nightly` | `v<VERSION>-SNAPSHOT.<run>.<attempt>` | Snapshots repository, `<VERSION>-SNAPSHOT` | `snapshot`, `<VERSION>-SNAPSHOT.<run>` |
 
 Set `BYPIXEL_REPO_USER` and `BYPIXEL_REPO_TOKEN` in GitHub Actions for Maven publishing.
+Use the Reposilite token name as the user and its secret as the token. Give the token read and
+write access to these two routes:
+
+- `/releases/dev/bypixel/kvstore/`
+- `/snapshots/dev/bypixel/kvstore/`
+
+Reposilite matches literal path prefixes. Keep the trailing slash to scope the routes to this
+artifact. Adding `*` to the route causes it to miss uploads. [Reposilite route rules](https://reposilite.com/guide/routes)
+
 npm publishing uses GitHub Actions OIDC. Go uses the GitHub release tag.
 Set the release version in [VERSION](VERSION). The nightly Maven repository is
 [ByPixel Snapshots](https://repo.bypixel.dev/snapshots/). Install the nightly npm package with

@@ -1,5 +1,6 @@
 import com.google.protobuf.gradle.*
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+import org.gradle.authentication.http.BasicAuthentication
 
 plugins {
     kotlin("jvm") version "2.4.20"
@@ -84,6 +85,9 @@ publishing {
             val channel = if (version.toString().endsWith("-SNAPSHOT")) "snapshots" else "releases"
             url = uri("https://repo.bypixel.dev/$channel/")
             credentials(PasswordCredentials::class)
+            authentication {
+                create<BasicAuthentication>("basic")
+            }
         }
         maven {
             name = "verification"
