@@ -9,6 +9,7 @@ $demo = Join-Path (Join-Path $repo 'data') ('kvctl-demo-' + [Guid]::NewGuid().To
 New-Item -ItemType Directory -Path $demo -Force | Out-Null
 $server = Join-Path $demo 'kvstore.exe'
 $console = Join-Path $demo 'kvctl.exe'
+$seeder = Join-Path $demo 'seed.exe'
 $registry = Join-Path $demo 'keys'
 $serverLog = Join-Path $demo 'server.log'
 $process = $null
@@ -19,11 +20,14 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Could not build the KVStore server.' }
     go build -buildvcs=false -o $console ./cmd/kvctl
     if ($LASTEXITCODE -ne 0) { throw 'Could not build the terminal console.' }
+    go build -buildvcs=false -o $seeder ./scripts/fixtures/kvctl-demo
+    if ($LASTEXITCODE -ne 0) { throw 'Could not build the demo seeder.' }
 
-    $accessKey = & $server apikey create --dir $registry --name demo-admin --read --write --manage
-    if ($LASTEXITCODE -ne 0 -or $accessKey -notmatch '^kvs_[A-Za-z0-9_-]{43}$') {
+    $keyOutput = @(& $server apikey create --dir $registry --name demo-admin --read --write --manage)
+    if ($LASTEXITCODE -ne 0 -or $keyOutput.Count -ne 1 -or $keyOutput[0] -cnotmatch '^kvs_[A-Za-z0-9_-]{43}$') {
         throw 'Could not create the demo access key.'
     }
+    $accessKey = [string]$keyOutput[0]
 
     $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
     $listener.Start()
@@ -78,14 +82,24 @@ try {
         }
     }
 
-    $previousOutputEncoding = $OutputEncoding
+    # Give the key only to the seeder process. This avoids native pipeline transcoding.
+    $seedInfo = [Diagnostics.ProcessStartInfo]::new()
+    $seedInfo.FileName = $seeder
+    $seedInfo.Arguments = $address
+    $seedInfo.UseShellExecute = $false
+    $seedInfo.CreateNoWindow = $true
+    $seedInfo.RedirectStandardOutput = $true
+    $seedInfo.RedirectStandardError = $true
+    $seedInfo.EnvironmentVariables['KVSTORE_DEMO_ACCESS_KEY'] = $accessKey
+    $seedProcess = [Diagnostics.Process]::Start($seedInfo)
     try {
-        # The access key is printable ASCII. Keep native stdin independent of the caller's encoding.
-        $OutputEncoding = [Text.Encoding]::ASCII
-        $accessKey | go run ./scripts/fixtures/kvctl-demo $address
-        if ($LASTEXITCODE -ne 0) { throw 'Could not seed the demo data.' }
+        $seedOutput = $seedProcess.StandardOutput.ReadToEndAsync()
+        $seedError = $seedProcess.StandardError.ReadToEndAsync()
+        $seedProcess.WaitForExit()
+        if ($seedProcess.ExitCode -ne 0) { throw "Could not seed the demo data. $($seedError.Result.Trim())" }
+        Write-Output $seedOutput.Result.Trim()
     } finally {
-        $OutputEncoding = $previousOutputEncoding
+        $seedProcess.Dispose()
     }
     if ($CheckOnly) {
         & $console --version

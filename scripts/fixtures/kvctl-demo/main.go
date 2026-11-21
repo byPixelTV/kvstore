@@ -1,14 +1,12 @@
-// Command kvctl-demo seeds a local demo endpoint. The access key comes from stdin.
+// Command kvctl-demo seeds a local demo endpoint using a process-local access key.
 package main
 
 import (
-	"bufio"
 	"context"
 	"fmt"
 	"log"
 	"os"
 	"slices"
-	"strings"
 	"time"
 
 	"github.com/byPixelTV/kvstore/internal/apikeys"
@@ -17,15 +15,11 @@ import (
 
 func main() {
 	if len(os.Args) != 2 {
-		log.Fatal("usage: kvctl-demo HOST:PORT (read the demo key from stdin)")
+		log.Fatal("usage: kvctl-demo HOST:PORT (set KVSTORE_DEMO_ACCESS_KEY)")
 	}
-	input := bufio.NewScanner(os.Stdin)
-	if !input.Scan() {
-		log.Fatal("missing demo access key on stdin")
-	}
-	accessKey := strings.TrimSpace(input.Text())
+	accessKey := os.Getenv("KVSTORE_DEMO_ACCESS_KEY")
 	if _, ok := apikeys.Digest(accessKey); !ok {
-		log.Fatal("invalid demo access key on stdin; use printable ASCII")
+		log.Fatal("missing or invalid KVSTORE_DEMO_ACCESS_KEY")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
