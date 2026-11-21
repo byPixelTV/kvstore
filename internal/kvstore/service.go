@@ -9,8 +9,10 @@ import (
 )
 
 var (
-	ErrEmptyNamespace = errors.New("namespace cannot be empty")
-	ErrEmptyKey       = errors.New("key cannot be empty")
+	ErrEmptyNamespace        = errors.New("namespace cannot be empty")
+	ErrEmptyKey              = errors.New("key cannot be empty")
+	ErrInvalidExpiration     = errors.New("invalid expiration")
+	ErrExpirationUnsupported = errors.New("storage does not support expiration")
 )
 
 type Service struct{ store storage.Store }
@@ -58,6 +60,28 @@ func (s *Service) Set(ctx context.Context, namespace, key string, value []byte) 
 	}
 	return s.store.Set(ctx, namespace, key, value)
 }
+
+func (s *Service) SupportsExpiration() bool {
+	_, ok := s.store.(storage.ExpiringStore)
+	return ok
+}
+
+func (s *Service) SetWithExpiration(ctx context.Context, namespace, key string, value []byte, expiresAtUnixMS int64) (uint64, error) {
+	if expiresAtUnixMS == 0 {
+		return s.Set(ctx, namespace, key, value)
+	}
+	if expiresAtUnixMS < 0 {
+		return 0, ErrInvalidExpiration
+	}
+	if err := validateKey(namespace, key); err != nil {
+		return 0, err
+	}
+	store, ok := s.store.(storage.ExpiringStore)
+	if !ok {
+		return 0, ErrExpirationUnsupported
+	}
+	return store.SetWithExpiration(ctx, namespace, key, value, expiresAtUnixMS)
+}
 func (s *Service) Delete(ctx context.Context, namespace, key string) (uint64, error) {
 	if err := validateKey(namespace, key); err != nil {
 		return 0, err
@@ -92,6 +116,12 @@ func (s *Service) BatchWrite(ctx context.Context, operations []storage.WriteOper
 	for _, op := range operations {
 		if err := validateKey(op.Namespace, op.Key); err != nil {
 			return nil, err
+		}
+		if op.ExpiresAtUnixMS < 0 || (op.Delete && op.ExpiresAtUnixMS != 0) {
+			return nil, ErrInvalidExpiration
+		}
+		if op.ExpiresAtUnixMS != 0 && !s.SupportsExpiration() {
+			return nil, ErrExpirationUnsupported
 		}
 		if len(op.Value) > 256<<10 {
 			return nil, errors.New("BatchWrite value exceeds 256 KiB")

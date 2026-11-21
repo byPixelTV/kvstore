@@ -130,12 +130,13 @@ func (x *GetRequest) GetConsistency() ReadConsistency {
 }
 
 type GetResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Found         bool                   `protobuf:"varint,1,opt,name=found,proto3" json:"found,omitempty"`
-	Value         []byte                 `protobuf:"bytes,2,opt,name=value,proto3" json:"value,omitempty"`
-	Revision      uint64                 `protobuf:"varint,3,opt,name=revision,proto3" json:"revision,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	Found           bool                   `protobuf:"varint,1,opt,name=found,proto3" json:"found,omitempty"`
+	Value           []byte                 `protobuf:"bytes,2,opt,name=value,proto3" json:"value,omitempty"`
+	Revision        uint64                 `protobuf:"varint,3,opt,name=revision,proto3" json:"revision,omitempty"`
+	ExpiresAtUnixMs int64                  `protobuf:"varint,4,opt,name=expires_at_unix_ms,json=expiresAtUnixMs,proto3" json:"expires_at_unix_ms,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *GetResponse) Reset() {
@@ -189,13 +190,22 @@ func (x *GetResponse) GetRevision() uint64 {
 	return 0
 }
 
+func (x *GetResponse) GetExpiresAtUnixMs() int64 {
+	if x != nil {
+		return x.ExpiresAtUnixMs
+	}
+	return 0
+}
+
 type SetRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Namespace     string                 `protobuf:"bytes,1,opt,name=namespace,proto3" json:"namespace,omitempty"`
-	Key           string                 `protobuf:"bytes,2,opt,name=key,proto3" json:"key,omitempty"`
-	Value         []byte                 `protobuf:"bytes,3,opt,name=value,proto3" json:"value,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	Namespace string                 `protobuf:"bytes,1,opt,name=namespace,proto3" json:"namespace,omitempty"`
+	Key       string                 `protobuf:"bytes,2,opt,name=key,proto3" json:"key,omitempty"`
+	Value     []byte                 `protobuf:"bytes,3,opt,name=value,proto3" json:"value,omitempty"`
+	// Absolute Unix time in milliseconds. Zero stores a persistent value.
+	ExpiresAtUnixMs int64 `protobuf:"varint,4,opt,name=expires_at_unix_ms,json=expiresAtUnixMs,proto3" json:"expires_at_unix_ms,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *SetRequest) Reset() {
@@ -249,11 +259,19 @@ func (x *SetRequest) GetValue() []byte {
 	return nil
 }
 
+func (x *SetRequest) GetExpiresAtUnixMs() int64 {
+	if x != nil {
+		return x.ExpiresAtUnixMs
+	}
+	return 0
+}
+
 type SetResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Revision      uint64                 `protobuf:"varint,1,opt,name=revision,proto3" json:"revision,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	Revision        uint64                 `protobuf:"varint,1,opt,name=revision,proto3" json:"revision,omitempty"`
+	ExpiresAtUnixMs int64                  `protobuf:"varint,2,opt,name=expires_at_unix_ms,json=expiresAtUnixMs,proto3" json:"expires_at_unix_ms,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *SetResponse) Reset() {
@@ -289,6 +307,13 @@ func (*SetResponse) Descriptor() ([]byte, []int) {
 func (x *SetResponse) GetRevision() uint64 {
 	if x != nil {
 		return x.Revision
+	}
+	return 0
+}
+
+func (x *SetResponse) GetExpiresAtUnixMs() int64 {
+	if x != nil {
+		return x.ExpiresAtUnixMs
 	}
 	return 0
 }
@@ -400,13 +425,14 @@ func (x *DeleteResponse) GetRevision() uint64 {
 // Maximum 128 operations and 192 KiB of raw values per request. Within each
 // shard operations are ordered and atomic; across shards they are NOT atomic.
 type BatchWriteOperation struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Namespace     string                 `protobuf:"bytes,1,opt,name=namespace,proto3" json:"namespace,omitempty"`
-	Key           string                 `protobuf:"bytes,2,opt,name=key,proto3" json:"key,omitempty"`
-	Value         []byte                 `protobuf:"bytes,3,opt,name=value,proto3" json:"value,omitempty"`
-	Delete        bool                   `protobuf:"varint,4,opt,name=delete,proto3" json:"delete,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	Namespace       string                 `protobuf:"bytes,1,opt,name=namespace,proto3" json:"namespace,omitempty"`
+	Key             string                 `protobuf:"bytes,2,opt,name=key,proto3" json:"key,omitempty"`
+	Value           []byte                 `protobuf:"bytes,3,opt,name=value,proto3" json:"value,omitempty"`
+	Delete          bool                   `protobuf:"varint,4,opt,name=delete,proto3" json:"delete,omitempty"`
+	ExpiresAtUnixMs int64                  `protobuf:"varint,5,opt,name=expires_at_unix_ms,json=expiresAtUnixMs,proto3" json:"expires_at_unix_ms,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *BatchWriteOperation) Reset() {
@@ -465,6 +491,13 @@ func (x *BatchWriteOperation) GetDelete() bool {
 		return x.Delete
 	}
 	return false
+}
+
+func (x *BatchWriteOperation) GetExpiresAtUnixMs() int64 {
+	if x != nil {
+		return x.ExpiresAtUnixMs
+	}
+	return 0
 }
 
 type BatchWriteRequest struct {
@@ -676,9 +709,10 @@ type HeadResponse struct {
 	Revision                uint64                 `protobuf:"varint,1,opt,name=revision,proto3" json:"revision,omitempty"`
 	OldestAvailableRevision uint64                 `protobuf:"varint,2,opt,name=oldest_available_revision,json=oldestAvailableRevision,proto3" json:"oldest_available_revision,omitempty"`
 	// Opaque cursor for multi-Raft. Set use_vector_cursor on requests.
-	Cursor        string `protobuf:"bytes,3,opt,name=cursor,proto3" json:"cursor,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Cursor             string `protobuf:"bytes,3,opt,name=cursor,proto3" json:"cursor,omitempty"`
+	SupportsExpiration bool   `protobuf:"varint,4,opt,name=supports_expiration,json=supportsExpiration,proto3" json:"supports_expiration,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *HeadResponse) Reset() {
@@ -730,6 +764,13 @@ func (x *HeadResponse) GetCursor() string {
 		return x.Cursor
 	}
 	return ""
+}
+
+func (x *HeadResponse) GetSupportsExpiration() bool {
+	if x != nil {
+		return x.SupportsExpiration
+	}
+	return false
 }
 
 // A namespace is mandatory. An empty key watches all keys in that namespace.
@@ -813,17 +854,18 @@ func (x *WatchRequest) GetUseVectorCursor() bool {
 }
 
 type WatchResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Revision      uint64                 `protobuf:"varint,1,opt,name=revision,proto3" json:"revision,omitempty"`
-	Namespace     string                 `protobuf:"bytes,2,opt,name=namespace,proto3" json:"namespace,omitempty"`
-	Key           string                 `protobuf:"bytes,3,opt,name=key,proto3" json:"key,omitempty"`
-	Value         []byte                 `protobuf:"bytes,4,opt,name=value,proto3" json:"value,omitempty"`
-	Deleted       bool                   `protobuf:"varint,5,opt,name=deleted,proto3" json:"deleted,omitempty"`
-	Checkpoint    bool                   `protobuf:"varint,6,opt,name=checkpoint,proto3" json:"checkpoint,omitempty"`
-	Cursor        string                 `protobuf:"bytes,7,opt,name=cursor,proto3" json:"cursor,omitempty"`
-	Shard         uint32                 `protobuf:"varint,8,opt,name=shard,proto3" json:"shard,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	Revision        uint64                 `protobuf:"varint,1,opt,name=revision,proto3" json:"revision,omitempty"`
+	Namespace       string                 `protobuf:"bytes,2,opt,name=namespace,proto3" json:"namespace,omitempty"`
+	Key             string                 `protobuf:"bytes,3,opt,name=key,proto3" json:"key,omitempty"`
+	Value           []byte                 `protobuf:"bytes,4,opt,name=value,proto3" json:"value,omitempty"`
+	Deleted         bool                   `protobuf:"varint,5,opt,name=deleted,proto3" json:"deleted,omitempty"`
+	Checkpoint      bool                   `protobuf:"varint,6,opt,name=checkpoint,proto3" json:"checkpoint,omitempty"`
+	Cursor          string                 `protobuf:"bytes,7,opt,name=cursor,proto3" json:"cursor,omitempty"`
+	Shard           uint32                 `protobuf:"varint,8,opt,name=shard,proto3" json:"shard,omitempty"`
+	ExpiresAtUnixMs int64                  `protobuf:"varint,9,opt,name=expires_at_unix_ms,json=expiresAtUnixMs,proto3" json:"expires_at_unix_ms,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *WatchResponse) Reset() {
@@ -912,6 +954,13 @@ func (x *WatchResponse) GetShard() uint32 {
 	return 0
 }
 
+func (x *WatchResponse) GetExpiresAtUnixMs() int64 {
+	if x != nil {
+		return x.ExpiresAtUnixMs
+	}
+	return 0
+}
+
 // Single-Raft: the first message is a consistent snapshot checkpoint; then
 // Watch(after_revision=snapshot_revision). Multi-Raft: request vector mode,
 // consume all records, then the FINAL checkpoint with the opaque cursor.
@@ -976,10 +1025,11 @@ type ScanResponse struct {
 	Revision         uint64                 `protobuf:"varint,4,opt,name=revision,proto3" json:"revision,omitempty"`
 	Checkpoint       bool                   `protobuf:"varint,5,opt,name=checkpoint,proto3" json:"checkpoint,omitempty"`
 	// Final checkpoint after ALL shard snapshots have completed.
-	Cursor        string `protobuf:"bytes,6,opt,name=cursor,proto3" json:"cursor,omitempty"`
-	Shard         uint32 `protobuf:"varint,7,opt,name=shard,proto3" json:"shard,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Cursor          string `protobuf:"bytes,6,opt,name=cursor,proto3" json:"cursor,omitempty"`
+	Shard           uint32 `protobuf:"varint,7,opt,name=shard,proto3" json:"shard,omitempty"`
+	ExpiresAtUnixMs int64  `protobuf:"varint,8,opt,name=expires_at_unix_ms,json=expiresAtUnixMs,proto3" json:"expires_at_unix_ms,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *ScanResponse) Reset() {
@@ -1057,6 +1107,13 @@ func (x *ScanResponse) GetCursor() string {
 func (x *ScanResponse) GetShard() uint32 {
 	if x != nil {
 		return x.Shard
+	}
+	return 0
+}
+
+func (x *ScanResponse) GetExpiresAtUnixMs() int64 {
+	if x != nil {
+		return x.ExpiresAtUnixMs
 	}
 	return 0
 }
@@ -1169,29 +1226,33 @@ const file_kvstore_v1_kvstore_proto_rawDesc = "" +
 	"GetRequest\x12\x1c\n" +
 	"\tnamespace\x18\x01 \x01(\tR\tnamespace\x12\x10\n" +
 	"\x03key\x18\x02 \x01(\tR\x03key\x12=\n" +
-	"\vconsistency\x18\x03 \x01(\x0e2\x1b.kvstore.v1.ReadConsistencyR\vconsistency\"U\n" +
+	"\vconsistency\x18\x03 \x01(\x0e2\x1b.kvstore.v1.ReadConsistencyR\vconsistency\"\x82\x01\n" +
 	"\vGetResponse\x12\x14\n" +
 	"\x05found\x18\x01 \x01(\bR\x05found\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\fR\x05value\x12\x1a\n" +
-	"\brevision\x18\x03 \x01(\x04R\brevision\"R\n" +
+	"\brevision\x18\x03 \x01(\x04R\brevision\x12+\n" +
+	"\x12expires_at_unix_ms\x18\x04 \x01(\x03R\x0fexpiresAtUnixMs\"\x7f\n" +
 	"\n" +
 	"SetRequest\x12\x1c\n" +
 	"\tnamespace\x18\x01 \x01(\tR\tnamespace\x12\x10\n" +
 	"\x03key\x18\x02 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x03 \x01(\fR\x05value\")\n" +
+	"\x05value\x18\x03 \x01(\fR\x05value\x12+\n" +
+	"\x12expires_at_unix_ms\x18\x04 \x01(\x03R\x0fexpiresAtUnixMs\"V\n" +
 	"\vSetResponse\x12\x1a\n" +
-	"\brevision\x18\x01 \x01(\x04R\brevision\"?\n" +
+	"\brevision\x18\x01 \x01(\x04R\brevision\x12+\n" +
+	"\x12expires_at_unix_ms\x18\x02 \x01(\x03R\x0fexpiresAtUnixMs\"?\n" +
 	"\rDeleteRequest\x12\x1c\n" +
 	"\tnamespace\x18\x01 \x01(\tR\tnamespace\x12\x10\n" +
 	"\x03key\x18\x02 \x01(\tR\x03key\"F\n" +
 	"\x0eDeleteResponse\x12\x18\n" +
 	"\adeleted\x18\x01 \x01(\bR\adeleted\x12\x1a\n" +
-	"\brevision\x18\x02 \x01(\x04R\brevision\"s\n" +
+	"\brevision\x18\x02 \x01(\x04R\brevision\"\xa0\x01\n" +
 	"\x13BatchWriteOperation\x12\x1c\n" +
 	"\tnamespace\x18\x01 \x01(\tR\tnamespace\x12\x10\n" +
 	"\x03key\x18\x02 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x03 \x01(\fR\x05value\x12\x16\n" +
-	"\x06delete\x18\x04 \x01(\bR\x06delete\"T\n" +
+	"\x06delete\x18\x04 \x01(\bR\x06delete\x12+\n" +
+	"\x12expires_at_unix_ms\x18\x05 \x01(\x03R\x0fexpiresAtUnixMs\"T\n" +
 	"\x11BatchWriteRequest\x12?\n" +
 	"\n" +
 	"operations\x18\x01 \x03(\v2\x1f.kvstore.v1.BatchWriteOperationR\n" +
@@ -1204,17 +1265,18 @@ const file_kvstore_v1_kvstore_proto_rawDesc = "" +
 	"\x12BatchWriteResponse\x126\n" +
 	"\aresults\x18\x01 \x03(\v2\x1c.kvstore.v1.BatchWriteResultR\aresults\"9\n" +
 	"\vHeadRequest\x12*\n" +
-	"\x11use_vector_cursor\x18\x01 \x01(\bR\x0fuseVectorCursor\"~\n" +
+	"\x11use_vector_cursor\x18\x01 \x01(\bR\x0fuseVectorCursor\"\xaf\x01\n" +
 	"\fHeadResponse\x12\x1a\n" +
 	"\brevision\x18\x01 \x01(\x04R\brevision\x12:\n" +
 	"\x19oldest_available_revision\x18\x02 \x01(\x04R\x17oldestAvailableRevision\x12\x16\n" +
-	"\x06cursor\x18\x03 \x01(\tR\x06cursor\"\xa9\x01\n" +
+	"\x06cursor\x18\x03 \x01(\tR\x06cursor\x12/\n" +
+	"\x13supports_expiration\x18\x04 \x01(\bR\x12supportsExpiration\"\xa9\x01\n" +
 	"\fWatchRequest\x12\x1c\n" +
 	"\tnamespace\x18\x01 \x01(\tR\tnamespace\x12\x10\n" +
 	"\x03key\x18\x02 \x01(\tR\x03key\x12%\n" +
 	"\x0eafter_revision\x18\x03 \x01(\x04R\rafterRevision\x12\x16\n" +
 	"\x06cursor\x18\x04 \x01(\tR\x06cursor\x12*\n" +
-	"\x11use_vector_cursor\x18\x05 \x01(\bR\x0fuseVectorCursor\"\xd9\x01\n" +
+	"\x11use_vector_cursor\x18\x05 \x01(\bR\x0fuseVectorCursor\"\x86\x02\n" +
 	"\rWatchResponse\x12\x1a\n" +
 	"\brevision\x18\x01 \x01(\x04R\brevision\x12\x1c\n" +
 	"\tnamespace\x18\x02 \x01(\tR\tnamespace\x12\x10\n" +
@@ -1225,10 +1287,11 @@ const file_kvstore_v1_kvstore_proto_rawDesc = "" +
 	"checkpoint\x18\x06 \x01(\bR\n" +
 	"checkpoint\x12\x16\n" +
 	"\x06cursor\x18\a \x01(\tR\x06cursor\x12\x14\n" +
-	"\x05shard\x18\b \x01(\rR\x05shard\"W\n" +
+	"\x05shard\x18\b \x01(\rR\x05shard\x12+\n" +
+	"\x12expires_at_unix_ms\x18\t \x01(\x03R\x0fexpiresAtUnixMs\"W\n" +
 	"\vScanRequest\x12\x1c\n" +
 	"\tnamespace\x18\x01 \x01(\tR\tnamespace\x12*\n" +
-	"\x11use_vector_cursor\x18\x02 \x01(\bR\x0fuseVectorCursor\"\xcd\x01\n" +
+	"\x11use_vector_cursor\x18\x02 \x01(\bR\x0fuseVectorCursor\"\xfa\x01\n" +
 	"\fScanResponse\x12+\n" +
 	"\x11snapshot_revision\x18\x01 \x01(\x04R\x10snapshotRevision\x12\x10\n" +
 	"\x03key\x18\x02 \x01(\tR\x03key\x12\x14\n" +
@@ -1238,7 +1301,8 @@ const file_kvstore_v1_kvstore_proto_rawDesc = "" +
 	"checkpoint\x18\x05 \x01(\bR\n" +
 	"checkpoint\x12\x16\n" +
 	"\x06cursor\x18\x06 \x01(\tR\x06cursor\x12\x14\n" +
-	"\x05shard\x18\a \x01(\rR\x05shard\"\\\n" +
+	"\x05shard\x18\a \x01(\rR\x05shard\x12+\n" +
+	"\x12expires_at_unix_ms\x18\b \x01(\x03R\x0fexpiresAtUnixMs\"\\\n" +
 	"\x10FenceSlotRequest\x12\x1c\n" +
 	"\tnamespace\x18\x01 \x01(\tR\tnamespace\x12\x12\n" +
 	"\x04slot\x18\x02 \x01(\rR\x04slot\x12\x16\n" +

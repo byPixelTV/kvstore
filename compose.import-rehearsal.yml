@@ -1,0 +1,15 @@
+# Use with compose.sharded.yml. Expose only the local test router.
+services:
+  s0n0: &private
+    ports: !reset []
+  s0n1: *private
+  s0n2: *private
+  s1n0: *private
+  s1n1: *private
+  s1n2: *private
+  s2n0: *private
+  s2n1: *private
+  s2n2: *private
+  router:
+    ports: !override
+      - '127.0.0.1:${KVSTORE_SHARDED_GRPC_PORT:-18082}:50051'

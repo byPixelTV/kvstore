@@ -10,9 +10,11 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
+	"github.com/byPixelTV/kvstore/internal/monitoring"
 	"github.com/hashicorp/raft"
 )
 
@@ -21,6 +23,9 @@ func (n *Node) StartAdmin() error {
 	mux.HandleFunc("POST /v1/cluster/join", n.handleJoin)
 	mux.HandleFunc("POST /v1/cluster/snapshot", n.handleSnapshot)
 	mux.HandleFunc("GET /v1/cluster/performance", n.handlePerformance)
+	if token := os.Getenv("KVSTORE_METRICS_TOKEN"); token != "" {
+		mux.HandleFunc("GET /metrics", monitoring.Protect(token, http.HandlerFunc(n.handleMetrics)))
+	}
 	listener, err := net.Listen("tcp", n.cfg.AdminListenAddr)
 	if err != nil {
 		return err
@@ -32,6 +37,19 @@ func (n *Node) StartAdmin() error {
 		}
 	}()
 	return nil
+}
+
+func (n *Node) handleMetrics(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	available, total, err := monitoring.DiskBytes(n.cfg.DataDir)
+	if err == nil {
+		fmt.Fprintf(w, "# TYPE kvstore_disk_available_bytes gauge\nkvstore_disk_available_bytes %d\n", available)
+		fmt.Fprintf(w, "# TYPE kvstore_disk_total_bytes gauge\nkvstore_disk_total_bytes %d\n", total)
+	}
+	fmt.Fprintf(w, "# TYPE kvstore_raft_voters gauge\nkvstore_raft_voters %d\n", n.voterCount())
+	metrics := n.fsm.db.Metrics()
+	fmt.Fprintf(w, "# TYPE kvstore_pebble_compactions_total counter\nkvstore_pebble_compactions_total %d\n", metrics.Compact.Count)
+	fmt.Fprintf(w, "# TYPE kvstore_pebble_failed_compactions_total counter\nkvstore_pebble_failed_compactions_total %d\n", metrics.Compact.FailedCount)
 }
 
 func (n *Node) authorized(r *http.Request) bool {
@@ -179,13 +197,34 @@ func (n *Node) handlePerformance(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
+	metrics := n.fsm.db.Metrics()
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(struct {
 		NodeID    string             `json:"node_id"`
 		RaftState string             `json:"raft_state"`
+		Voters    int                `json:"voters"`
 		Reads     ReadPerformance    `json:"reads"`
 		Writes    WritePerformance   `json:"writes"`
 		FSM       FSMPerformance     `json:"fsm"`
 		RaftLog   RaftLogPerformance `json:"raft_log"`
-	}{NodeID: n.cfg.NodeID, RaftState: n.RaftState(), Reads: n.ReadPerformance(), Writes: n.writes.Performance(), FSM: n.fsm.Performance(), RaftLog: n.logStats.Snapshot()})
+		Pebble    pebblePerformance  `json:"pebble"`
+	}{
+		NodeID: n.cfg.NodeID, RaftState: n.RaftState(), Voters: n.voterCount(),
+		Reads: n.ReadPerformance(), Writes: n.writes.Performance(),
+		FSM: n.fsm.Performance(), RaftLog: n.logStats.Snapshot(),
+		Pebble: pebblePerformance{
+			Compactions: metrics.Compact.Count, FailedCompactions: metrics.Compact.FailedCount,
+			CompactionDebtBytes: metrics.Compact.EstimatedDebt, CompactionsInProgress: metrics.Compact.NumInProgress,
+			CompactionDurationMS: metrics.Compact.Duration.Milliseconds(), DiskBytes: metrics.DiskSpaceUsage(),
+		},
+	})
+}
+
+type pebblePerformance struct {
+	Compactions           int64  `json:"compactions"`
+	FailedCompactions     int64  `json:"failed_compactions"`
+	CompactionsInProgress int64  `json:"compactions_in_progress"`
+	CompactionDebtBytes   uint64 `json:"compaction_debt_bytes"`
+	CompactionDurationMS  int64  `json:"compaction_duration_ms"`
+	DiskBytes             uint64 `json:"disk_bytes"`
 }

@@ -25,6 +25,7 @@ func (n *Node) BatchWrite(ctx context.Context, operations []storage.WriteOperati
 	}
 	commands := make([]command, 0, len(operations))
 	total := 0
+	hasExpiration := false
 	for _, op := range operations {
 		if op.Namespace == "" || op.Key == "" {
 			return nil, status.Error(codes.InvalidArgument, "invalid namespace/key")
@@ -32,12 +33,14 @@ func (n *Node) BatchWrite(ctx context.Context, operations []storage.WriteOperati
 		if len(op.Value) > 256<<10 {
 			return nil, status.Error(codes.ResourceExhausted, "value exceeds 256 KiB")
 		}
-		cmd := command{Operation: opSet, Namespace: op.Namespace, Key: op.Key}
-		if op.Delete {
-			cmd.Operation = opDelete
-		} else {
-			cmd.Value = op.Value
+		if op.ExpiresAtUnixMS < 0 || (op.Delete && op.ExpiresAtUnixMS != 0) {
+			return nil, status.Error(codes.InvalidArgument, "invalid batch expiration")
 		}
+		cmd := newSetCommand(op.Namespace, op.Key, op.Value, op.ExpiresAtUnixMS)
+		if op.Delete {
+			cmd = command{Operation: opDelete, Namespace: op.Namespace, Key: op.Key}
+		}
+		hasExpiration = hasExpiration || op.ExpiresAtUnixMS > 0
 		total += estimateRaftCommand(cmd)
 		if total > clusterWriteBatchBytes {
 			return nil, status.Error(codes.ResourceExhausted, "batch exceeds Raft log budget")
@@ -56,9 +59,14 @@ func (n *Node) BatchWrite(ctx context.Context, operations []storage.WriteOperati
 		if err != nil {
 			return nil, err
 		}
+		if hasExpiration {
+			if err := requireLeaderExpiration(ctx, client); err != nil {
+				return nil, err
+			}
+		}
 		req := &kvstorev1.BatchWriteRequest{Operations: make([]*kvstorev1.BatchWriteOperation, len(operations))}
 		for i, op := range operations {
-			req.Operations[i] = &kvstorev1.BatchWriteOperation{Namespace: op.Namespace, Key: op.Key, Value: op.Value, Delete: op.Delete}
+			req.Operations[i] = &kvstorev1.BatchWriteOperation{Namespace: op.Namespace, Key: op.Key, Value: op.Value, Delete: op.Delete, ExpiresAtUnixMs: op.ExpiresAtUnixMS}
 		}
 		res, err := client.BatchWrite(ctx, req)
 		if err != nil {

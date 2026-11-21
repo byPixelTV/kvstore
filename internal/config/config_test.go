@@ -1,6 +1,42 @@
 package config
 
-import "testing"
+import (
+	"os"
+	"testing"
+	"time"
+)
+
+func TestClusterBenchmarkDefaults(t *testing.T) {
+	t.Setenv("KVSTORE_MODE", "cluster")
+	t.Setenv("KVSTORE_NODE_ID", "node0")
+	t.Setenv("KVSTORE_CLUSTER_BOOTSTRAP_NODE", "node0")
+	t.Setenv("KVSTORE_RAFT_ADVERTISE_ADDR", "node0:7000")
+	t.Setenv("KVSTORE_GRPC_ADVERTISE_ADDR", "node0:50051")
+	t.Setenv("KVSTORE_ADMIN_ADVERTISE_ADDR", "node0:7001")
+	t.Setenv("KVSTORE_JOIN_TOKEN", "test-only")
+	for _, key := range []string{
+		"KVSTORE_READ_BATCH_WINDOW", "KVSTORE_READ_BATCH_MAX", "KVSTORE_READ_VERIFY_PARALLELISM",
+		"KVSTORE_WRITE_BATCH_WINDOW", "KVSTORE_WRITE_BATCH_MAX_WINDOW", "KVSTORE_WRITE_BATCH_TARGET",
+		"KVSTORE_WRITE_BATCH_MAX", "KVSTORE_WRITE_MAX_QUEUE_DELAY", "KVSTORE_RAFT_MAX_INFLIGHT",
+		"KVSTORE_RAFT_COMMIT_TIMEOUT", "KVSTORE_RAFT_MAX_APPEND_ENTRIES", "KVSTORE_RAFT_LOG_CACHE_ENTRIES",
+	} {
+		t.Setenv(key, "")
+		if err := os.Unsetenv(key); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.WriteBatchWindow != 1500*time.Microsecond || cfg.WriteBatchMaxWindow != 3*time.Millisecond ||
+		cfg.WriteBatchMax != 256 || cfg.WriteBatchTarget != 64 || cfg.WriteMaxQueueDelay != 0 ||
+		cfg.RaftMaxInflight != 8 || cfg.RaftCommitTimeout != 50*time.Millisecond ||
+		cfg.RaftMaxAppendEntries != 128 || cfg.RaftLogCacheEntries != 512 ||
+		cfg.ReadBatchWindow != 300*time.Microsecond || cfg.ReadBatchMax != 256 || cfg.ReadVerifyParallelism != 2 {
+		t.Fatalf("unexpected cluster defaults: %+v", cfg)
+	}
+}
 
 func TestStandaloneDefaults(t *testing.T) {
 	t.Setenv("KVSTORE_MODE", "standalone")

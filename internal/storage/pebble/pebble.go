@@ -147,13 +147,6 @@ func encodeKey(namespace, key string) []byte {
 	return append(encoded, key...)
 }
 
-func encodeRecord(value []byte, revision uint64) []byte {
-	result := make([]byte, 8+len(value))
-	binary.BigEndian.PutUint64(result[:8], revision)
-	copy(result[8:], value)
-	return result
-}
-
 func (s *Store) Get(ctx context.Context, namespace, key string) (storage.Record, bool, error) {
 	if err := ctx.Err(); err != nil {
 		return storage.Record{}, false, err
@@ -170,27 +163,31 @@ func (s *Store) Get(ctx context.Context, namespace, key string) (storage.Record,
 		return storage.Record{}, false, fmt.Errorf("pebble get: %w", err)
 	}
 	// Pebble's value is only valid until its closer is closed.
-	if len(raw) < 8 {
-		_ = closer.Close()
-		return storage.Record{}, false, errors.New("corrupt record: missing revision")
+	record, err := storage.DecodeRecord(raw)
+	found := err == nil && (record.ExpiresAtUnixMS == 0 || !record.ExpiredAt(time.Now().UnixMilli()))
+	if found {
+		record.Value = bytes.Clone(record.Value)
 	}
-	record := storage.Record{
-		Revision: binary.BigEndian.Uint64(raw[:8]),
-		Value:    bytes.Clone(raw[8:]),
-	}
-	if err := closer.Close(); err != nil {
-		return storage.Record{}, false, fmt.Errorf("close pebble reader: %w", err)
+	if err = errors.Join(err, closer.Close()); err != nil || !found {
+		return storage.Record{}, false, err
 	}
 	return record, true, nil
 }
 
 func (s *Store) Set(ctx context.Context, namespace, key string, value []byte) (uint64, error) {
+	return s.SetWithExpiration(ctx, namespace, key, value, 0)
+}
+
+func (s *Store) SetWithExpiration(ctx context.Context, namespace, key string, value []byte, expiresAtUnixMS int64) (uint64, error) {
+	if expiresAtUnixMS < 0 {
+		return 0, errors.New("invalid expiration")
+	}
 	// Clone before passing to a worker: the caller can modify the slice.
-	return s.submit(ctx, setKind, namespace, key, bytes.Clone(value))
+	return s.submit(ctx, setKind, namespace, key, bytes.Clone(value), expiresAtUnixMS)
 }
 
 func (s *Store) Delete(ctx context.Context, namespace, key string) (uint64, error) {
-	return s.submit(ctx, deleteKind, namespace, key, nil)
+	return s.submit(ctx, deleteKind, namespace, key, nil, 0)
 }
 
 // ReadChanges serves durable events from the exact same Pebble commits as Set/Delete.

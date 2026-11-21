@@ -30,12 +30,13 @@ const (
 )
 
 type writeRequest struct {
-	ctx            context.Context
-	kind           writeKind
-	namespace, key string
-	value          []byte
-	reply          chan writeResponse
-	operations     []storage.WriteOperation
+	ctx             context.Context
+	kind            writeKind
+	namespace, key  string
+	value           []byte
+	expiresAtUnixMS int64
+	reply           chan writeResponse
+	operations      []storage.WriteOperation
 }
 
 type writeResponse struct {
@@ -48,11 +49,11 @@ type writeResponse struct {
 // prevents Close from closing the queue while a sender is still enqueuing.
 // A canceled request already enqueued may still commit; like raft.Apply,
 // canceled or timed-out writes must be treated as outcome-unknown.
-func (s *Store) submit(ctx context.Context, kind writeKind, namespace, key string, value []byte) (uint64, error) {
+func (s *Store) submit(ctx context.Context, kind writeKind, namespace, key string, value []byte, expiresAtUnixMS int64) (uint64, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	req := writeRequest{ctx: ctx, kind: kind, namespace: namespace, key: key, value: value, reply: make(chan writeResponse, 1)}
+	req := writeRequest{ctx: ctx, kind: kind, namespace: namespace, key: key, value: value, expiresAtUnixMS: expiresAtUnixMS, reply: make(chan writeResponse, 1)}
 	s.gate.RLock()
 	if s.closed {
 		s.gate.RUnlock()
@@ -88,11 +89,15 @@ func (s *Store) BatchWrite(ctx context.Context, operations []storage.WriteOperat
 		if op.Namespace == "" || op.Key == "" {
 			return nil, errors.New("empty namespace/key")
 		}
+		if op.ExpiresAtUnixMS < 0 || (op.Delete && op.ExpiresAtUnixMS != 0) {
+			return nil, errors.New("invalid batch expiration")
+		}
 		total += len(op.Namespace) + len(op.Key) + len(op.Value) + 128
 		if total > 256<<10 {
 			return nil, errors.New("batch exceeds 256 KiB")
 		}
-		copyOps[i] = storage.WriteOperation{Namespace: op.Namespace, Key: op.Key, Delete: op.Delete, Value: bytes.Clone(op.Value)}
+		op.Value = bytes.Clone(op.Value)
+		copyOps[i] = op
 	}
 	req := writeRequest{ctx: ctx, operations: copyOps, reply: make(chan writeResponse, 1)}
 	s.gate.RLock()
@@ -182,7 +187,7 @@ func (s *Store) applyGroup(group []writeRequest) {
 		}
 		ops := req.operations
 		if ops == nil {
-			ops = []storage.WriteOperation{{Namespace: req.namespace, Key: req.key, Value: req.value, Delete: req.kind == deleteKind}}
+			ops = []storage.WriteOperation{{Namespace: req.namespace, Key: req.key, Value: req.value, Delete: req.kind == deleteKind, ExpiresAtUnixMS: req.expiresAtUnixMS}}
 		}
 		revisions := make([]uint64, len(ops))
 		for j, op := range ops {
@@ -215,7 +220,7 @@ func (s *Store) applyGroup(group []writeRequest) {
 			}
 			next++
 			if !op.Delete {
-				batchErr = batch.Set(encodedKey, encodeRecord(op.Value, next), nil)
+				batchErr = batch.Set(encodedKey, storage.EncodeRecord(op.Value, next, op.ExpiresAtUnixMS), nil)
 				shadow[key] = true
 			} else {
 				batchErr = batch.Delete(encodedKey, nil)
@@ -224,7 +229,7 @@ func (s *Store) applyGroup(group []writeRequest) {
 			if batchErr != nil {
 				break
 			}
-			batchErr = writer.Append(changefeed.Change{Revision: next, Namespace: op.Namespace, Key: op.Key, Value: op.Value, Deleted: op.Delete})
+			batchErr = writer.Append(changefeed.Change{Revision: next, Namespace: op.Namespace, Key: op.Key, Value: op.Value, Deleted: op.Delete, ExpiresAtUnixMS: op.ExpiresAtUnixMS})
 			if batchErr != nil {
 				break
 			}

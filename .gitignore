@@ -75,6 +75,7 @@ mem.prof
 /tmp/
 /temp/
 *.tmp
+*.kvsnapshot
 *.temp
 *.bak
 *.swp

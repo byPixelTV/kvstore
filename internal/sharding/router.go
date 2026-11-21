@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
@@ -166,7 +167,7 @@ func (r *Router) Refresh(ctx context.Context) error {
 	r.ready.Store(len(errs) == 0 && r.loaded.Load() && !r.unresolved.Load())
 	return errors.Join(errs...)
 }
-func (r *Router) Ready() bool { return r.ready.Load() }
+func (r *Router) Ready() bool { return r.ready.Load() && !r.unresolved.Load() }
 
 func invalidKey(namespace, key string) error {
 	if namespace == "" {
@@ -244,7 +245,7 @@ func (r *Router) Set(ctx context.Context, req *kvstorev1.SetRequest) (*kvstorev1
 	if err != nil {
 		return nil, err
 	}
-	result, err := c.Set(ctx, req)
+	result, err := setOnBackend(ctx, c, req)
 	if status.Code(err) == codes.Unavailable {
 		g.leader.Store(-1)
 	}
@@ -258,6 +259,33 @@ func (r *Router) Set(ctx context.Context, req *kvstorev1.SetRequest) (*kvstorev1
 	}
 	result.Revision = v
 	return result, nil
+}
+
+func requireBackendExpiration(ctx context.Context, backend kvstorev1.KVStoreClient) error {
+	head, err := backend.Head(ctx, &kvstorev1.HeadRequest{})
+	if err != nil {
+		return err
+	}
+	if !head.GetSupportsExpiration() {
+		return status.Error(codes.FailedPrecondition, "shard backend does not support expiration")
+	}
+	return nil
+}
+
+func setOnBackend(ctx context.Context, backend kvstorev1.KVStoreClient, req *kvstorev1.SetRequest) (*kvstorev1.SetResponse, error) {
+	if req.GetExpiresAtUnixMs() > 0 {
+		if err := requireBackendExpiration(ctx, backend); err != nil {
+			return nil, err
+		}
+	}
+	reply, err := backend.Set(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	if reply.GetExpiresAtUnixMs() != req.GetExpiresAtUnixMs() {
+		return nil, status.Error(codes.FailedPrecondition, "shard backend did not acknowledge the requested expiration")
+	}
+	return reply, nil
 }
 func (r *Router) Delete(ctx context.Context, req *kvstorev1.DeleteRequest) (*kvstorev1.DeleteResponse, error) {
 	if err := invalidKey(req.GetNamespace(), req.GetKey()); err != nil {
@@ -310,6 +338,7 @@ func (r *Router) Head(ctx context.Context, req *kvstorev1.HeadRequest) (*kvstore
 	}
 	epoch, _ := r.epochSignal()
 	var c Cursor
+	supportsExpiration := true
 	for i, g := range r.groups {
 		client, err := g.selectClient()
 		if err != nil {
@@ -320,16 +349,17 @@ func (r *Router) Head(ctx context.Context, req *kvstorev1.HeadRequest) (*kvstore
 			return nil, err
 		}
 		c[i] = res.GetRevision()
+		supportsExpiration = supportsExpiration && res.GetSupportsExpiration()
 	}
 	if r.current().Epoch != epoch {
 		return nil, status.Error(codes.Aborted, "routing changed during Head; rescan before resuming Watch")
 	}
 	// Revision zero is deliberate: no cross-shard global revision exists.
-	return &kvstorev1.HeadResponse{Cursor: encodeEpochCursor(c, epoch)}, nil
+	return &kvstorev1.HeadResponse{Cursor: encodeEpochCursor(c, epoch), SupportsExpiration: supportsExpiration}, nil
 }
 
 // ServeRouter starts the existing KVStore binary in stateless router mode.
-// It is intended to be behind an authenticated/TLS proxy for production.
+// Production deployments put the router behind the mTLS proxy.
 func ServeRouter() error {
 	listen := getenv("KVSTORE_LISTEN_ADDR", ":50051")
 	if _, _, err := net.SplitHostPort(listen); err != nil {
@@ -372,7 +402,14 @@ func ServeRouter() error {
 		time.Sleep(500 * time.Millisecond)
 	}
 	router.ready.Store(true)
-	admin, err := router.startAdmin()
+	var metrics http.Handler
+	var serverOptions []grpc.ServerOption
+	if os.Getenv("KVSTORE_METRICS_TOKEN") != "" {
+		var observe grpc.UnaryServerInterceptor
+		metrics, observe = router.metrics()
+		serverOptions = append(serverOptions, grpc.UnaryInterceptor(observe))
+	}
+	admin, err := router.startAdmin(metrics)
 	if err != nil {
 		return err
 	}
@@ -388,9 +425,11 @@ func ServeRouter() error {
 		return err
 	}
 	defer listener.Close()
-	server := grpc.NewServer()
+	server := grpc.NewServer(serverOptions...)
 	kvstorev1.RegisterKVStoreServer(server, router)
 	healthServer := health.NewServer()
+	healthServer.SetServingStatus("liveness", healthpb.HealthCheckResponse_SERVING)
+	healthServer.SetServingStatus("readiness", healthpb.HealthCheckResponse_SERVING)
 	healthpb.RegisterHealthServer(server, healthServer)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -401,10 +440,10 @@ func ServeRouter() error {
 		defer ticker.Stop()
 		for {
 			checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-			err := router.Refresh(checkCtx)
+			_ = router.Refresh(checkCtx)
 			cancel()
 			state := healthpb.HealthCheckResponse_NOT_SERVING
-			if err == nil {
+			if router.Ready() {
 				state = healthpb.HealthCheckResponse_SERVING
 			}
 			healthServer.SetServingStatus("readiness", state)

@@ -1,0 +1,59 @@
+static_resources:
+  listeners:
+    - name: kvstore_mtls
+      address:
+        socket_address: {address: 0.0.0.0, port_value: 5443}
+      filter_chains:
+        - transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              '@type': type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              require_client_certificate: true
+              common_tls_context:
+                alpn_protocols: [h2]
+                tls_params:
+                  tls_minimum_protocol_version: TLSv1_2
+                tls_certificates:
+                  - certificate_chain: {filename: /etc/kvstore/tls/server.crt}
+                    private_key: {filename: /etc/kvstore/tls/server.key}
+                validation_context:
+                  trusted_ca: {filename: /etc/kvstore/tls/client-ca.crt}
+          filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                '@type': type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: kvstore_grpc
+                codec_type: HTTP2
+                http2_protocol_options: {}
+                # Watch can stay open; the service sends periodic checkpoints.
+                stream_idle_timeout: 300s
+                route_config:
+                  name: kvstore_grpc
+                  virtual_hosts:
+                    - name: kvstore
+                      domains: ['*']
+                      routes:
+                        - match: {prefix: '/kvstore.v1.KVStore/'}
+                          route: {cluster: router, timeout: 0s}
+                        - match: {prefix: '/grpc.health.v1.Health/'}
+                          route: {cluster: router, timeout: 5s}
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      '@type': type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters:
+    - name: router
+      type: STRICT_DNS
+      connect_timeout: 2s
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          '@type': type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
+      load_assignment:
+        cluster_name: router
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: {address: router, port_value: 50051}

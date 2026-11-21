@@ -105,7 +105,7 @@ func parallelSlotScan(ctx context.Context, client kvstorev1.KVStoreClient, names
 		}()
 	}
 	revision, scanErr := scanSlot(ctx, client, namespace, slot, func(item *kvstorev1.ScanResponse) error {
-		copied := &kvstorev1.ScanResponse{Key: item.GetKey(), Value: append([]byte(nil), item.GetValue()...), Revision: item.GetRevision()}
+		copied := &kvstorev1.ScanResponse{Key: item.GetKey(), Value: append([]byte(nil), item.GetValue()...), Revision: item.GetRevision(), ExpiresAtUnixMs: item.GetExpiresAtUnixMs()}
 		select {
 		case jobs <- copied:
 			return nil
@@ -137,9 +137,10 @@ const (
 )
 
 type replayMutation struct {
-	key     string
-	value   []byte
-	deleted bool
+	key             string
+	value           []byte
+	deleted         bool
+	expiresAtUnixMS int64
 }
 
 // applyReplay writes distinct keys in parallel but does not return until ALL
@@ -168,7 +169,7 @@ func applyReplay(ctx context.Context, target kvstorev1.KVStoreClient, namespace 
 				if item.deleted {
 					_, err = target.Delete(ctx, &kvstorev1.DeleteRequest{Namespace: namespace, Key: item.key})
 				} else {
-					_, err = target.Set(ctx, &kvstorev1.SetRequest{Namespace: namespace, Key: item.key, Value: item.value})
+					_, err = setOnBackend(ctx, target, &kvstorev1.SetRequest{Namespace: namespace, Key: item.key, Value: item.value, ExpiresAtUnixMs: item.expiresAtUnixMS})
 				}
 				if err != nil {
 					once.Do(func() { firstErr = fmt.Errorf("replay key %q: %w", item.key, err); cancel() })
@@ -238,7 +239,7 @@ func catchUp(ctx context.Context, stream grpc.ServerStreamingClient[kvstorev1.Wa
 			if old, found := pending[key]; found {
 				pendingBytes -= len(old.key) + len(old.value)
 			}
-			mutation := replayMutation{key: key, deleted: event.GetDeleted()}
+			mutation := replayMutation{key: key, deleted: event.GetDeleted(), expiresAtUnixMS: event.GetExpiresAtUnixMs()}
 			if !mutation.deleted {
 				mutation.value = append([]byte(nil), event.GetValue()...)
 			}
@@ -330,7 +331,7 @@ func (r *Router) MigrateSlot(ctx context.Context, namespace string, slot uint16,
 	}
 
 	checkpoint, copied, err := parallelSlotScan(ctx, source, namespace, slot, 16, func(workCtx context.Context, item *kvstorev1.ScanResponse) error {
-		_, e := destination.Set(workCtx, &kvstorev1.SetRequest{Namespace: namespace, Key: item.GetKey(), Value: item.GetValue()})
+		_, e := setOnBackend(workCtx, destination, &kvstorev1.SetRequest{Namespace: namespace, Key: item.GetKey(), Value: item.GetValue(), ExpiresAtUnixMs: item.GetExpiresAtUnixMs()})
 		return e
 	})
 	report.Copied = copied

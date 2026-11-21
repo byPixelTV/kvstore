@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	kvstorev1 "github.com/byPixelTV/kvstore/gen/go/kvstore/v1"
@@ -47,6 +48,8 @@ type Node struct {
 	writes      *clusterWriteBatcher
 	readStats   readMetrics
 	leaderReads leaderFence
+	voterReady  atomic.Bool
+	readyTerm   atomic.Uint64
 }
 
 var _ storage.Store = (*Node)(nil)
@@ -175,8 +178,49 @@ func Open(cfg config.Config) (_ *Node, err error) {
 }
 
 func (n *Node) RaftState() string { return n.raft.State().String() }
+
+func (n *Node) voterCount() int {
+	membership := n.raft.GetConfiguration()
+	if membership.Error() != nil {
+		return 0
+	}
+	voters := 0
+	for _, server := range membership.Configuration().Servers {
+		if server.Suffrage == raft.Voter {
+			voters++
+		}
+	}
+	return voters
+}
+
+// RefreshAdmission runs outside RPC handlers. On election the leader must
+// commit a barrier under a configuration with enough voters before serving.
+func (n *Node) RefreshAdmission() {
+	if n.cfg.MinRaftVoters <= 1 {
+		return
+	}
+	enoughVoters := n.voterCount() >= n.cfg.MinRaftVoters
+	n.voterReady.Store(enoughVoters)
+	if !enoughVoters {
+		n.readyTerm.Store(0)
+		return
+	}
+	term := n.raft.CurrentTerm()
+	if n.raft.State() == raft.Leader && n.readyTerm.Load() != term {
+		if err := n.raft.Barrier(500 * time.Millisecond).Error(); err == nil &&
+			n.raft.CurrentTerm() == term && n.voterCount() >= n.cfg.MinRaftVoters {
+			n.readyTerm.Store(term)
+		}
+	}
+}
+
+func (n *Node) ClientTrafficReady() bool {
+	return n.cfg.MinRaftVoters <= 1 || (n.voterReady.Load() &&
+		(n.raft.State() != raft.Leader || n.readyTerm.Load() == n.raft.CurrentTerm()))
+}
+
 func (n *Node) Ready() bool {
-	if n.fsm.Failure() != nil {
+	if n.fsm.Failure() != nil || !n.ClientTrafficReady() {
 		return false
 	}
 	if n.raft.State() == raft.Shutdown {
@@ -245,7 +289,7 @@ func (n *Node) FenceSlot(ctx context.Context, namespace string, slot uint16, sea
 }
 
 func (n *Node) apply(ctx context.Context, cmd command) (uint64, error) {
-	if cmd.Operation == opSet || cmd.Operation == opDelete {
+	if cmd.isWrite() {
 		return n.writes.Submit(ctx, cmd)
 	}
 	result, err := n.applyDirect(ctx, cmd)
@@ -374,7 +418,7 @@ func (n *Node) Get(ctx context.Context, namespace, key string) (storage.Record, 
 		if err != nil {
 			return storage.Record{}, false, err
 		}
-		return storage.Record{Value: res.GetValue(), Revision: res.GetRevision()}, res.GetFound(), nil
+		return storage.Record{Value: res.GetValue(), Revision: res.GetRevision(), ExpiresAtUnixMS: res.GetExpiresAtUnixMs()}, res.GetFound(), nil
 	}
 	if err := n.readStrong(ctx); err != nil {
 		return storage.Record{}, false, err
@@ -387,6 +431,13 @@ func (n *Node) ReadPerformance() ReadPerformance {
 }
 
 func (n *Node) Set(ctx context.Context, namespace, key string, value []byte) (uint64, error) {
+	return n.SetWithExpiration(ctx, namespace, key, value, 0)
+}
+
+func (n *Node) SetWithExpiration(ctx context.Context, namespace, key string, value []byte, expiresAtUnixMS int64) (uint64, error) {
+	if expiresAtUnixMS < 0 {
+		return 0, status.Error(codes.InvalidArgument, "invalid expiration")
+	}
 	// Keep raft entries under HashiCorp Raft's recommended 512 KiB (JSON base64 adds overhead).
 	if len(value) > 256<<10 {
 		return 0, status.Error(codes.ResourceExhausted, "cluster values must be at most 256 KiB")
@@ -403,13 +454,32 @@ func (n *Node) Set(ctx context.Context, namespace, key string, value []byte) (ui
 		if err != nil {
 			return 0, err
 		}
-		res, err := client.Set(ctx, &kvstorev1.SetRequest{Namespace: namespace, Key: key, Value: value})
+		if expiresAtUnixMS > 0 {
+			if err := requireLeaderExpiration(ctx, client); err != nil {
+				return 0, err
+			}
+		}
+		res, err := client.Set(ctx, &kvstorev1.SetRequest{Namespace: namespace, Key: key, Value: value, ExpiresAtUnixMs: expiresAtUnixMS})
 		if err != nil {
 			return 0, err
 		}
+		if res.GetExpiresAtUnixMs() != expiresAtUnixMS {
+			return 0, status.Error(codes.FailedPrecondition, "leader did not acknowledge the requested expiration")
+		}
 		return res.GetRevision(), nil
 	}
-	return n.apply(ctx, command{Operation: opSet, Namespace: namespace, Key: key, Value: value})
+	return n.apply(ctx, newSetCommand(namespace, key, value, expiresAtUnixMS))
+}
+
+func requireLeaderExpiration(ctx context.Context, client kvstorev1.KVStoreClient) error {
+	head, err := client.Head(ctx, &kvstorev1.HeadRequest{})
+	if err != nil {
+		return err
+	}
+	if !head.GetSupportsExpiration() {
+		return status.Error(codes.FailedPrecondition, "leader does not support expiration")
+	}
+	return nil
 }
 
 func (n *Node) Delete(ctx context.Context, namespace, key string) (uint64, error) {
@@ -575,7 +645,7 @@ func (n *Node) ScanNamespace(ctx context.Context, ns string, emit func(storage.S
 			if err != nil {
 				return err
 			}
-			if err := emit(storage.ScanItem{SnapshotRevision: msg.GetSnapshotRevision(), Key: msg.GetKey(), Value: msg.GetValue(), Revision: msg.GetRevision(), Checkpoint: msg.GetCheckpoint()}); err != nil {
+			if err := emit(storage.ScanItem{SnapshotRevision: msg.GetSnapshotRevision(), Key: msg.GetKey(), Value: msg.GetValue(), Revision: msg.GetRevision(), Checkpoint: msg.GetCheckpoint(), ExpiresAtUnixMS: msg.GetExpiresAtUnixMs()}); err != nil {
 				return err
 			}
 		}

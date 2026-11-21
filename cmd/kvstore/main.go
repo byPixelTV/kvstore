@@ -5,8 +5,6 @@ import (
 	"crypto/subtle"
 	"errors"
 	"fmt"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 	"log/slog"
 	"net"
 	"os"
@@ -25,9 +23,11 @@ import (
 	"github.com/byPixelTV/kvstore/internal/storage"
 	pebblestore "github.com/byPixelTV/kvstore/internal/storage/pebble"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/health"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 )
 
 var version = "dev" // -ldflags=-X main.version=...
@@ -95,7 +95,16 @@ func run() (runErr error) {
 	service := kvstore.New(store)
 	grpcOptions := []grpc.ServerOption{}
 	if node != nil {
+		grpcOptions = append(grpcOptions, grpc.StreamInterceptor(func(srv any, stream grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+			if strings.HasPrefix(info.FullMethod, "/kvstore.v1.KVStore/") && !node.ClientTrafficReady() {
+				return status.Error(codes.Unavailable, "Raft voter configuration not ready")
+			}
+			return handler(srv, stream)
+		}))
 		grpcOptions = append(grpcOptions, grpc.UnaryInterceptor(func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+			if strings.HasPrefix(info.FullMethod, "/kvstore.v1.KVStore/") && !node.ClientTrafficReady() {
+				return nil, status.Error(codes.Unavailable, "Raft voter configuration not ready")
+			}
 			// Replicated fences are privileged. Other public RPCs cannot toggle
 			// the write protection used by online migration.
 			if info.FullMethod == "/kvstore.v1.KVStore/FenceSlot" {
@@ -135,6 +144,7 @@ func run() (runErr error) {
 		healthSrv.SetServingStatus("readiness", healthpb.HealthCheckResponse_SERVING)
 	} else {
 		healthSrv.SetServingStatus("readiness", healthpb.HealthCheckResponse_NOT_SERVING)
+		healthSrv.SetServingStatus("", healthpb.HealthCheckResponse_NOT_SERVING)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -146,11 +156,13 @@ func run() (runErr error) {
 			ticker := time.NewTicker(500 * time.Millisecond)
 			defer ticker.Stop()
 			for {
+				node.RefreshAdmission()
 				state := healthpb.HealthCheckResponse_NOT_SERVING
 				if node.Ready() {
 					state = healthpb.HealthCheckResponse_SERVING
 				}
 				healthSrv.SetServingStatus("readiness", state)
+				healthSrv.SetServingStatus("", state)
 				select {
 				case <-ctx.Done():
 					return

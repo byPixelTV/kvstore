@@ -11,10 +11,12 @@ bin/
 build/
 dist/
 coverage/
+benchmarks/results/
 *.test
 *.out
 tmp/
 data/
+**/*.kvsnapshot
 README.md
 compose*.yml
 compose*.yaml

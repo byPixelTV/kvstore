@@ -1,0 +1,37 @@
+groups:
+  - name: kvstore
+    rules:
+      - alert: KVStoreScrapeUnavailable
+        expr: up{job=~"kvstore-(router|voters)"} == 0
+        for: 1m
+        annotations:
+          summary: "KVStore metrics unavailable on {{ $labels.instance }}"
+      - alert: KVStoreRouterUnavailable
+        expr: kvstore_router_ready == 0
+        for: 30s
+        annotations:
+          summary: "Router has no usable route for one or more shards"
+      - alert: KVStoreShardUnavailable
+        expr: kvstore_shard_ready == 0
+        for: 30s
+        annotations:
+          summary: "Shard {{ $labels.shard }} has no quorum-confirmed leader route"
+      - alert: KVStoreMutationFailures
+        expr: sum by (instance) (increase(kvstore_mutations_total{outcome="failed"}[5m])) > 0
+        for: 1m
+        annotations:
+          summary: "KVStore reported failed mutations, including partial BatchWrite failures"
+      - alert: KVStoreLatencyP99
+        expr: histogram_quantile(0.99, sum by (instance, method, le) (rate(kvstore_rpc_duration_seconds_bucket{method=~"get|set|batch_write"}[5m]))) >= 0.1
+        for: 5m
+        annotations:
+          summary: "KVStore p99 is at least 100 ms for {{ $labels.method }}"
+      - alert: KVStoreDiskSpaceLow
+        expr: kvstore_disk_available_bytes / kvstore_disk_total_bytes < 0.15
+        for: 5m
+        annotations:
+          summary: "Less than 15% of the KVStore data filesystem is available on {{ $labels.instance }}"
+      - alert: KVStoreCompactionFailed
+        expr: increase(kvstore_pebble_failed_compactions_total[5m]) > 0
+        annotations:
+          summary: "Pebble compaction failed on {{ $labels.instance }}"

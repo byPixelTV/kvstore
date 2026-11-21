@@ -36,16 +36,20 @@ message GetResponse {
   bool found = 1;
   bytes value = 2;
   uint64 revision = 3;
+  int64 expires_at_unix_ms = 4;
 }
 
 message SetRequest {
   string namespace = 1;
   string key = 2;
   bytes value = 3;
+  // Absolute Unix time in milliseconds. Zero stores a persistent value.
+  int64 expires_at_unix_ms = 4;
 }
 
 message SetResponse {
   uint64 revision = 1;
+  int64 expires_at_unix_ms = 2;
 }
 
 message DeleteRequest {
@@ -65,6 +69,7 @@ message BatchWriteOperation {
   string key = 2;
   bytes value = 3;
   bool delete = 4;
+  int64 expires_at_unix_ms = 5;
 }
 message BatchWriteRequest { repeated BatchWriteOperation operations = 1; }
 message BatchWriteResult {
@@ -86,6 +91,7 @@ message HeadResponse {
   uint64 oldest_available_revision = 2;
   // Opaque cursor for multi-Raft. Set use_vector_cursor on requests.
   string cursor = 3;
+  bool supports_expiration = 4;
 }
 
 // A namespace is mandatory. An empty key watches all keys in that namespace.
@@ -108,6 +114,7 @@ message WatchResponse {
   bool checkpoint = 6;
   string cursor = 7;
   uint32 shard = 8;
+  int64 expires_at_unix_ms = 9;
 }
 
 // Single-Raft: the first message is a consistent snapshot checkpoint; then
@@ -127,6 +134,7 @@ message ScanResponse {
   // Final checkpoint after ALL shard snapshots have completed.
   string cursor = 6;
   uint32 shard = 7;
+  int64 expires_at_unix_ms = 8;
 }
 
 // A fence is replicated within the source/target Raft group and applied in

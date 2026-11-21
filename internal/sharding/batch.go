@@ -28,6 +28,9 @@ func (r *Router) BatchWrite(ctx context.Context, req *kvstorev1.BatchWriteReques
 		if err := invalidKey(op.GetNamespace(), op.GetKey()); err != nil {
 			return nil, err
 		}
+		if op.GetExpiresAtUnixMs() < 0 || (op.GetDelete() && op.GetExpiresAtUnixMs() != 0) {
+			return nil, status.Error(codes.InvalidArgument, "invalid batch expiration")
+		}
 		size += len(op.GetNamespace()) + len(op.GetKey()) + len(op.GetValue()) + 128
 		if size > 256<<10 {
 			return nil, status.Error(codes.ResourceExhausted, "batch exceeds 256 KiB; split into smaller batches")
@@ -68,14 +71,16 @@ func (r *Router) BatchWrite(ctx context.Context, req *kvstorev1.BatchWriteReques
 
 	layout := r.current()
 	type shardPart struct {
-		positions  []int
-		operations []*kvstorev1.BatchWriteOperation
+		positions     []int
+		operations    []*kvstorev1.BatchWriteOperation
+		hasExpiration bool
 	}
 	var parts [ShardCount]shardPart
 	for i, op := range items {
 		shard := layout.owner(op.GetNamespace(), Slot(op.GetNamespace(), op.GetKey()))
 		parts[shard].positions = append(parts[shard].positions, i)
 		parts[shard].operations = append(parts[shard].operations, op)
+		parts[shard].hasExpiration = parts[shard].hasExpiration || op.GetExpiresAtUnixMs() > 0
 	}
 
 	results := make([]*kvstorev1.BatchWriteResult, len(items))
@@ -99,6 +104,12 @@ func (r *Router) BatchWrite(ctx context.Context, req *kvstorev1.BatchWriteReques
 			if err != nil {
 				completeError(err)
 				return
+			}
+			if part.hasExpiration {
+				if err := requireBackendExpiration(ctx, client); err != nil {
+					completeError(err)
+					return
+				}
 			}
 			reply, err := client.BatchWrite(ctx, &kvstorev1.BatchWriteRequest{Operations: part.operations})
 			if err != nil {

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	kvstorev1 "github.com/byPixelTV/kvstore/gen/go/kvstore/v1"
+	"github.com/byPixelTV/kvstore/internal/monitoring"
 )
 
 type migrateRequest struct {
@@ -81,7 +82,7 @@ func (r *Router) RecoverSlot(ctx context.Context, namespace string, slot uint16)
 	return r.Refresh(ctx)
 }
 
-func (r *Router) startAdmin() (*http.Server, error) {
+func (r *Router) startAdmin(metrics http.Handler) (*http.Server, error) {
 	addr := os.Getenv("KVSTORE_ROUTER_ADMIN_ADDR")
 	if addr == "" {
 		return nil, nil
@@ -95,6 +96,9 @@ func (r *Router) startAdmin() (*http.Server, error) {
 		return nil, fmt.Errorf("router admin listen %s: %w", addr, err)
 	}
 	mux := http.NewServeMux()
+	if metrics != nil {
+		mux.HandleFunc("GET /metrics", monitoring.Protect(os.Getenv("KVSTORE_METRICS_TOKEN"), metrics))
+	}
 	authorized := func(w http.ResponseWriter, req *http.Request) bool {
 		got := req.Header.Get("Authorization")
 		if subtle.ConstantTimeCompare([]byte(got), []byte("Bearer "+token)) != 1 {

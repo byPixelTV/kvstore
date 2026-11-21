@@ -69,18 +69,19 @@ func (s *Server) Get(ctx context.Context, req *kvstorev1.GetRequest) (*kvstorev1
 		return &kvstorev1.GetResponse{Found: false}, nil
 	}
 	return &kvstorev1.GetResponse{
-		Found:    true,
-		Value:    record.Value,
-		Revision: record.Revision,
+		Found:           true,
+		Value:           record.Value,
+		Revision:        record.Revision,
+		ExpiresAtUnixMs: record.ExpiresAtUnixMS,
 	}, nil
 }
 
 func (s *Server) Set(ctx context.Context, req *kvstorev1.SetRequest) (*kvstorev1.SetResponse, error) {
-	revision, err := s.service.Set(ctx, req.GetNamespace(), req.GetKey(), req.GetValue())
+	revision, err := s.service.SetWithExpiration(ctx, req.GetNamespace(), req.GetKey(), req.GetValue(), req.GetExpiresAtUnixMs())
 	if err != nil {
 		return nil, mapError(err)
 	}
-	return &kvstorev1.SetResponse{Revision: revision}, nil
+	return &kvstorev1.SetResponse{Revision: revision, ExpiresAtUnixMs: req.GetExpiresAtUnixMs()}, nil
 }
 
 func (s *Server) Delete(ctx context.Context, req *kvstorev1.DeleteRequest) (*kvstorev1.DeleteResponse, error) {
@@ -99,8 +100,10 @@ func mapError(err error) error {
 		return err
 	}
 	switch {
-	case errors.Is(err, kvstore.ErrEmptyNamespace), errors.Is(err, kvstore.ErrEmptyKey):
+	case errors.Is(err, kvstore.ErrEmptyNamespace), errors.Is(err, kvstore.ErrEmptyKey), errors.Is(err, kvstore.ErrInvalidExpiration):
 		return status.Error(codes.InvalidArgument, err.Error())
+	case errors.Is(err, kvstore.ErrExpirationUnsupported):
+		return status.Error(codes.FailedPrecondition, err.Error())
 	case errors.Is(err, raft.ErrNotLeader), errors.Is(err, raft.ErrLeadershipLost):
 		return status.Error(codes.Unavailable, "Raft leader unavailable")
 	case errors.Is(err, changefeed.ErrHistoryUnavailable):
@@ -124,7 +127,7 @@ func (s *Server) Head(ctx context.Context, _ *kvstorev1.HeadRequest) (*kvstorev1
 	if err != nil {
 		return nil, mapError(err)
 	}
-	return &kvstorev1.HeadResponse{Revision: head, OldestAvailableRevision: oldest}, nil
+	return &kvstorev1.HeadResponse{Revision: head, OldestAvailableRevision: oldest, SupportsExpiration: s.service.SupportsExpiration()}, nil
 }
 
 // Watch replays changes from durable storage before following new commits.
@@ -153,7 +156,7 @@ func (s *Server) Watch(req *kvstorev1.WatchRequest, stream grpc.ServerStreamingS
 			if event.Namespace != req.GetNamespace() || (req.GetKey() != "" && event.Key != req.GetKey()) {
 				continue
 			}
-			if err := stream.Send(&kvstorev1.WatchResponse{Revision: event.Revision, Namespace: event.Namespace, Key: event.Key, Value: event.Value, Deleted: event.Deleted}); err != nil {
+			if err := stream.Send(&kvstorev1.WatchResponse{Revision: event.Revision, Namespace: event.Namespace, Key: event.Key, Value: event.Value, Deleted: event.Deleted, ExpiresAtUnixMs: event.ExpiresAtUnixMS}); err != nil {
 				return err
 			}
 			lastSent = cursor
@@ -185,7 +188,7 @@ func (s *Server) Watch(req *kvstorev1.WatchRequest, stream grpc.ServerStreamingS
 
 func (s *Server) Scan(req *kvstorev1.ScanRequest, stream grpc.ServerStreamingServer[kvstorev1.ScanResponse]) error {
 	err := s.service.ScanNamespace(stream.Context(), req.GetNamespace(), func(item storage.ScanItem) error {
-		return stream.Send(&kvstorev1.ScanResponse{SnapshotRevision: item.SnapshotRevision, Key: item.Key, Value: item.Value, Revision: item.Revision, Checkpoint: item.Checkpoint})
+		return stream.Send(&kvstorev1.ScanResponse{SnapshotRevision: item.SnapshotRevision, Key: item.Key, Value: item.Value, Revision: item.Revision, Checkpoint: item.Checkpoint, ExpiresAtUnixMs: item.ExpiresAtUnixMS})
 	})
 	if err != nil {
 		return mapError(err)

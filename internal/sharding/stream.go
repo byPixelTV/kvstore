@@ -71,7 +71,7 @@ func (r *Router) Scan(req *kvstorev1.ScanRequest, stream grpc.ServerStreamingSer
 			if e != nil {
 				return status.Error(codes.Internal, e.Error())
 			}
-			if err := stream.Send(&kvstorev1.ScanResponse{Key: res.GetKey(), Value: res.GetValue(), Revision: rev, Shard: uint32(id)}); err != nil {
+			if err := stream.Send(&kvstorev1.ScanResponse{Key: res.GetKey(), Value: res.GetValue(), Revision: rev, Shard: uint32(id), ExpiresAtUnixMs: res.GetExpiresAtUnixMs()}); err != nil {
 				return err
 			}
 		}
@@ -189,13 +189,15 @@ func (r *Router) Watch(req *kvstorev1.WatchRequest, stream grpc.ServerStreamingS
 				Revision:  0, // no single global revision; per-shard revision below
 				Namespace: e.event.GetNamespace(), Key: e.event.GetKey(), Value: e.event.GetValue(),
 				Deleted: e.event.GetDeleted(), Checkpoint: e.event.GetCheckpoint(),
-				Cursor: encodeEpochCursor(next, epoch), Shard: uint32(e.shard),
+				ExpiresAtUnixMs: e.event.GetExpiresAtUnixMs(),
+				Cursor:          encodeEpochCursor(next, epoch), Shard: uint32(e.shard),
 			}
 			if !owned {
 				response.Checkpoint = true
 				response.Key = ""
 				response.Value = nil
 				response.Deleted = false
+				response.ExpiresAtUnixMs = 0
 				response.Namespace = ""
 			}
 			if !response.Checkpoint {

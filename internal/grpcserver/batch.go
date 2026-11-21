@@ -26,7 +26,7 @@ func (s *Server) BatchWrite(ctx context.Context, req *kvstorev1.BatchWriteReques
 		if total > 256<<10 {
 			return nil, status.Error(codes.ResourceExhausted, "batch exceeds 256 KiB; split into smaller batches")
 		}
-		operations[i] = storage.WriteOperation{Namespace: op.GetNamespace(), Key: op.GetKey(), Value: op.GetValue(), Delete: op.GetDelete()}
+		operations[i] = storage.WriteOperation{Namespace: op.GetNamespace(), Key: op.GetKey(), Value: op.GetValue(), Delete: op.GetDelete(), ExpiresAtUnixMS: op.GetExpiresAtUnixMs()}
 	}
 	revisions, err := s.service.BatchWrite(ctx, operations)
 	if err != nil {

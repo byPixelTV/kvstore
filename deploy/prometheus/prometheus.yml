@@ -1,0 +1,26 @@
+global:
+  scrape_interval: 15s
+
+rule_files: [kvstore-alerts.yml]
+
+# Run the scraper on the Compose host. token is the KVSTORE_METRICS_TOKEN.
+scrape_configs:
+  - job_name: kvstore-router
+    authorization:
+      credentials_file: token
+    static_configs:
+      - targets: ['127.0.0.1:17110']
+  - job_name: kvstore-voters
+    authorization:
+      credentials_file: token
+    static_configs:
+      - targets:
+          - '127.0.0.1:17101'
+          - '127.0.0.1:17102'
+          - '127.0.0.1:17103'
+          - '127.0.0.1:17104'
+          - '127.0.0.1:17105'
+          - '127.0.0.1:17106'
+          - '127.0.0.1:17107'
+          - '127.0.0.1:17108'
+          - '127.0.0.1:17109'

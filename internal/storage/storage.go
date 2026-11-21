@@ -4,8 +4,14 @@ import "context"
 
 // Record is a stored value and the revision of its last modification.
 type Record struct {
-	Value    []byte
-	Revision uint64
+	Value           []byte
+	Revision        uint64
+	ExpiresAtUnixMS int64
+}
+
+// ExpiringStore extends Set with an absolute wall-clock deadline in milliseconds.
+type ExpiringStore interface {
+	SetWithExpiration(context.Context, string, string, []byte, int64) (uint64, error)
 }
 
 // Store defines the operations supported by the storage backend.
@@ -22,6 +28,7 @@ type ScanItem struct {
 	Key              string
 	Value            []byte
 	Revision         uint64
+	ExpiresAtUnixMS  int64
 	Checkpoint       bool
 }
 type NamespaceScanner interface {

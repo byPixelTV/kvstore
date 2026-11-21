@@ -34,6 +34,7 @@ const maxSnapshotField = 64 << 20 // 64 MiB per snapshot key or value
 
 const (
 	opSet    = "set"
+	opSetTTL = "set-with-expiration"
 	opDelete = "delete"
 	opPeer   = "peer"
 	opBatch  = "batch"
@@ -51,14 +52,29 @@ type peerInfo struct {
 }
 
 type command struct {
-	Operation string    `json:"op"`
-	Namespace string    `json:"namespace,omitempty"`
-	Key       string    `json:"key,omitempty"`
-	Value     []byte    `json:"value,omitempty"`
-	Peer      *peerInfo `json:"peer,omitempty"`
-	Commands  []command `json:"commands,omitempty"`
-	Slot      uint32    `json:"slot,omitempty"`
-	Sealed    bool      `json:"sealed,omitempty"`
+	Operation       string    `json:"op"`
+	Namespace       string    `json:"namespace,omitempty"`
+	Key             string    `json:"key,omitempty"`
+	Value           []byte    `json:"value,omitempty"`
+	ExpiresAtUnixMS int64     `json:"expires_at_unix_ms,omitempty"`
+	Peer            *peerInfo `json:"peer,omitempty"`
+	Commands        []command `json:"commands,omitempty"`
+	Slot            uint32    `json:"slot,omitempty"`
+	Sealed          bool      `json:"sealed,omitempty"`
+}
+
+func (cmd command) isWrite() bool {
+	return cmd.Operation == opSet || cmd.Operation == opSetTTL || cmd.Operation == opDelete
+}
+
+func newSetCommand(namespace, key string, value []byte, deadline int64) command {
+	operation := opSet
+	if deadline > 0 {
+		// Older binaries must reject this log entry rather than apply a
+		// permanent value after dropping its unknown deadline field.
+		operation = opSetTTL
+	}
+	return command{Operation: operation, Namespace: namespace, Key: key, Value: value, ExpiresAtUnixMS: deadline}
 }
 
 type applyResult struct {
@@ -241,12 +257,6 @@ func encodeRecordKey(ns, key string) []byte {
 	b = append(b, ns...)
 	return append(b, key...)
 }
-func encodeRecord(value []byte, rev uint64) []byte {
-	b := make([]byte, 8+len(value))
-	binary.BigEndian.PutUint64(b[:8], rev)
-	copy(b[8:], value)
-	return b
-}
 func encode64(value uint64) []byte {
 	var b [8]byte
 	binary.BigEndian.PutUint64(b[:], value)
@@ -307,10 +317,15 @@ func (f *FSM) Get(ctx context.Context, ns, key string) (storage.Record, bool, er
 		return storage.Record{}, false, fmt.Errorf("read record: %w", err)
 	}
 	defer closer.Close()
-	if len(raw) < 8 {
-		return storage.Record{}, false, errors.New("corrupt replicated record")
+	record, err := storage.DecodeRecord(raw)
+	if err != nil {
+		return storage.Record{}, false, fmt.Errorf("corrupt replicated record: %w", err)
 	}
-	return storage.Record{Revision: binary.BigEndian.Uint64(raw[:8]), Value: bytes.Clone(raw[8:])}, true, nil
+	if record.ExpiresAtUnixMS > 0 && record.ExpiredAt(time.Now().UnixMilli()) {
+		return storage.Record{}, false, nil
+	}
+	record.Value = bytes.Clone(record.Value)
+	return record, true, nil
 }
 
 func (f *FSM) Peer(id string) (peerInfo, bool, error) {
@@ -391,7 +406,10 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
 	applyOne := func(cmd command) (uint64, error) {
 		revision := uint64(0)
 		switch cmd.Operation {
-		case opSet, opDelete:
+		case opSet, opSetTTL, opDelete:
+			if cmd.ExpiresAtUnixMS < 0 || (cmd.Operation == opSetTTL) != (cmd.ExpiresAtUnixMS > 0) {
+				return 0, errors.New("invalid committed expiration")
+			}
 			encoded := encodeRecordKey(cmd.Namespace, cmd.Key)
 			key := string(encoded)
 			if cmd.Operation == opDelete {
@@ -420,8 +438,8 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
 			nextRevision++
 			revision = nextRevision
 			var err error
-			if cmd.Operation == opSet {
-				err = batch.Set(encoded, encodeRecord(cmd.Value, revision), nil)
+			if cmd.Operation != opDelete {
+				err = batch.Set(encoded, storage.EncodeRecord(cmd.Value, revision, cmd.ExpiresAtUnixMS), nil)
 				shadow[key] = true
 			} else {
 				err = batch.Delete(encoded, nil)
@@ -430,7 +448,7 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
 			if err != nil {
 				return 0, err
 			}
-			err = history.Append(changefeed.Change{Revision: revision, Namespace: cmd.Namespace, Key: cmd.Key, Value: cmd.Value, Deleted: cmd.Operation == opDelete})
+			err = history.Append(changefeed.Change{Revision: revision, Namespace: cmd.Namespace, Key: cmd.Key, Value: cmd.Value, Deleted: cmd.Operation == opDelete, ExpiresAtUnixMS: cmd.ExpiresAtUnixMS})
 			if err != nil {
 				return 0, err
 			}
@@ -492,7 +510,7 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
 			// a physical Raft log with unrelated clients.
 			for _, item := range cmd.Commands {
 				switch item.Operation {
-				case opSet, opDelete:
+				case opSet, opSetTTL, opDelete:
 					logicalCount++
 				case opBatch:
 					if len(item.Commands) < 1 || len(item.Commands) > 128 {
@@ -500,7 +518,7 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
 					}
 					logicalCount += len(item.Commands)
 					for _, nested := range item.Commands {
-						if nested.Operation != opSet && nested.Operation != opDelete {
+						if !nested.isWrite() {
 							return fail(fmt.Errorf("invalid nested batch operation %q", nested.Operation))
 						}
 					}
@@ -555,7 +573,7 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
 			revisions := make([]uint64, len(cmd.Commands))
 			blocked := false
 			for _, item := range cmd.Commands {
-				if item.Operation != opSet && item.Operation != opDelete {
+				if !item.isWrite() {
 					return fail(fmt.Errorf("invalid batched operation %q", item.Operation))
 				}
 				if isSealed(item) {
@@ -568,9 +586,6 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
 				continue
 			}
 			for j, item := range cmd.Commands {
-				if item.Operation != opSet && item.Operation != opDelete {
-					return fail(fmt.Errorf("invalid batched operation %q", item.Operation))
-				}
 				rev, err := applyOne(item)
 				if err != nil {
 					return fail(err)
@@ -579,7 +594,7 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []interface{} {
 			}
 			responses[i] = applyResult{Revisions: revisions}
 		} else {
-			if (cmd.Operation == opSet || cmd.Operation == opDelete) && isSealed(cmd) {
+			if cmd.isWrite() && isSealed(cmd) {
 				responses[i] = applyResult{Err: status.Error(codes.FailedPrecondition, "write rejected by replicated migration fence; refresh routing")}
 				nextApplied = log.Index
 				continue

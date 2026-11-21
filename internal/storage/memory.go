@@ -3,7 +3,9 @@ package storage
 import (
 	"bytes"
 	"context"
+	"errors"
 	"sync"
+	"time"
 )
 
 type storageKey struct {
@@ -34,7 +36,7 @@ func (m *MemoryStorage) Get(ctx context.Context, namespace, key string) (Record,
 	}
 
 	record, exists := m.data[storageKey{namespace: namespace, key: key}]
-	if !exists {
+	if !exists || (record.ExpiresAtUnixMS > 0 && record.ExpiredAt(time.Now().UnixMilli())) {
 		return Record{}, false, nil
 	}
 
@@ -43,6 +45,13 @@ func (m *MemoryStorage) Get(ctx context.Context, namespace, key string) (Record,
 }
 
 func (m *MemoryStorage) Set(ctx context.Context, namespace, key string, value []byte) (uint64, error) {
+	return m.SetWithExpiration(ctx, namespace, key, value, 0)
+}
+
+func (m *MemoryStorage) SetWithExpiration(ctx context.Context, namespace, key string, value []byte, expiresAtUnixMS int64) (uint64, error) {
+	if expiresAtUnixMS < 0 {
+		return 0, errors.New("invalid expiration")
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -52,8 +61,9 @@ func (m *MemoryStorage) Set(ctx context.Context, namespace, key string, value []
 
 	m.revision++
 	m.data[storageKey{namespace: namespace, key: key}] = Record{
-		Value:    bytes.Clone(value),
-		Revision: m.revision,
+		Value:           bytes.Clone(value),
+		Revision:        m.revision,
+		ExpiresAtUnixMS: expiresAtUnixMS,
 	}
 
 	return m.revision, nil

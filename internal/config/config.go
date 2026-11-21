@@ -29,6 +29,7 @@ type Config struct {
 	Bootstrap             bool
 	BootstrapNode         string
 	JoinToken             string
+	MinRaftVoters         int
 	ReadBatchWindow       time.Duration
 	ReadBatchMax          int
 	ReadVerifyParallelism int
@@ -106,11 +107,15 @@ func Load() (Config, error) {
 	if err != nil || c.ReadVerifyParallelism < 1 || c.ReadVerifyParallelism > 64 {
 		return c, fmt.Errorf("KVSTORE_READ_VERIFY_PARALLELISM must be between 1 and 64")
 	}
-	c.WriteBatchWindow, err = time.ParseDuration(getenv("KVSTORE_WRITE_BATCH_WINDOW", "250us"))
+	writeWindow, writeMax, writeMaxWindow, raftInflight := "250us", "128", "5ms", "16"
+	if c.Mode == ModeCluster {
+		writeWindow, writeMax, writeMaxWindow, raftInflight = "1500us", "256", "3ms", "8"
+	}
+	c.WriteBatchWindow, err = time.ParseDuration(getenv("KVSTORE_WRITE_BATCH_WINDOW", writeWindow))
 	if err != nil || c.WriteBatchWindow <= 0 || c.WriteBatchWindow > 20*time.Millisecond {
 		return c, fmt.Errorf("KVSTORE_WRITE_BATCH_WINDOW must be greater than 0s and at most 20ms")
 	}
-	c.WriteBatchMax, err = strconv.Atoi(getenv("KVSTORE_WRITE_BATCH_MAX", "128"))
+	c.WriteBatchMax, err = strconv.Atoi(getenv("KVSTORE_WRITE_BATCH_MAX", writeMax))
 	if err != nil || c.WriteBatchMax < 1 || c.WriteBatchMax > 4096 {
 		return c, fmt.Errorf("KVSTORE_WRITE_BATCH_MAX must be between 1 and 4096")
 	}
@@ -119,11 +124,12 @@ func Load() (Config, error) {
 		return c, fmt.Errorf("KVSTORE_WRITE_BATCH_TARGET must be between 1 and 256")
 	}
 	maxWindowText := os.Getenv("KVSTORE_WRITE_BATCH_MAX_WINDOW")
-	if maxWindowText == "" {
-		maxWindowText = "5ms"
+	defaultMaxWindow := maxWindowText == ""
+	if defaultMaxWindow {
+		maxWindowText = writeMaxWindow
 	}
 	c.WriteBatchMaxWindow, err = time.ParseDuration(maxWindowText)
-	if os.Getenv("KVSTORE_WRITE_BATCH_MAX_WINDOW") == "" && c.WriteBatchMaxWindow < c.WriteBatchWindow {
+	if defaultMaxWindow && c.WriteBatchMaxWindow < c.WriteBatchWindow {
 		c.WriteBatchMaxWindow = c.WriteBatchWindow
 	}
 	if err != nil || c.WriteBatchMaxWindow < c.WriteBatchWindow || c.WriteBatchMaxWindow > 20*time.Millisecond {
@@ -145,7 +151,7 @@ func Load() (Config, error) {
 	if err != nil || c.RaftLogCacheEntries < 0 || c.RaftLogCacheEntries > 8192 {
 		return c, fmt.Errorf("KVSTORE_RAFT_LOG_CACHE_ENTRIES must be 0..8192")
 	}
-	c.RaftMaxInflight, err = strconv.Atoi(getenv("KVSTORE_RAFT_MAX_INFLIGHT", "16"))
+	c.RaftMaxInflight, err = strconv.Atoi(getenv("KVSTORE_RAFT_MAX_INFLIGHT", raftInflight))
 	if err != nil || c.RaftMaxInflight < 1 || c.RaftMaxInflight > 128 {
 		return c, fmt.Errorf("KVSTORE_RAFT_MAX_INFLIGHT must be between 1 and 128")
 	}
@@ -154,6 +160,10 @@ func Load() (Config, error) {
 			return c, fmt.Errorf("standalone instance %q is not the permitted singleton %q", c.NodeID, expected)
 		}
 		return c, nil
+	}
+	c.MinRaftVoters, err = strconv.Atoi(getenv("KVSTORE_CLUSTER_MIN_VOTERS", "1"))
+	if err != nil || c.MinRaftVoters < 1 {
+		return c, fmt.Errorf("KVSTORE_CLUSTER_MIN_VOTERS must be a positive integer")
 	}
 	c.Bootstrap = c.NodeID == c.BootstrapNode
 	for _, v := range strings.Split(os.Getenv("KVSTORE_CLUSTER_SEEDS"), ",") {

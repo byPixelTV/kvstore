@@ -18,11 +18,12 @@ var ByteCountKey = []byte{0, 4}
 var ErrHistoryUnavailable = errors.New("changefeed history unavailable; resynchronize your cache")
 
 type Change struct {
-	Revision  uint64
-	Namespace string
-	Key       string
-	Value     []byte
-	Deleted   bool
+	Revision        uint64
+	Namespace       string
+	Key             string
+	Value           []byte
+	Deleted         bool
+	ExpiresAtUnixMS int64
 }
 
 type Page struct {
@@ -70,8 +71,8 @@ func Key(revision uint64) []byte {
 	return b[:]
 }
 
-// Binary format v1: version, flags, length-prefixed namespace, key and value.
-// This avoids JSON/base64 overhead in the persisted event log.
+// Format v1 stores flags and the length-prefixed namespace, key and value.
+// Format v2 adds an absolute deadline before the namespace length.
 func Encode(c Change) []byte {
 	b := make([]byte, 0, 16+len(c.Namespace)+len(c.Key)+len(c.Value))
 	b = append(b, 1)
@@ -79,6 +80,10 @@ func Encode(c Change) []byte {
 		b = append(b, 1)
 	} else {
 		b = append(b, 0)
+	}
+	if c.ExpiresAtUnixMS > 0 {
+		b[0] = 2
+		b = binary.BigEndian.AppendUint64(b, uint64(c.ExpiresAtUnixMS))
 	}
 	b = binary.AppendUvarint(b, uint64(len(c.Namespace)))
 	b = append(b, c.Namespace...)
@@ -90,11 +95,22 @@ func Encode(c Change) []byte {
 }
 
 func Decode(revision uint64, b []byte) (Change, error) {
-	if len(b) < 2 || b[0] != 1 || b[1] > 1 {
+	if len(b) < 2 || (b[0] != 1 && b[0] != 2) || b[1] > 1 {
 		return Change{}, errors.New("unknown changefeed event format")
 	}
 	c := Change{Revision: revision, Deleted: b[1] == 1}
+	version := b[0]
 	b = b[2:]
+	if version == 2 {
+		if len(b) < 8 || c.Deleted {
+			return Change{}, errors.New("invalid changefeed expiration")
+		}
+		c.ExpiresAtUnixMS = int64(binary.BigEndian.Uint64(b[:8]))
+		if c.ExpiresAtUnixMS <= 0 {
+			return Change{}, errors.New("invalid changefeed deadline")
+		}
+		b = b[8:]
+	}
 	read := func() ([]byte, error) {
 		n, used := binary.Uvarint(b)
 		if used <= 0 {
