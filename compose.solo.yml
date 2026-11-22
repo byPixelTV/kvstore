@@ -1,0 +1,29 @@
+name: kvstore-solo
+
+services:
+  kvstore:
+    image: ${KVSTORE_IMAGE:-ghcr.io/bypixeltv/kvstore:latest}
+    pull_policy: always
+    restart: unless-stopped
+    init: true
+    read_only: true
+    ports:
+      - '127.0.0.1:${KVSTORE_PORT:-50051}:50051'
+    environment:
+      KVSTORE_MODE: standalone
+      KVSTORE_API_KEYS_DIR: /data/api-keys
+      KVSTORE_INIT_API_KEY: ${KVSTORE_API_KEY:-}
+    volumes:
+      - kvstore-data:/data
+    healthcheck:
+      test: [CMD, /usr/local/bin/kvstore, healthcheck]
+      interval: 5s
+      timeout: 3s
+      start_period: 15s
+      retries: 3
+    stop_grace_period: 30s
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+
+volumes:
+  kvstore-data:

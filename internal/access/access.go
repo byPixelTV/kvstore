@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -32,12 +33,38 @@ type Settings struct {
 }
 
 func Load() (Settings, error) {
+	return load(os.Getenv("KVSTORE_API_KEYS_DIR"))
+}
+
+// LoadStandalone enables the persisted registry on subsequent starts even when
+// the initializer is no longer supplied.
+func LoadStandalone(dataDir string) (Settings, error) {
+	token := os.Getenv("KVSTORE_INIT_API_KEY")
+	dir := os.Getenv("KVSTORE_API_KEYS_DIR")
+	if dir == "" {
+		dir = filepath.Join(dataDir, "api-keys")
+		if token == "" {
+			if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
+				dir = ""
+			} else if err != nil {
+				return Settings{}, fmt.Errorf("inspect standalone API key registry: %w", err)
+			}
+		}
+	}
+	if token != "" {
+		if err := apikeys.Bootstrap(dir, token); err != nil {
+			return Settings{}, fmt.Errorf("initialize KVSTORE_INIT_API_KEY: %w", err)
+		}
+	}
+	return load(dir)
+}
+
+func load(apiKeyDir string) (Settings, error) {
 	var s Settings
 	certFile := os.Getenv("KVSTORE_TLS_CERT_FILE")
 	keyFile := os.Getenv("KVSTORE_TLS_KEY_FILE")
 	caFile := os.Getenv("KVSTORE_TLS_CLIENT_CA_FILE")
 	policyFile := os.Getenv("KVSTORE_ACCESS_POLICY_FILE")
-	apiKeyDir := os.Getenv("KVSTORE_API_KEYS_DIR")
 	s.HealthListenAddr = os.Getenv("KVSTORE_HEALTH_LISTEN_ADDR")
 	if certFile != "" || keyFile != "" || caFile != "" {
 		if certFile == "" || keyFile == "" || (caFile == "" && apiKeyDir == "") {

@@ -37,6 +37,54 @@ Compose sets `KVSTORE_CLUSTER_MIN_VOTERS=3`. The leader starts serving client RP
 
 ## Production with Compose
 
+### Quick setup for one Linux host
+
+Save [`compose.solo.yml`](../compose.solo.yml) as `compose.yaml` on the deployment
+host. Put a KVStore token in the adjacent `.env` as `KVSTORE_API_KEY`. To generate
+a new token when creating that file, run:
+
+```sh
+(umask 077
+set -C
+printf 'KVSTORE_API_KEY=kvs_%s\n' "$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n')" > .env
+)
+```
+
+Then start the service:
+
+```sh
+docker compose up -d --wait
+```
+
+The default image is `ghcr.io/bypixeltv/kvstore:latest` from the stable release
+workflow. Compose checks for a current image when you run `up`. To pin a version
+or digest, set `KVSTORE_IMAGE` in `.env`. The listener is published on
+`127.0.0.1:50051`. Set `KVSTORE_PORT` to change the host port.
+
+On first start, KVStore saves the initial key's digest and management grants in
+the persistent `/data/api-keys` directory. The persisted registry is used on
+later starts, including when the initial value is removed from `.env`. Changing
+that variable does not rotate an existing key. To create separate application
+keys, use the API key command against the persisted registry:
+
+```sh
+docker compose exec kvstore kvstore apikey create --dir /data/api-keys --name moonlight --read --write
+```
+
+Set `KVSTORE_ADDR=127.0.0.1:50051`, `KVSTORE_PLAINTEXT=true`, and the application's
+`KVSTORE_API_KEY` in the application's environment. Docker clients can join the
+`kvstore-solo_default` network and use `kvstore:50051`. Keep their existing network
+memberships and declare the KVStore network as external in their Compose files.
+Use the TLS profile below for clients on another host.
+
+If an existing deployment uses a separate API key registry, keep mounting and
+using that registry while migrating its configuration. The one-file example
+initializes a registry inside its data volume. For V1 data, follow
+[import and verification](#importing-kvstore-v1-from-mongodb) before starting the
+migrated applications.
+
+### TLS configuration
+
 For a single server, add `compose.solo.production.yml`. For a sharded cluster, combine `compose.sharded.yml` and `compose.production.yml`. Set `KVSTORE_IMAGE` to the approved image digest for either profile. Put `server.crt` with its certificate chain, `server.key`, and `client-ca.crt` for the dedicated client CA in `KVSTORE_TLS_DIR`. The container runs as UID 65532 and needs read access to these files. The gRPC address used in `-addr` or in the application must match the server certificate.
 
 ```sh

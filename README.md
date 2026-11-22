@@ -41,6 +41,21 @@ or build the server from a checkout with the Compose quickstart.
 
 ## Quickstart
 
+### Authenticated standalone
+
+Save [`compose.solo.yml`](compose.solo.yml) as `compose.yaml`, put a `KVSTORE_API_KEY`
+in `.env` for the first start, then run:
+
+```sh
+docker compose up -d --wait
+```
+
+Compose pulls the latest stable image and keeps data and credentials in its persistent
+volume. See [standalone setup](deploy/production.md#quick-setup-for-one-linux-host)
+for the key format and client settings.
+
+### Local development
+
 From a checkout with Docker Compose installed, build and start one standalone node:
 
 ```sh
@@ -95,7 +110,7 @@ repositories {
     maven("https://repo.bypixel.dev/releases/")
 }
 dependencies {
-    implementation("dev.bypixel:kvstore:1.2.1")
+    implementation("dev.bypixel:kvstore:1.2.2")
 }
 ```
 
@@ -157,7 +172,7 @@ longer needed and close the client to stop its watches.
 See the [Go SDK guide](sdk/go/README.md) for namespace cache examples.
 
 ```sh
-go get github.com/byPixelTV/kvstore/sdk/go@v1.2.1
+go get github.com/byPixelTV/kvstore/sdk/go@v1.2.2
 ```
 
 ```go
@@ -259,7 +274,7 @@ flowchart LR
 
 | Mode | Entry point | Guide |
 | --- | --- | --- |
-| **Standalone** | [`compose.yml`](compose.yml) | [Quickstart](#quickstart) |
+| **Standalone** | [`compose.solo.yml`](compose.solo.yml) | [Authenticated quickstart](#authenticated-standalone) |
 | **Single Raft group** | [`compose.cluster.yml`](compose.cluster.yml) | [Linux deployment](deploy/production.md) |
 | **Sharded** | [`compose.sharded.yml`](compose.sharded.yml) | [Production profiles and TLS](deploy/production.md#production-with-compose) |
 | **Kubernetes** | [`deploy/kubernetes/`](deploy/kubernetes/) | [Kubernetes setup](deploy/kubernetes/README.md) |
@@ -329,7 +344,7 @@ isolated KVStore instance. The second command also needs JDK 21 and Node.js 24.
 
 ```sh
 go test -race ./...
-bash scripts/test-sdks.sh 1.2.1 "$PWD/tmp/sdk-packages"
+bash scripts/test-sdks.sh 1.2.2 "$PWD/tmp/sdk-packages"
 ```
 
 ## License

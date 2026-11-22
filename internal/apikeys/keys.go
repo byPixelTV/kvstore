@@ -83,34 +83,41 @@ func Create(dir string, key Key) (secret string, err error) {
 		return "", err
 	}
 	token := tokenPrefix + base64.RawURLEncoding.EncodeToString(random[:])
-	digest := sha256.Sum256([]byte(token))
+	err = create(dir, key, sha256.Sum256([]byte(token)))
+	if err != nil && !errors.Is(err, ErrUncertainDurability) {
+		return "", err
+	}
+	return token, err
+}
+
+func create(dir string, key Key, digest [sha256.Size]byte) error {
 	payload, err := json.Marshal(record{Key: key, SHA256: hex.EncodeToString(digest[:])})
 	if err != nil {
-		return "", err
+		return err
 	}
 	if len(payload) > maxRecordBytes {
-		return "", fmt.Errorf("%w: record exceeds 64 KiB", ErrInvalidKey)
+		return fmt.Errorf("%w: record exceeds 64 KiB", ErrInvalidKey)
 	}
 	if err := os.MkdirAll(dir, 0700); err != nil {
-		return "", err
+		return err
 	}
 	f, err := os.CreateTemp(dir, ".key-")
 	if err != nil {
-		return "", err
+		return err
 	}
 	defer os.Remove(f.Name())
 	writeErr := writeRecord(f, payload)
 	if err := errors.Join(writeErr, f.Close()); err != nil {
-		return "", err
+		return err
 	}
 	// Link publishes a complete file without replacing a concurrently created key.
 	if err := os.Link(f.Name(), filepath.Join(dir, filename(key.Name))); err != nil {
 		if errors.Is(err, os.ErrExist) {
-			return "", fmt.Errorf("%w: %q", ErrKeyExists, key.Name)
+			return fmt.Errorf("%w: %q", ErrKeyExists, key.Name)
 		}
-		return "", err
+		return err
 	}
-	return token, syncDirectory(dir)
+	return syncDirectory(dir)
 }
 
 func writeRecord(f *os.File, payload []byte) error {

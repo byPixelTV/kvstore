@@ -76,6 +76,9 @@ func main() {
 }
 
 func run() (runErr error) {
+	if mode := os.Getenv("KVSTORE_MODE"); (mode == "router" || mode == config.ModeCluster) && os.Getenv("KVSTORE_INIT_API_KEY") != "" {
+		return errors.New("KVSTORE_INIT_API_KEY requires standalone mode")
+	}
 	switch os.Getenv("KVSTORE_MODE") {
 	case "router":
 		return sharding.ServeRouter()
@@ -88,7 +91,12 @@ func run() (runErr error) {
 	if err != nil {
 		return err
 	}
-	endpoint, err := access.Load()
+	var endpoint access.Settings
+	if cfg.Mode == config.ModeStandalone {
+		endpoint, err = access.LoadStandalone(cfg.DataDir)
+	} else {
+		endpoint, err = access.Load()
+	}
 	if err != nil {
 		return err
 	}
