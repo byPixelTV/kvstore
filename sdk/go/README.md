@@ -2,6 +2,10 @@
 
 Import `github.com/byPixelTV/kvstore/sdk/go` as `kvstore`. Use the existing strong reads and transactions when a decision needs current server state.
 
+`ReadJSON[T]` decodes an existing value after a retrying strong read. With
+`JSONReadOptions{EmptyAsMissing: true}`, a stored zero-length value is treated
+as missing. A decode error returns `found == true`.
+
 ## Materialized namespace cache
 
 `CacheNamespace` loads a complete namespace snapshot and follows changes in the background. It resumes from the last processed cursor after a disconnect and replaces the snapshot if the cursor becomes invalid. Cached reads are synchronous and may lag server writes. Entries with an expired TTL are removed locally.

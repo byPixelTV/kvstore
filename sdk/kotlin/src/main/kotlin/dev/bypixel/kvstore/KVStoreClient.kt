@@ -145,6 +145,14 @@ class KVStoreClient private constructor(
 
     suspend fun readText(storeName: String, key: String): String? = runtime.cache.read(KVStoreKey(storeName, key))
 
+    /** Decode JSON from the watched namespace cache, retrying a strong read on a cache miss. */
+    suspend inline fun <reified T> readJson(storeName: String, key: String, format: Json = json): T? =
+        readText(storeName, key)?.let { format.decodeFromString<T>(it) }
+
+    /** Decode a local namespace cache hit without performing network I/O. */
+    inline fun <reified T> cachedJson(storeName: String, key: String, format: Json = json): T? =
+        cachedText(storeName, key)?.let { format.decodeFromString<T>(it) }
+
     /** Write UTF-8 bytes under a renewable key lease and update the local namespace cache. */
     suspend fun writeText(storeName: String, key: String, value: String, ttlMs: Long? = null) =
         runtime.writeText(storeName, key, value, ttlMs)

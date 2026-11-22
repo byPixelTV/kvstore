@@ -2,6 +2,7 @@ package kvstore
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"time"
@@ -20,6 +21,27 @@ type KeyValue struct {
 func (c *Client) GetKeyValue(ctx context.Context, namespace, key string) (string, bool, error) {
 	record, err := c.getWithRetry(ctx, namespace, key)
 	return string(record.GetValue()), record.GetFound(), err
+}
+
+// TextReader is the retrying key read used by ReadJSON.
+type TextReader interface {
+	GetKeyValue(context.Context, string, string) (string, bool, error)
+}
+
+// JSONReadOptions controls how ReadJSON handles an existing zero-length value.
+type JSONReadOptions struct {
+	EmptyAsMissing bool
+}
+
+// ReadJSON decodes a strong read using the same retry behavior as GetKeyValue.
+// If found is true and err is non-nil, the stored value could not be decoded.
+func ReadJSON[T any](ctx context.Context, c TextReader, namespace, key string, opts JSONReadOptions) (value T, found bool, err error) {
+	raw, found, err := c.GetKeyValue(ctx, namespace, key)
+	if err != nil || !found || (opts.EmptyAsMissing && raw == "") {
+		return value, false, err
+	}
+	err = json.Unmarshal([]byte(raw), &value)
+	return value, true, err
 }
 
 func (c *Client) getWithRetry(ctx context.Context, namespace, key string) (*pb.GetResponse, error) {

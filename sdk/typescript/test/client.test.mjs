@@ -197,6 +197,10 @@ test("commits conditional writes, renews a lease and maintains a local snapshot"
   const signal = AbortSignal.timeout(15_000);
   try {
     await client.setJson(namespace, "alice", { coins: 1 });
+    assert.deepEqual(await client.getJson(namespace, "alice"), { coins: 1 });
+    await client.set(namespace, "empty", Buffer.alloc(0));
+    assert.equal(await client.getJson(namespace, "empty", { emptyAsMissing: true }), undefined);
+    await assert.rejects(client.getJson(namespace, "empty"), SyntaxError);
     const cache = await client.loadNamespaceCache(namespace, signal);
     assert.equal(cache.get("alice").value.toString(), '{"coins":1}');
     await client.withKeyLock(namespace, "alice", async held => {

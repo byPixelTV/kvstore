@@ -95,7 +95,7 @@ repositories {
     maven("https://repo.bypixel.dev/releases/")
 }
 dependencies {
-    implementation("dev.bypixel:kvstore:1.2.0")
+    implementation("dev.bypixel:kvstore:1.2.1")
 }
 ```
 
@@ -129,6 +129,8 @@ The defaults are 4,096 entries and five seconds. Local writes evict affected key
 Collect `watch` or `onChange` for the keys you want invalidated by remote writes as changes arrive.
 Values with a server expiration also expire locally. Use `get<T>` for a fresh strong read.
 Pass a custom `Json` instance to reuse application serializers.
+Use `readJson<T>` and `cachedJson<T>` when reading typed values through the watched
+namespace cache. `cachedJson<T>` is synchronous and only reads local cache entries.
 
 Use `transaction` for a callback whose staged writes commit atomically across namespaces
 and shards. The SDK executes the callback once and checks the recorded revisions and leases
@@ -155,7 +157,7 @@ longer needed and close the client to stop its watches.
 See the [Go SDK guide](sdk/go/README.md) for namespace cache examples.
 
 ```sh
-go get github.com/byPixelTV/kvstore/sdk/go@v1.2.0
+go get github.com/byPixelTV/kvstore/sdk/go@v1.2.1
 ```
 
 ```go
@@ -327,7 +329,7 @@ isolated KVStore instance. The second command also needs JDK 21 and Node.js 24.
 
 ```sh
 go test -race ./...
-bash scripts/test-sdks.sh 1.2.0 "$PWD/tmp/sdk-packages"
+bash scripts/test-sdks.sh 1.2.1 "$PWD/tmp/sdk-packages"
 ```
 
 ## License

@@ -275,9 +275,10 @@ export class KVStoreClient {
     }
   }
 
-  async getJson<T>(namespace: string, key: string): Promise<T | undefined> {
+  async getJson<T>(namespace: string, key: string, options: { emptyAsMissing?: boolean } = {}): Promise<T | undefined> {
     const result = await this.get(namespace, key);
-    return result.found ? JSON.parse(result.value.toString("utf8")) as T : undefined;
+    if (!result.found || (options.emptyAsMissing && result.value.length === 0)) return undefined;
+    return JSON.parse(result.value.toString("utf8")) as T;
   }
 
   async setJson<T>(namespace: string, key: string, value: T, expiresAtUnixMs = 0): Promise<SetResult> {
